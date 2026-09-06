@@ -6,10 +6,9 @@ import json
 import base64
 import sqlite3
 import threading
-import requests
+import httpx
 from dotenv import load_dotenv
 
-# Optional import for Firebase
 try:
     import firebase_admin
     from firebase_admin import credentials, db
@@ -29,11 +28,13 @@ from telegram.ext import (
     filters,
 )
 
-# Load environment variables
 load_dotenv()
 
 # ---------------- CONFIGURATION ----------------
 TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN পরিবেশক ভ্যারিয়েবল পাওয়া যায়নি! .env ফাইল বা এনভায়রনমেন্ট চেক করুন।")
+
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -44,9 +45,13 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# ---------------- LOCAL SQLITE INITIALIZATION ----------------
+
+def get_db_connection():
+    return sqlite3.connect("bot_database.db", timeout=10)
+
+
 def init_sqlite():
-    conn = sqlite3.connect("bot_database.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS services (
@@ -83,19 +88,19 @@ def init_sqlite():
 
 init_sqlite()
 
-# ---------------- HYBRID DATABASE ENGINE ----------------
-def init_firebase_system():
+
+def init_firebase_system(run_migration=False):
     global CURRENT_DB_MODE
     if not HAS_FIREBASE_LIB:
         return False
 
     if firebase_admin._apps:
         CURRENT_DB_MODE = "Firebase (Cloud)"
+        if run_migration:
+            migrate_sqlite_to_firebase()
         return True
 
     cred_dict = None
-
-    # Check Base64 / ENV Json / Local Uploaded File
     firebase_b64 = os.environ.get("FIREBASE_BASE64")
     firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
 
@@ -115,7 +120,8 @@ def init_firebase_system():
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
             CURRENT_DB_MODE = "Firebase (Cloud)"
-            migrate_sqlite_to_firebase()
+            if run_migration:
+                migrate_sqlite_to_firebase()
             logging.info("Firebase connected successfully!")
             return True
     except Exception as e:
@@ -124,23 +130,22 @@ def init_firebase_system():
     CURRENT_DB_MODE = "SQLite (Local)"
     return False
 
+
 def migrate_sqlite_to_firebase():
-    """Migrate SQLite data to Firebase Realtime DB"""
+    """Migrate SQLite data to Firebase Realtime DB without creating duplicate items"""
     if not firebase_admin._apps:
         return
 
-    conn = sqlite3.connect("bot_database.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Migrate Numbers
     cursor.execute("SELECT service, country, number, status, user_id FROM numbers")
     rows = cursor.fetchall()
     for row in rows:
         srv, cnt, num, st, uid = row
-        db.reference(f"numbers/{srv}/{cnt}").push({"number": num, "status": st, "user_id": uid})
+        db.reference(f"numbers/{srv}/{cnt}/{num}").set({"number": num, "status": st, "user_id": uid})
         db.reference(f"services/{srv}/{cnt}").set(True)
 
-    # Migrate Allocations
     cursor.execute("SELECT number, user_id, service, country FROM allocations")
     rows = cursor.fetchall()
     for row in rows:
@@ -149,9 +154,9 @@ def migrate_sqlite_to_firebase():
 
     conn.close()
 
-init_firebase_system()
 
-# ---------------- FLASK SERVER ----------------
+init_firebase_system(run_migration=False)
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -162,10 +167,9 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# Conversation States
 ADD_SERVICE, ADD_COUNTRY, ADD_NUMBERS, WAIT_FIREBASE_FILE = range(4)
 
-# Keyboards
+
 def get_main_keyboard(user_id: int):
     keyboard = [
         ["Get number"],
@@ -175,13 +179,13 @@ def get_main_keyboard(user_id: int):
         keyboard.append(["Admin Panel"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ---------------- BOT HANDLERS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user_id = update.effective_user.id
-    msg = f"স্বাগতম!\nবর্তমান ডাটাবেস মোড: **{CURRENT_DB_MODE}**"
+    msg = f"Welcome!\nSelect an option from menu: **{CURRENT_DB_MODE}**"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
+
 
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -191,10 +195,10 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         services = []
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             services_ref = db.reference("services").get()
-            if services_ref:
+            if services_ref and isinstance(services_ref, dict):
                 services = list(services_ref.keys())
         else:
-            conn = sqlite3.connect("bot_database.db")
+            conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT service_name FROM services")
             services = [row[0] for row in cursor.fetchall()]
@@ -220,7 +224,6 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await update.message.reply_text(f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
-# ---------------- ADMIN FLOW ----------------
 
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -253,32 +256,34 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = context.user_data.get('country_name')
 
     if service and country and numbers:
+        valid_count = 0
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             ref = db.reference(f"numbers/{service}/{country}")
             for num in numbers:
                 clean_num = re.sub(r'\D', '', num)
                 if clean_num:
-                    ref.push({"number": clean_num, "status": "available"})
+                    ref.child(clean_num).set({"number": clean_num, "status": "available", "user_id": 0})
+                    valid_count += 1
             db.reference(f"services/{service}/{country}").set(True)
         else:
-            conn = sqlite3.connect("bot_database.db")
+            conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
             for num in numbers:
                 clean_num = re.sub(r'\D', '', num)
                 if clean_num:
                     cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
+                    valid_count += 1
             conn.commit()
             conn.close()
 
-        await update.message.reply_text(f"সফলভাবে {len(numbers)} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_main_keyboard(ADMIN_ID))
+        await update.message.reply_text(f"সফলভাবে {valid_count} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_main_keyboard(ADMIN_ID))
     else:
         await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_main_keyboard(ADMIN_ID))
 
     context.user_data.clear()
     return ConversationHandler.END
 
-# Firebase JSON Upload Handler
 async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -295,7 +300,7 @@ async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TY
     file = await context.bot.get_file(update.message.document.file_id)
     await file.download_to_drive(FIREBASE_JSON_PATH)
 
-    success = init_firebase_system()
+    success = init_firebase_system(run_migration=True)
     if success:
         await update.message.reply_text("ফায়ারবেস ফাইল রিসিভড! ডাটাবেস সফলভাবে Firebase-এ সুইচেবল ও মাইগ্রেট হয়েছে। 🚀", reply_markup=get_main_keyboard(ADMIN_ID))
     else:
@@ -309,7 +314,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=get_main_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
-# ---------------- CALLBACK HANDLER ----------------
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -318,15 +322,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if data.startswith("srv_"):
-        service = data.split("_")[1]
+        service = data.split("_", 1)[1]
         countries = []
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             countries_ref = db.reference(f"services/{service}").get()
-            if countries_ref:
+            if countries_ref and isinstance(countries_ref, dict):
                 countries = list(countries_ref.keys())
         else:
-            conn = sqlite3.connect("bot_database.db")
+            conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT country_name FROM services WHERE service_name = ?", (service,))
             countries = [row[0] for row in cursor.fetchall()]
@@ -340,21 +344,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("cnt_"):
-        _, service, country = data.split("_")
+        parts = data.split("_", 2)
+        if len(parts) < 3:
+            await query.edit_message_text("অবৈধ কমান্ড।")
+            return
+        
+        service, country = parts[1], parts[2]
         assigned_num = None
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             numbers_ref = db.reference(f"numbers/{service}/{country}").get()
-            if numbers_ref:
+            if numbers_ref and isinstance(numbers_ref, dict):
                 for key, val in numbers_ref.items():
-                    if val.get("status") == "available":
+                    if isinstance(val, dict) and val.get("status") == "available":
                         assigned_num = val.get("number")
                         db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
                         db.reference(f"allocations/{assigned_num}").set({"user_id": user_id, "service": service, "country": country})
                         break
         else:
-            conn = sqlite3.connect("bot_database.db")
+            conn = get_db_connection()
             cursor = conn.cursor()
+            # SQLite Transaction for Race Condition Prevention
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute("SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT 1", (service, country))
             row = cursor.fetchone()
             if row:
@@ -362,6 +373,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
                 cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (assigned_num, user_id, service, country))
                 conn.commit()
+            else:
+                conn.rollback()
             conn.close()
 
         if not assigned_num:
@@ -370,87 +383,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(f"আপনার নম্বর: `{assigned_num}`\n\nওটিপি আসার সাথে সাথে জানিয়ে দেওয়া হবে।", parse_mode="Markdown")
 
-# ---------------- OTP POLLING WORKER ----------------
 
 async def otp_poller(application: Application):
     processed_ids = set()
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         seen_ref = db.reference("seen_otp_ids").get()
-        if seen_ref:
+        if seen_ref and isinstance(seen_ref, dict):
             processed_ids = set(seen_ref.keys())
     else:
-        conn = sqlite3.connect("bot_database.db")
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT msg_id FROM seen_otps")
         processed_ids = {row[0] for row in cursor.fetchall()}
         conn.close()
 
-    while True:
-        try:
-            if API_URL:
-                res = requests.get(API_URL, timeout=10).json()
-                docs = res.get("data", {}).get("docs", [])
+    # Async HTTP client to prevent blocking event loop
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                if API_URL:
+                    res = await client.get(API_URL)
+                    if res.status_code == 200:
+                        docs = res.json().get("data", {}).get("docs", [])
 
-                for item in docs:
-                    msg_id = item.get("_id")
-                    num = item.get("number")
-                    msg = item.get("message")
+                        for item in docs:
+                            msg_id = item.get("_id")
+                            num = item.get("number")
+                            msg = item.get("message")
 
-                    if msg_id and msg_id not in processed_ids:
-                        processed_ids.add(msg_id)
+                            if msg_id and msg_id not in processed_ids:
+                                processed_ids.add(msg_id)
 
-                        if CURRENT_DB_MODE == "Firebase (Cloud)":
-                            db.reference(f"seen_otp_ids/{msg_id}").set(True)
-                        else:
-                            conn = sqlite3.connect("bot_database.db")
-                            cursor = conn.cursor()
-                            cursor.execute("INSERT OR IGNORE INTO seen_otps (msg_id) VALUES (?)", (msg_id,))
-                            conn.commit()
-                            conn.close()
+                                # Prevent infinite memory growth (Keep last 1000 items)
+                                if len(processed_ids) > 2000:
+                                    processed_ids = set(list(processed_ids)[-1000:])
 
-                        # Send to Group
-                        if OTP_GROUP_ID:
-                            try:
-                                await application.bot.send_message(
-                                    chat_id=OTP_GROUP_ID,
-                                    text=f"📩 **New OTP Received**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{msg}`",
-                                    parse_mode="Markdown"
-                                )
-                            except Exception as e:
-                                logging.error(f"Group Forward Error: {e}")
+                                if CURRENT_DB_MODE == "Firebase (Cloud)":
+                                    db.reference(f"seen_otp_ids/{msg_id}").set(True)
+                                else:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor()
+                                    cursor.execute("INSERT OR IGNORE INTO seen_otps (msg_id) VALUES (?)", (msg_id,))
+                                    conn.commit()
+                                    conn.close()
 
-                        # Send to User
-                        allocated_user = None
-                        if CURRENT_DB_MODE == "Firebase (Cloud)":
-                            alloc_ref = db.reference(f"allocations/{num}").get()
-                            if alloc_ref:
-                                allocated_user = alloc_ref.get("user_id")
-                        else:
-                            conn = sqlite3.connect("bot_database.db")
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT user_id FROM allocations WHERE number = ?", (num,))
-                            row = cursor.fetchone()
-                            if row:
-                                allocated_user = row[0]
-                            conn.close()
+                                if OTP_GROUP_ID:
+                                    try:
+                                        await application.bot.send_message(
+                                            chat_id=OTP_GROUP_ID,
+                                            text=f"📩 **New OTP Received**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{msg}`",
+                                            parse_mode="Markdown"
+                                        )
+                                    except Exception as e:
+                                        logging.error(f"Group Forward Error: {e}")
 
-                        if allocated_user:
-                            try:
-                                await application.bot.send_message(
-                                    chat_id=allocated_user,
-                                    text=f"🎉 **আপনার OTP কোড এসেছে!**\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{msg}`",
-                                    parse_mode="Markdown"
-                                )
-                            except Exception as e:
-                                logging.error(f"User Forward Error: {e}")
+                                allocated_user = None
+                                if CURRENT_DB_MODE == "Firebase (Cloud)":
+                                    alloc_ref = db.reference(f"allocations/{num}").get()
+                                    if alloc_ref and isinstance(alloc_ref, dict):
+                                        allocated_user = alloc_ref.get("user_id")
+                                else:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor()
+                                    cursor.execute("SELECT user_id FROM allocations WHERE number = ?", (num,))
+                                    row = cursor.fetchone()
+                                    if row:
+                                        allocated_user = row[0]
+                                    conn.close()
 
-        except Exception as e:
-            logging.error(f"Polling Exception: {e}")
+                                if allocated_user:
+                                    try:
+                                        await application.bot.send_message(
+                                            chat_id=allocated_user,
+                                            text=f"🎉 **আপনার OTP কোড এসেছে!**\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{msg}`",
+                                            parse_mode="Markdown"
+                                        )
+                                    except Exception as e:
+                                        logging.error(f"User Forward Error: {e}")
 
-        await asyncio.sleep(5)
+            except Exception as e:
+                logging.error(f"Polling Exception: {e}")
 
-# ---------------- MAIN APPLICATION ----------------
+            await asyncio.sleep(5)
+
 
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
