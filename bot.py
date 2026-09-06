@@ -29,16 +29,26 @@ API_URL = os.environ.get("API_URL")
 
 # Initialize Firebase
 if not firebase_admin._apps:
-    # Set GOOGLE_APPLICATION_CREDENTIALS in env or place serviceAccountKey.json in directory
-    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
-    if os.path.exists(cred_path):
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
+    firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
+    
+    if firebase_json_env:
+        try:
+            # JSON স্ট্রাকচার লোড করা
+            cred_dict = json.loads(firebase_json_env)
+            
+            # \n এরিয়াল নিউলাইন ইস্যু ঠিক করা
+            if "private_key" in cred_dict:
+                cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+                
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
+            logging.info("Firebase connected successfully via ENV variable!")
+        except Exception as e:
+            logging.error(f"Firebase ENV Initialization Error: {e}")
     else:
-        # Fallback for platforms with injected JSON string
-        import json
-        service_account_info = json.loads(os.environ.get("FIREBASE_CONFIG_JSON", "{}"))
-        cred = credentials.Certificate(service_account_info)
+        # ফাইল ব্যাকআপ (যদি ফাইল ব্যবহার করেন)
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+        cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
 
 # Enable logging
