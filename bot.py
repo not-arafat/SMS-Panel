@@ -447,12 +447,19 @@ def get_main_keyboard(user_id: int):
 
 
 def get_admin_keyboard():
-    keyboard = [
-        ["Services", "Upload Firebase"],
-        ["Global Settings"],
-        ["Back"]
+    keyboard_layout = [
+        [
+            {"text": "Services", "style": "primary"},
+            {"text": "Upload Firebase", "style": "primary"}
+        ],
+        [
+            {"text": "Global Settings", "style": "primary"}
+        ],
+        [
+            {"text": "Back", "style": "danger"}
+        ]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 # ---------------- BOT HANDLERS ----------------
@@ -890,7 +897,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
                 conn.commit()
             else:
-                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_number))
+                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_number,))
                 cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
                 conn.commit()
             conn.close()
