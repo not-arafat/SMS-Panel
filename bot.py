@@ -89,7 +89,6 @@ def init_sqlite():
             value TEXT
         )
     ''')
-    # Default settings setup
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     conn.commit()
@@ -99,7 +98,6 @@ init_sqlite()
 
 
 def get_setting(key: str, default_val: str = "") -> str:
-    """Get setting value from Firebase or SQLite"""
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             val = db.reference(f"settings/{key}").get()
@@ -123,7 +121,6 @@ def get_setting(key: str, default_val: str = "") -> str:
 
 
 def set_setting(key: str, value: str):
-    """Save setting value to Firebase and SQLite"""
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             db.reference(f"settings/{key}").set(value)
@@ -138,6 +135,118 @@ def set_setting(key: str, value: str):
         conn.close()
     except Exception as e:
         logging.error(f"Error writing setting to SQLite: {e}")
+
+
+def get_admin_services_summary():
+    """Get services, countries, and available (unallocated) numbers count"""
+    summary = {}
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        srv_ref = db.reference("services").get()
+        if srv_ref and isinstance(srv_ref, dict):
+            for srv in srv_ref.keys():
+                summary[srv] = {}
+                cnt_ref = db.reference(f"services/{srv}").get()
+                if cnt_ref and isinstance(cnt_ref, dict):
+                    for cnt in cnt_ref.keys():
+                        num_ref = db.reference(f"numbers/{srv}/{cnt}").get()
+                        avail_count = 0
+                        if num_ref and isinstance(num_ref, dict):
+                            for n_key, n_val in num_ref.items():
+                                if isinstance(n_val, dict) and n_val.get("status") == "available":
+                                    avail_count += 1
+                        summary[srv][cnt] = avail_count
+    else:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT service_name, country_name FROM services")
+        pairs = cursor.fetchall()
+        for srv, cnt in pairs:
+            if srv not in summary:
+                summary[srv] = {}
+            cursor.execute("SELECT COUNT(*) FROM numbers WHERE service = ? AND country = ? AND status = 'available'", (srv, cnt))
+            cnt_val = cursor.fetchone()[0]
+            summary[srv][cnt] = cnt_val
+        conn.close()
+    return summary
+
+
+def delete_service_db(service: str):
+    """Delete service and all associated numbers"""
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"services/{service}").delete()
+            db.reference(f"numbers/{service}").delete()
+        except Exception as e:
+            logging.error(f"Error deleting service from Firebase: {e}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM services WHERE service_name = ?", (service,))
+    cursor.execute("DELETE FROM numbers WHERE service = ?", (service,))
+    conn.commit()
+    conn.close()
+
+
+def delete_country_db(service: str, country: str):
+    """Delete specific country and its numbers from a service"""
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"services/{service}/{country}").delete()
+            db.reference(f"numbers/{service}/{country}").delete()
+        except Exception as e:
+            logging.error(f"Error deleting country from Firebase: {e}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM services WHERE service_name = ? AND country_name = ?", (service, country))
+    cursor.execute("DELETE FROM numbers WHERE service = ? AND country = ?", (service, country))
+    conn.commit()
+    conn.close()
+
+
+def build_admin_services_view():
+    summary = get_admin_services_summary()
+    if not summary:
+        text = "📱 **SERVICES MANAGEMENT**\n\nবর্তমানে কোনো সার্ভিস যুক্ত করা নেই।"
+        buttons = [[InlineKeyboardButton("➕ Add New Service", callback_data="adm:srv:add")]]
+        return text, InlineKeyboardMarkup(buttons)
+
+    text = "📱 **SERVICES MANAGEMENT**\n\nনিচে আপনার সার্ভিসসমূহ এবং আনইউজড/এভেলেবল নম্বরের বিবরণ দেওয়া হলো:\n"
+    buttons = []
+    for srv, cnts in summary.items():
+        total_avail = sum(cnts.values())
+        text += f"\n🔹 **{srv}** (Total Available: `{total_avail}`)"
+        for cnt, count in cnts.items():
+            text += f"\n   └ {cnt}: `{count}` টি"
+        buttons.append([InlineKeyboardButton(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}")])
+
+    buttons.append([InlineKeyboardButton("➕ Add New Service / Numbers", callback_data="adm:srv:add")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_service_manage_view(service: str):
+    summary = get_admin_services_summary()
+    cnts = summary.get(service, {})
+    total_avail = sum(cnts.values())
+
+    text = f"⚙️ **SERVICE DETAILS: {service}**\n\n"
+    text += f"📊 মোট এভেলেবল নম্বর: `{total_avail}` টি\n\n"
+    text += "🏳️ **দেশ এবং আনইউজড নম্বর:**\n"
+    if cnts:
+        for cnt, count in cnts.items():
+            text += f"• **{cnt}**: `{count}` টি এভেলেবল\n"
+    else:
+        text += "কোনো দেশ যুক্ত নেই।\n"
+
+    buttons = [
+        [InlineKeyboardButton("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}")],
+        [InlineKeyboardButton("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}")],
+    ]
+    if cnts:
+        buttons.append([InlineKeyboardButton("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}")])
+    buttons.append([InlineKeyboardButton("⬅️ Back to Services", callback_data="adm:srv:list")])
+
+    return text, InlineKeyboardMarkup(buttons)
 
 
 def init_firebase_system(run_migration=False):
@@ -183,7 +292,6 @@ def init_firebase_system(run_migration=False):
 
 
 def migrate_sqlite_to_firebase():
-    """Migrate SQLite data to Firebase Realtime DB without creating duplicate items"""
     if not firebase_admin._apps:
         return
 
@@ -305,6 +413,10 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+    elif text == "Services" and user_id == ADMIN_ID:
+        text_msg, kbd = build_admin_services_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
     elif text == "Global Settings" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         ch_val = get_setting("channel", "https://t.me/your_channel")
@@ -335,10 +447,22 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await update.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
+    await query.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
     return ADD_SERVICE
+
+async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    service = query.data.split(":", 3)[3]
+    context.user_data['service_name'] = service
+    await query.message.reply_text(f"সার্ভিস **{service}** সিলেক্ট করা হয়েছে।\n\nদেশের নাম লিখুন (যেমন: Bangladesh, Nepal):", parse_mode="Markdown")
+    return ADD_COUNTRY
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['service_name'] = update.message.text.strip()
@@ -393,9 +517,11 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await update.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
+    await query.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
     return WAIT_FIREBASE_FILE
 
 async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -477,7 +603,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
-    if data.startswith("srv_"):
+    # Admin Management Actions
+    if data == "adm:srv:list":
+        if user_id != ADMIN_ID:
+            return
+        text, kbd = build_admin_services_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:srv:view:"):
+        if user_id != ADMIN_ID:
+            return
+        service = data.split(":", 3)[3]
+        text, kbd = build_service_manage_view(service)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:srv:del:"):
+        if user_id != ADMIN_ID:
+            return
+        service = data.split(":", 3)[3]
+        delete_service_db(service)
+        await query.answer(f"{service} সার্ভিসটি সফলভাবে ডিলিট করা হয়েছে!", show_alert=True)
+        text, kbd = build_admin_services_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:cnt:delli:"):
+        if user_id != ADMIN_ID:
+            return
+        service = data.split(":", 3)[3]
+        summary = get_admin_services_summary()
+        cnts = summary.get(service, {})
+        buttons = []
+        for cnt in cnts.keys():
+            buttons.append([InlineKeyboardButton(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}")])
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"adm:srv:view:{service}")])
+        await query.edit_message_text(f"**{service}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+    elif data.startswith("adm:cnt:del:"):
+        if user_id != ADMIN_ID:
+            return
+        parts = data.split(":", 4)
+        if len(parts) >= 5:
+            service, country = parts[3], parts[4]
+            delete_country_db(service, country)
+            await query.answer(f"{service} থেকে {country} ডিলিট করা হয়েছে!", show_alert=True)
+            text, kbd = build_service_manage_view(service)
+            await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    # User Get Number Flow
+    elif data.startswith("srv_"):
         service = data.split("_", 1)[1]
         countries = []
 
@@ -630,8 +803,9 @@ def main():
 
     admin_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^Services$") & filters.User(user_id=ADMIN_ID), admin_add_service_start),
-            MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
+            CallbackQueryHandler(admin_add_service_start, pattern="^adm:srv:add$"),
+            CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
+            CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
             MessageHandler(filters.Regex("^Channel$"), set_channel_start),
             MessageHandler(filters.Regex("^Support$"), set_support_start),
         ],
