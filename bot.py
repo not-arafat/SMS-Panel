@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import json
 import threading
 import requests
 from dotenv import load_dotenv
@@ -19,6 +20,8 @@ from telegram.ext import (
     filters,
 )
 
+load_dotenv()
+
 # ---------------- CONFIGURATION ----------------
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
@@ -26,50 +29,47 @@ OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 API_URL = os.environ.get("API_URL")
 
+# Firebase Init
+# ---------------- FIREBASE INITIALIZATION ----------------
+firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
+db_url = os.environ.get("DATABASE_URL")
 
-# Initialize Firebase
 if not firebase_admin._apps:
-    firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
-    
-    if firebase_json_env:
-        try:
-            # JSON স্ট্রাকচার লোড করা
+    try:
+        if firebase_json_env:
             cred_dict = json.loads(firebase_json_env)
-            
-            # \n এরিয়াল নিউলাইন ইস্যু ঠিক করা
             if "private_key" in cred_dict:
                 cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-                
             cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
-            logging.info("Firebase connected successfully via ENV variable!")
-        except Exception as e:
-            logging.error(f"Firebase ENV Initialization Error: {e}")
-    else:
-        # ফাইল ব্যাকআপ (যদি ফাইল ব্যবহার করেন)
-        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
+            firebase_admin.initialize_app(cred, {'databaseURL': db_url})
+            logging.info("Firebase connected via FIREBASE_CONFIG_JSON!")
+        else:
+            cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+            if os.path.exists(cred_path):
+                cred = credentials.Certificate(cred_path)
+                firebase_admin.initialize_app(cred, {'databaseURL': db_url})
+                logging.info("Firebase connected via JSON file!")
+            else:
+                logging.critical("CRITICAL: No valid Firebase credentials found!")
+    except Exception as e:
+        logging.critical(f"CRITICAL: Firebase Failed to Initialize: {e}")
 
-# Enable logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Flask Server for Render Health Check
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive and running!"
+    return "Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# States for ConversationHandler
+# States
 ADD_SERVICE, ADD_COUNTRY, ADD_NUMBERS = range(3)
 
-# ---------------- TELEGRAM BOT HANDLERS ----------------
-
+# Main Keyboard
 def get_main_keyboard(user_id: int):
     keyboard = [
         ["Get number"],
@@ -80,9 +80,9 @@ def get_main_keyboard(user_id: int):
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear() # Clear state on start
     user_id = update.effective_user.id
-    reply_markup = get_main_keyboard(user_id)
-    await update.message.reply_text("স্বাগতম! নিচের মেনু থেকে অপশন নির্বাচন করুন:", reply_markup=reply_markup)
+    await update.message.reply_text("স্বাগতম! নিচের মেনু থেকে অপশন নির্বাচন করুন:", reply_markup=get_main_keyboard(user_id))
 
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -108,8 +108,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "Admin Panel" and user_id == ADMIN_ID:
         buttons = [
-            [InlineKeyboardButton("➕ Add Service & Numbers", callback_data="admin_add_service")],
-            [InlineKeyboardButton("📊 View Stats", callback_data="admin_stats")]
+            [InlineKeyboardButton("➕ Add Service & Numbers", callback_data="admin_add_service")]
         ]
         await update.message.reply_text("এডমিন প্যানেল:", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -119,17 +118,17 @@ async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await query.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
+    await query.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok):")
     return ADD_SERVICE
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['service_name'] = update.message.text.strip()
-    await update.message.reply_text("দেশের নাম লিখুন (যেমন: Bangladesh, Nepal):")
+    await update.message.reply_text("দেশের নাম লিখুন (যেমন: Bangladesh):")
     return ADD_COUNTRY
 
 async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['country_name'] = update.message.text.strip()
-    await update.message.reply_text("নম্বরগুলো লিখুন (প্রতি লাইনে একটি করে অথবা টেক্সট ফাইল পাঠান):")
+    await update.message.reply_text("নম্বরগুলো পাঠাও (টেক্সট ফাইল অথবা প্রতি লাইনে একটি নম্বর):")
     return ADD_NUMBERS
 
 async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,27 +140,30 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         numbers = [line.strip() for line in update.message.text.splitlines() if line.strip()]
 
-    service = context.user_data['service_name']
-    country = context.user_data['country_name']
+    service = context.user_data.get('service_name')
+    country = context.user_data.get('country_name')
 
-    ref = db.reference(f"numbers/{service}/{country}")
-    for num in numbers:
-        # Clean number (digits only)
-        clean_num = re.sub(r'\D', '', num)
-        if clean_num:
-            ref.push({"number": clean_num, "status": "available"})
+    if service and country and numbers:
+        ref = db.reference(f"numbers/{service}/{country}")
+        for num in numbers:
+            clean_num = re.sub(r'\D', '', num)
+            if clean_num:
+                ref.push({"number": clean_num, "status": "available"})
 
-    # Ensure service/country mapping exists
-    db.reference(f"services/{service}/{country}").set(True)
+        db.reference(f"services/{service}/{country}").set(True)
+        await update.message.reply_text(f"সফলভাবে {len(numbers)} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_main_keyboard(ADMIN_ID))
+    else:
+        await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_main_keyboard(ADMIN_ID))
 
-    await update.message.reply_text(f"সফলভাবে {len(numbers)} টি নম্বর যোগ করা হয়েছে {service} ({country}) এর জন্য।")
+    context.user_data.clear() # Clear state after complete
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।")
+    context.user_data.clear()
+    await update.message.reply_text("বাতিল করা হয়েছে।", reply_markup=get_main_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
-# Inline Keyboard Selection Flow for Users
+# Inline Handling
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -196,21 +198,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
 
         if not assigned_num:
-            await query.edit_message_text("দুঃখিত, এই ক্যাটাগরিতে কোনো নম্বর খালি নেই।")
+            await query.edit_message_text("দুঃখিত, কোনো খালি নম্বর নেই।")
             return
 
-        # Mark as allocated
         db.reference(f"numbers/{service}/{country}/{assigned_key}").update({"status": "allocated", "user_id": user_id})
         db.reference(f"allocations/{assigned_num}").set({"user_id": user_id, "service": service, "country": country})
 
-        await query.edit_message_text(f"আপনার নম্বর: `{assigned_num}`\n\nওটিপি আসার সাথে সাথে এখানে পাঠিয়ে দেওয়া হবে।", parse_mode="Markdown")
+        await query.edit_message_text(f"আপনার নম্বর: `{assigned_num}`\n\nওটিপি আসলে জানিয়ে দেওয়া হবে।", parse_mode="Markdown")
 
-# ---------------- OTP POLLING WORKER ----------------
-
+# Polling Function
 async def otp_poller(application: Application):
     processed_ids = set()
-    
-    # Load previously seen IDs from DB if needed
     seen_ref = db.reference("seen_otp_ids").get()
     if seen_ref:
         processed_ids = set(seen_ref.keys())
@@ -229,38 +227,31 @@ async def otp_poller(application: Application):
                     processed_ids.add(msg_id)
                     db.reference(f"seen_otp_ids/{msg_id}").set(True)
 
-                    # 1. Forward to Global Group
-                    group_text = f"📩 **New OTP Received**\n\n📱 **Number:** `{num}`\n💬 **Message:**\n`{msg}`"
-                    try:
-                        await application.bot.send_message(chat_id=OTP_GROUP_ID, text=group_text, parse_mode="Markdown")
-                    except Exception as e:
-                        logging.error(f"Group Forward Error: {e}")
+                    if OTP_GROUP_ID:
+                        try:
+                            await application.bot.send_message(chat_id=OTP_GROUP_ID, text=f"📩 **New OTP**\n📱 **Num:** `{num}`\n💬 `{msg}`", parse_mode="Markdown")
+                        except Exception as e:
+                            logging.error(f"Group Forward Error: {e}")
 
-                    # 2. Check allocated user and forward
                     alloc_ref = db.reference(f"allocations/{num}").get()
                     if alloc_ref:
                         allocated_user = alloc_ref.get("user_id")
-                        user_text = f"🎉 **আপনার OTP কোড এসেছে!**\n\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{msg}`"
                         try:
-                            await application.bot.send_message(chat_id=allocated_user, text=user_text, parse_mode="Markdown")
+                            await application.bot.send_message(chat_id=allocated_user, text=f"🎉 **আপনার OTP এসেছে!**\n📱 `{num}`\n💬 `{msg}`", parse_mode="Markdown")
                         except Exception as e:
                             logging.error(f"User Forward Error: {e}")
 
         except Exception as e:
-            logging.error(f"Polling loop exception: {e}")
+            logging.error(f"Polling Exception: {e}")
 
         await asyncio.sleep(5)
 
-# ---------------- MAIN APPLICATION ----------------
-
 def main():
-    # Start Flask thread
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # Build Telegram Bot
     application = Application.builder().token(TOKEN).build()
 
-    # Admin Conversation Handler
+    # Admin Conversation Fix with per_chat & per_user Settings
     admin_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_service_start, pattern="^admin_add_service$")],
         states={
@@ -269,6 +260,7 @@ def main():
             ADD_NUMBERS: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, receive_numbers)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -276,13 +268,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_menu))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Background task for OTP polling
     async def post_init(app: Application):
         asyncio.create_task(otp_poller(app))
 
     application.post_init = post_init
-
-    # Run bot
     application.run_polling()
 
 if __name__ == "__main__":
