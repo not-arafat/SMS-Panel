@@ -138,7 +138,6 @@ def set_setting(key: str, value: str):
 
 
 def get_admin_services_summary():
-    """Get services, countries, and available (unallocated) numbers count"""
     summary = {}
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         srv_ref = db.reference("services").get()
@@ -171,7 +170,6 @@ def get_admin_services_summary():
 
 
 def delete_service_db(service: str):
-    """Delete service and all associated numbers"""
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             db.reference(f"services/{service}").delete()
@@ -188,7 +186,6 @@ def delete_service_db(service: str):
 
 
 def delete_country_db(service: str, country: str):
-    """Delete specific country and its numbers from a service"""
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             db.reference(f"services/{service}/{country}").delete()
@@ -249,10 +246,18 @@ def build_service_manage_view(service: str):
     return text, InlineKeyboardMarkup(buttons)
 
 
-def init_firebase_system(run_migration=False):
+def init_firebase_system(run_migration=False, force_reinit=False):
     global CURRENT_DB_MODE
     if not HAS_FIREBASE_LIB:
+        CURRENT_DB_MODE = "SQLite (Local)"
         return False
+
+    if force_reinit and firebase_admin._apps:
+        try:
+            for app_name in list(firebase_admin._apps.keys()):
+                firebase_admin.delete_app(firebase_admin._apps[app_name])
+        except Exception as e:
+            logging.error(f"Error deleting previous firebase instance: {e}")
 
     if firebase_admin._apps:
         CURRENT_DB_MODE = "Firebase (Cloud)"
@@ -265,20 +270,23 @@ def init_firebase_system(run_migration=False):
     firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
 
     try:
-        if firebase_b64:
+        if os.path.exists(FIREBASE_JSON_PATH):
+            with open(FIREBASE_JSON_PATH, "r") as f:
+                cred_dict = json.load(f)
+        elif firebase_b64:
             decoded_json = base64.b64decode(firebase_b64).decode('utf-8')
             cred_dict = json.loads(decoded_json)
         elif firebase_json_env:
             cred_dict = json.loads(firebase_json_env)
             if "private_key" in cred_dict:
                 cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-        elif os.path.exists(FIREBASE_JSON_PATH):
-            with open(FIREBASE_JSON_PATH, "r") as f:
-                cred_dict = json.load(f)
 
         if cred_dict:
             cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
+            options = {}
+            if DATABASE_URL:
+                options['databaseURL'] = DATABASE_URL
+            firebase_admin.initialize_app(cred, options if options else None)
             CURRENT_DB_MODE = "Firebase (Cloud)"
             if run_migration:
                 migrate_sqlite_to_firebase()
@@ -373,7 +381,8 @@ def get_global_settings_keyboard():
 
 # ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    context.user_data.pop('service_name', None)
+    context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'main'
     user_id = update.effective_user.id
     msg = f"Welcome!\nSelect an option from menu: **{CURRENT_DB_MODE}**"
@@ -414,6 +423,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text == "Services" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'admin'
         text_msg, kbd = build_admin_services_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
@@ -512,33 +522,39 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_admin_keyboard())
 
-    context.user_data.clear()
+    context.user_data.pop('service_name', None)
+    context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'admin'
     return ConversationHandler.END
 
 async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
         return ConversationHandler.END
-    await query.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
+    else:
+        await update.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
     return WAIT_FIREBASE_FILE
 
 async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.document or not update.message.document.file_name.endswith('.json'):
-        await update.message.reply_text("ভুল ফাইল! শুধুমাত্র `.json` সার্ভিস একাউন্ট ফাইল আপলোড দিন।")
+        await update.message.reply_text("ভুল ফাইল! শুধুমাত্র `.json` সার্ভিস একাউন্ট ফাইল আপলোড দিন।", reply_markup=get_admin_keyboard())
         return ConversationHandler.END
 
     file = await context.bot.get_file(update.message.document.file_id)
     await file.download_to_drive(FIREBASE_JSON_PATH)
 
-    success = init_firebase_system(run_migration=True)
+    success = init_firebase_system(run_migration=True, force_reinit=True)
     if success:
         await update.message.reply_text("ফায়ারবেস ফাইল রিসিভড! ডাটাবেস সফলভাবে Firebase-এ সুইচেবল ও মাইগ্রেট হয়েছে। 🚀", reply_markup=get_admin_keyboard())
     else:
         await update.message.reply_text("ফাইল সেভ হয়েছে কিন্তু ফায়ারবেসে কানেক্ট হতে পারেনি। JSON চেক করুন।", reply_markup=get_admin_keyboard())
 
-    context.user_data.clear()
+    context.user_data.pop('service_name', None)
+    context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'admin'
     return ConversationHandler.END
 
@@ -558,6 +574,7 @@ async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     set_setting("channel", new_link)
+    context.user_data['current_menu'] = 'global_settings'
     await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}", reply_markup=get_global_settings_keyboard())
     return ConversationHandler.END
 
@@ -576,23 +593,50 @@ async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     set_setting("support", new_link)
+    context.user_data['current_menu'] = 'global_settings'
     await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {new_link}", reply_markup=get_global_settings_keyboard())
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    current_menu = context.user_data.get('current_menu', 'main')
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
 
-    if current_menu == 'global_settings':
-        reply_kbd = get_global_settings_keyboard()
-    elif current_menu == 'admin':
-        reply_kbd = get_admin_keyboard()
-    else:
-        reply_kbd = get_main_keyboard(user_id)
+    text = update.message.text if update.message else ""
 
-    await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=reply_kbd)
+    if text == "Global Settings" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'global_settings'
+        ch_val = get_setting("channel", "https://t.me/your_channel")
+        sp_val = get_setting("support", "@your_support")
+        msg = (
+            f"⚙️ **GLOBAL SETTINGS**\n\n"
+            f"📢 **Channel:** {ch_val}\n"
+            f"🎧 **Support:** {sp_val}\n\n"
+            f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
+        )
+        await update.message.reply_text(msg, reply_markup=get_global_settings_keyboard(), parse_mode="Markdown")
+    elif text == "Admin Panel" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'admin'
+        await update.message.reply_text(
+            f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**",
+            reply_markup=get_admin_keyboard(),
+            parse_mode="Markdown"
+        )
+    elif text == "Services" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'admin'
+        text_msg, kbd = build_admin_services_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    else:
+        current_menu = context.user_data.get('current_menu', 'main')
+        if current_menu == 'global_settings':
+            reply_kbd = get_global_settings_keyboard()
+        elif current_menu == 'admin':
+            reply_kbd = get_admin_keyboard()
+        else:
+            reply_kbd = get_main_keyboard(user_id)
+
+        await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=reply_kbd)
+
     return ConversationHandler.END
 
 
@@ -806,6 +850,7 @@ def main():
             CallbackQueryHandler(admin_add_service_start, pattern="^adm:srv:add$"),
             CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
             CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
+            MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("^Channel$"), set_channel_start),
             MessageHandler(filters.Regex("^Support$"), set_support_start),
         ],
@@ -819,7 +864,7 @@ def main():
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Back$"), cancel)
+            MessageHandler(filters.Regex("^(Back|Cancel|Admin Panel|Global Settings|Services|Get number)$"), cancel)
         ],
         per_message=False
     )
