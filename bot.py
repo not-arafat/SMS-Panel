@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import os
+import re
+import threading
 import requests
-from aiohttp import web
-
+from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, db
-
+from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -18,419 +19,261 @@ from telegram.ext import (
     filters,
 )
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-CONFIG = {
-    "BOT_TOKEN": os.getenv("BOT_TOKEN", "8943388643:AAFD6iYseE3AhEf7Epfep87TEzI_XTuSSdU"),
-    "ADMIN_ID": int(os.getenv("ADMIN_ID", "8067626951")),
-    "OTP_GROUP_ID": int(os.getenv("OTP_GROUP_ID", "-1004479178690")),
-    "FIREBASE_DATABASE_URL": os.getenv("FIREBASE_DATABASE_URL", "https://universal-test-e4a9c-default-rtdb.firebaseio.com/"),
-    "API_URL": os.getenv("API_URL", "https://server.teleroutex.com/api/message-data-record/viewstats?apiKey=xiaJtFpkTQyQHQUg5Qnq0DpjQxOYgbiYt2d4aCwzeVA%3D")
-}
+# ---------------- CONFIGURATION ----------------
+TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+API_URL = os.environ.get("API_URL")
 
-# Logging Setup
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
-# Firebase Init from JSON File
-try:
-    cred = credentials.Certificate("firebase_key.json")
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': CONFIG["FIREBASE_DATABASE_URL"]
-    })
-    logger.info("Firebase successfully initialized from firebase_key.json!")
-except Exception as e:
-    logger.error(f"Firebase Initialization Error: {e}")
+# Initialize Firebase
+if not firebase_admin._apps:
+    # Set GOOGLE_APPLICATION_CREDENTIALS in env or place serviceAccountKey.json in directory
+    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
+    else:
+        # Fallback for platforms with injected JSON string
+        import json
+        service_account_info = json.loads(os.environ.get("FIREBASE_CONFIG_JSON", "{}"))
+        cred = credentials.Certificate(service_account_info)
+        firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
 
-# Firebase References
-ref_services = db.reference('services')
-ref_numbers = db.reference('numbers')
-ref_allocated = db.reference('allocated_numbers')
-ref_processed = db.reference('processed_msg_ids')
+# Enable logging
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Conversation States
-WAITING_SERVICE_NAME = 1
-WAITING_COUNTRY_SERVICE = 2
-WAITING_COUNTRY_NAME = 3
-WAITING_NUMBER_SERVICE = 4
-WAITING_NUMBER_COUNTRY = 5
-WAITING_NUMBERS_INPUT = 6
+# Flask Server for Render Health Check
+app = Flask(__name__)
 
-# Helper Keyboards
+@app.route('/')
+def home():
+    return "Bot is alive and running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+# States for ConversationHandler
+ADD_SERVICE, ADD_COUNTRY, ADD_NUMBERS = range(3)
+
+# ---------------- TELEGRAM BOT HANDLERS ----------------
+
 def get_main_keyboard(user_id: int):
     keyboard = [
-        ["Get Number"],
+        ["Get number"],
         ["Channel", "Support"]
     ]
-    if user_id == CONFIG["ADMIN_ID"]:
+    if user_id == ADMIN_ID:
         keyboard.append(["Admin Panel"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text(
-        "স্বাগতম! নিচের মেনু থেকে অপশন সিলেক্ট করুন:",
-        reply_markup=get_main_keyboard(user_id)
-    )
-    return ConversationHandler.END
+    reply_markup = get_main_keyboard(user_id)
+    await update.message.reply_text("স্বাগতম! নিচের মেনু থেকে অপশন নির্বাচন করুন:", reply_markup=reply_markup)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
 
-    if text == "Channel":
-        await update.message.reply_text("আমাদের চ্যানেল লিংক: https://t.me/your_channel")
+    if text == "Get number":
+        services_ref = db.reference("services").get()
+        if not services_ref:
+            await update.message.reply_text("বর্তমানে কোনো সার্ভিস এভেলেবল নেই।")
+            return
+        
+        buttons = []
+        for service_name in services_ref.keys():
+            buttons.append([InlineKeyboardButton(service_name, callback_data=f"srv_{service_name}")])
+        
+        await update.message.reply_text("একটি সার্ভিস সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif text == "Channel":
+        await update.message.reply_text("আমাদের অফিশিয়াল চ্যানেল: https://t.me/your_channel")
+
     elif text == "Support":
-        await update.message.reply_text("সাপোর্টের জন্য যোগাযোগ করুন: @your_support")
-    elif text == "Get Number":
-        await show_services(update, context)
-    elif text == "Admin Panel" and user_id == CONFIG["ADMIN_ID"]:
-        await show_admin_panel(update, context)
+        await update.message.reply_text("যেকোনো সাহায্যের জন্য যোগাযোগ করুন: @your_support")
 
-# User Flow
-async def show_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        services_data = ref_services.get()
-    except Exception as e:
-        logger.error(f"Error fetching services: {e}")
-        await update.message.reply_text("ডেটাবেজ কানেকশনে সমস্যা হচ্ছে।")
-        return
+    elif text == "Admin Panel" and user_id == ADMIN_ID:
+        buttons = [
+            [InlineKeyboardButton("➕ Add Service & Numbers", callback_data="admin_add_service")],
+            [InlineKeyboardButton("📊 View Stats", callback_data="admin_stats")]
+        ]
+        await update.message.reply_text("এডমিন প্যানেল:", reply_markup=InlineKeyboardMarkup(buttons))
 
-    if not services_data or not isinstance(services_data, dict):
-        await update.message.reply_text("বর্তমানে কোনো সার্ভিস এভেইলএবল নেই।")
-        return
-
-    keyboard = []
-    for s_id, s_val in services_data.items():
-        if isinstance(s_val, dict) and 'name' in s_val:
-            keyboard.append([InlineKeyboardButton(s_val['name'], callback_data=f"user_service_{s_id}")])
-
-    if not keyboard:
-        await update.message.reply_text("বর্তমানে কোনো সার্ভিস এভেইলএবল নেই।")
-        return
-
-    markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("সার্ভিস সিলেক্ট করুন:", reply_markup=markup)
-
-async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Admin Conversation Flow
+async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    await query.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
+    return ADD_SERVICE
+
+async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['service_name'] = update.message.text.strip()
+    await update.message.reply_text("দেশের নাম লিখুন (যেমন: Bangladesh, Nepal):")
+    return ADD_COUNTRY
+
+async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['country_name'] = update.message.text.strip()
+    await update.message.reply_text("নম্বরগুলো লিখুন (প্রতি লাইনে একটি করে অথবা টেক্সট ফাইল পাঠান):")
+    return ADD_NUMBERS
+
+async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    numbers = []
+    if update.message.document:
+        file = await context.bot.get_file(update.message.document.file_id)
+        content = (await file.download_as_bytearray()).decode('utf-8')
+        numbers = [line.strip() for line in content.splitlines() if line.strip()]
+    else:
+        numbers = [line.strip() for line in update.message.text.splitlines() if line.strip()]
+
+    service = context.user_data['service_name']
+    country = context.user_data['country_name']
+
+    ref = db.reference(f"numbers/{service}/{country}")
+    for num in numbers:
+        # Clean number (digits only)
+        clean_num = re.sub(r'\D', '', num)
+        if clean_num:
+            ref.push({"number": clean_num, "status": "available"})
+
+    # Ensure service/country mapping exists
+    db.reference(f"services/{service}/{country}").set(True)
+
+    await update.message.reply_text(f"সফলভাবে {len(numbers)} টি নম্বর যোগ করা হয়েছে {service} ({country}) এর জন্য।")
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।")
+    return ConversationHandler.END
+
+# Inline Keyboard Selection Flow for Users
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     data = query.data
+    user_id = query.from_user.id
+    await query.answer()
 
-    if data.startswith("user_service_"):
-        service_id = data.split("_")[2]
-        services_data = ref_services.get() or {}
-        countries = services_data.get(service_id, {}).get("countries", {})
-        
-        if not countries or not isinstance(countries, dict):
-            await query.edit_message_text("এই সার্ভিসের জন্য কোনো কান্ট্রি নেই।")
+    if data.startswith("srv_"):
+        service = data.split("_")[1]
+        countries_ref = db.reference(f"services/{service}").get()
+        if not countries_ref:
+            await query.edit_message_text("এই সার্ভিসে কোনো দেশ পাওয়া যায়নি।")
             return
-            
-        keyboard = []
-        for c_id, c_val in countries.items():
-            if isinstance(c_val, dict) and 'name' in c_val:
-                keyboard.append([InlineKeyboardButton(c_val['name'], callback_data=f"user_country_{service_id}_{c_id}")])
         
-        if not keyboard:
-            await query.edit_message_text("এই সার্ভিসের জন্য কোনো কান্ট্রি নেই।")
-            return
-
-        await query.edit_message_text("কান্ট্রি সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data.startswith("user_country_"):
-        _, _, service_id, country_id = data.split("_")
-        user_id = query.from_user.id
+        buttons = []
+        for country in countries_ref.keys():
+            buttons.append([InlineKeyboardButton(country, callback_data=f"cnt_{service}_{country}")])
         
-        all_numbers = ref_numbers.get() or {}
+        await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("cnt_"):
+        _, service, country = data.split("_")
+        numbers_ref = db.reference(f"numbers/{service}/{country}").get()
+        
         assigned_num = None
         assigned_key = None
 
-        if isinstance(all_numbers, dict):
-            for n_key, n_val in all_numbers.items():
-                if isinstance(n_val, dict):
-                    if n_val.get("service_id") == service_id and n_val.get("country_id") == country_id and not n_val.get("status"):
-                        assigned_num = n_val.get("number")
-                        assigned_key = n_key
-                        break
+        if numbers_ref:
+            for key, val in numbers_ref.items():
+                if val.get("status") == "available":
+                    assigned_num = val.get("number")
+                    assigned_key = key
+                    break
 
         if not assigned_num:
-            await query.edit_message_text("দুঃখিত, এই কান্ট্রির কোনো ফাঁকা নাম্বার এভেইলএবল নেই।")
+            await query.edit_message_text("দুঃখিত, এই ক্যাটাগরিতে কোনো নম্বর খালি নেই।")
             return
 
-        ref_numbers.child(assigned_key).update({"status": "used"})
-        ref_allocated.child(str(assigned_num)).set({
-            "user_id": user_id
-        })
+        # Mark as allocated
+        db.reference(f"numbers/{service}/{country}/{assigned_key}").update({"status": "allocated", "user_id": user_id})
+        db.reference(f"allocations/{assigned_num}").set({"user_id": user_id, "service": service, "country": country})
 
-        await query.edit_message_text(
-            f"আপনার প্রাপ্ত নাম্বার: `{assigned_num}`\n\n"
-            "এই নাম্বারে OTP পাঠালে কিছুক্ষণের মধ্যে বোট আপনাকে ফরওয়ার্ড করবে।",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"আপনার নম্বর: `{assigned_num}`\n\nওটিপি আসার সাথে সাথে এখানে পাঠিয়ে দেওয়া হবে।", parse_mode="Markdown")
 
-# Admin Panel Functions
-async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Add Service", callback_data="admin_add_service")],
-        [InlineKeyboardButton("Add Country", callback_data="admin_add_country")],
-        [InlineKeyboardButton("Add Numbers", callback_data="admin_add_numbers")]
-    ]
-    await update.message.reply_text("এডমিন প্যানেল:", reply_markup=InlineKeyboardMarkup(keyboard))
+# ---------------- OTP POLLING WORKER ----------------
 
-async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "admin_add_service":
-        await query.edit_message_text("নতুন সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
-        return WAITING_SERVICE_NAME
-
-    elif data == "admin_add_country":
-        services_data = ref_services.get() or {}
-        if not services_data or not isinstance(services_data, dict):
-            await query.edit_message_text("আগে সার্ভিস এড করুন।")
-            return ConversationHandler.END
-
-        keyboard = []
-        for k, v in services_data.items():
-            if isinstance(v, dict) and 'name' in v:
-                keyboard.append([InlineKeyboardButton(v['name'], callback_data=f"adc_{k}")])
-
-        if not keyboard:
-            await query.edit_message_text("কোনো সার্ভিস পাওয়া যায়নি। আগে সার্ভিস এড করুন।")
-            return ConversationHandler.END
-
-        await query.edit_message_text("কোন সার্ভিসে কান্ট্রি এড করতে চান?", reply_markup=InlineKeyboardMarkup(keyboard))
-        return WAITING_COUNTRY_SERVICE
-
-    elif data == "admin_add_numbers":
-        services_data = ref_services.get() or {}
-        if not services_data or not isinstance(services_data, dict):
-            await query.edit_message_text("আগে সার্ভিস ও কান্ট্রি এড করুন।")
-            return ConversationHandler.END
-
-        keyboard = []
-        for k, v in services_data.items():
-            if isinstance(v, dict) and 'name' in v:
-                keyboard.append([InlineKeyboardButton(v['name'], callback_data=f"adn_s_{k}")])
-
-        if not keyboard:
-            await query.edit_message_text("কোনো সার্ভিস পাওয়া যায়নি।")
-            return ConversationHandler.END
-
-        await query.edit_message_text("সার্ভিস সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return WAITING_NUMBER_SERVICE
-
-async def save_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    try:
-        ref_services.push({'name': name})
-        await update.message.reply_text(f"সার্ভিস '{name}' সফলভাবে সেভ হয়েছে!", reply_markup=get_main_keyboard(update.effective_user.id))
-    except Exception as e:
-        logger.error(f"Save service error: {e}")
-        await update.message.reply_text(f"❌ এরর: {str(e)}")
-    return ConversationHandler.END
-
-async def select_country_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    service_id = query.data.replace("adc_", "")
-    context.user_data['target_service'] = service_id
-    await query.edit_message_text("কান্ট্রির নাম লিখুন (যেমন: Bangladesh):")
-    return WAITING_COUNTRY_NAME
-
-async def save_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    country_name = update.message.text.strip()
-    service_id = context.user_data.get('target_service')
+async def otp_poller(application: Application):
+    processed_ids = set()
     
-    if service_id:
-        try:
-            ref_services.child(service_id).child("countries").push({'name': country_name})
-            await update.message.reply_text(f"কান্ট্রি '{country_name}' সফলভাবে সেভ হয়েছে!", reply_markup=get_main_keyboard(update.effective_user.id))
-        except Exception as e:
-            logger.error(f"Save country error: {e}")
-            await update.message.reply_text(f"❌ এরর: {str(e)}")
-    return ConversationHandler.END
+    # Load previously seen IDs from DB if needed
+    seen_ref = db.reference("seen_otp_ids").get()
+    if seen_ref:
+        processed_ids = set(seen_ref.keys())
 
-async def select_number_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    service_id = query.data.replace("adn_s_", "")
-    context.user_data['num_service'] = service_id
-
-    services_data = ref_services.get() or {}
-    countries = services_data.get(service_id, {}).get("countries", {}) if isinstance(services_data, dict) else {}
-    
-    if not countries or not isinstance(countries, dict):
-        await query.edit_message_text("এই সার্ভিসে কোনো কান্ট্রি নেই। আগে কান্ট্রি এড করুন।")
-        return ConversationHandler.END
-
-    keyboard = []
-    for k, v in countries.items():
-        if isinstance(v, dict) and 'name' in v:
-            keyboard.append([InlineKeyboardButton(v['name'], callback_data=f"adn_c_{k}")])
-
-    await query.edit_message_text("কান্ট্রি সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return WAITING_NUMBER_COUNTRY
-
-async def select_number_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    country_id = query.data.replace("adn_c_", "")
-    context.user_data['num_country'] = country_id
-
-    await query.edit_message_text("এবার লাইন বাই লাইন নাম্বার লিখে অথবা একটি `.txt` ফাইল আপলোড করে পাঠান:")
-    return WAITING_NUMBERS_INPUT
-
-async def save_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    service_id = context.user_data.get('num_service')
-    country_id = context.user_data.get('num_country')
-    numbers_list = []
-
-    if update.message.document:
-        file = await update.message.document.get_file()
-        content = (await file.download_as_bytearray()).decode('utf-8')
-        numbers_list = [line.strip() for line in content.splitlines() if line.strip()]
-    elif update.message.text:
-        numbers_list = [line.strip() for line in update.message.text.splitlines() if line.strip()]
-
-    added_count = 0
-    for num in numbers_list:
-        ref_numbers.push({
-            'number': num,
-            'service_id': service_id,
-            'country_id': country_id,
-            'status': None
-        })
-        added_count += 1
-
-    await update.message.reply_text(f"মোট {added_count} টি নাম্বার সফলভাবে সেভ করা হয়েছে।", reply_markup=get_main_keyboard(update.effective_user.id))
-    return ConversationHandler.END
-
-async def cancel_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("প্রক্রিয়া বাতিল করা হয়েছে।", reply_markup=get_main_keyboard(update.effective_user.id))
-    return ConversationHandler.END
-
-# Background Task for checking OTPs
-async def check_otp_loop(app: Application):
     while True:
         try:
-            response = requests.get(CONFIG["API_URL"], timeout=10)
-            if response.status_code == 200:
-                json_data = response.json()
-                docs = json_data.get("data", {}).get("docs", [])
-                
-                processed_ids = ref_processed.get() or {}
+            res = requests.get(API_URL, timeout=10).json()
+            docs = res.get("data", {}).get("docs", [])
 
-                for doc in docs:
-                    msg_id = doc.get("_id")
-                    number = doc.get("number")
-                    message = doc.get("message")
-                    cli = doc.get("cli")
+            for item in docs:
+                msg_id = item.get("_id")
+                num = item.get("number")
+                msg = item.get("message")
 
-                    if msg_id and msg_id not in processed_ids:
-                        text_to_send = f"<b>New OTP Received!</b>\n\n<b>Sender:</b> {cli}\n<b>Number:</b> {number}\n<b>Message:</b>\n<code>{message}</code>"
-                        
-                        if CONFIG["OTP_GROUP_ID"] != 0:
-                            try:
-                                await app.bot.send_message(chat_id=CONFIG["OTP_GROUP_ID"], text=text_to_send, parse_mode="HTML")
-                            except Exception as e:
-                                logger.error(f"Group Forward Error: {e}")
+                if msg_id and msg_id not in processed_ids:
+                    processed_ids.add(msg_id)
+                    db.reference(f"seen_otp_ids/{msg_id}").set(True)
 
-                        allocated_data = ref_allocated.child(str(number)).get() if isinstance(ref_allocated, db.Reference) else None
-                        if allocated_data and isinstance(allocated_data, dict):
-                            user_id = allocated_data.get("user_id")
-                            try:
-                                await app.bot.send_message(chat_id=user_id, text=f"আপনার ওটিপি চলে এসেছে!\n\n{text_to_send}", parse_mode="HTML")
-                            except Exception as e:
-                                logger.error(f"User Forward Error: {e}")
+                    # 1. Forward to Global Group
+                    group_text = f"📩 **New OTP Received**\n\n📱 **Number:** `{num}`\n💬 **Message:**\n`{msg}`"
+                    try:
+                        await application.bot.send_message(chat_id=OTP_GROUP_ID, text=group_text, parse_mode="Markdown")
+                    except Exception as e:
+                        logging.error(f"Group Forward Error: {e}")
 
-                        ref_processed.child(msg_id).set(True)
+                    # 2. Check allocated user and forward
+                    alloc_ref = db.reference(f"allocations/{num}").get()
+                    if alloc_ref:
+                        allocated_user = alloc_ref.get("user_id")
+                        user_text = f"🎉 **আপনার OTP কোড এসেছে!**\n\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{msg}`"
+                        try:
+                            await application.bot.send_message(chat_id=allocated_user, text=user_text, parse_mode="Markdown")
+                        except Exception as e:
+                            logging.error(f"User Forward Error: {e}")
 
         except Exception as e:
-            logger.error(f"Error in OTP Loop: {e}")
+            logging.error(f"Polling loop exception: {e}")
 
         await asyncio.sleep(5)
 
-# HTTP Health Check Server for Render Web Service
-async def health_check_handler(request):
-    return web.Response(text="Bot is running alive!")
+# ---------------- MAIN APPLICATION ----------------
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health_check_handler)
-    app.router.add_get('/health', health_check_handler)
-    
-    port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logger.info(f"Web server started on port {port}")
+def main():
+    # Start Flask thread
+    threading.Thread(target=run_flask, daemon=True).start()
 
-# Main Runner Setup
-async def run_bot():
-    application = Application.builder().token(CONFIG["BOT_TOKEN"]).build()
+    # Build Telegram Bot
+    application = Application.builder().token(TOKEN).build()
 
+    # Admin Conversation Handler
     admin_conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(admin_callback_handler, pattern="^admin_")
-        ],
+        entry_points=[CallbackQueryHandler(admin_add_service_start, pattern="^admin_add_service$")],
         states={
-            WAITING_SERVICE_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_service_name)
-            ],
-            WAITING_COUNTRY_SERVICE: [
-                CallbackQueryHandler(select_country_service, pattern="^adc_")
-            ],
-            WAITING_COUNTRY_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_country_name)
-            ],
-            WAITING_NUMBER_SERVICE: [
-                CallbackQueryHandler(select_number_service, pattern="^adn_s_")
-            ],
-            WAITING_NUMBER_COUNTRY: [
-                CallbackQueryHandler(select_number_country, pattern="^adn_c_")
-            ],
-            WAITING_NUMBERS_INPUT: [
-                MessageHandler(filters.TEXT | filters.Document.MimeType("text/plain"), save_numbers)
-            ]
+            ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_service_name)],
+            ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_country_name)],
+            ADD_NUMBERS: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, receive_numbers)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel_admin),
-            MessageHandler(filters.Regex("^(Get Number|Channel|Support|Admin Panel)$"), cancel_admin)
-        ],
-        allow_reentry=True
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(admin_conv)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(user_callback_handler, pattern="^user_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_menu))
+    application.add_handler(CallbackQueryHandler(handle_callback))
 
+    # Background task for OTP polling
     async def post_init(app: Application):
-        asyncio.create_task(check_otp_loop(app))
+        asyncio.create_task(otp_poller(app))
 
     application.post_init = post_init
 
-    # Start dummy web server to pass Render Web Service port check
-    await start_web_server()
-
-    # Initialize and start polling
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    # Keep the loop running
-    await asyncio.Event().wait()
+    # Run bot
+    application.run_polling()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_bot())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    main()
