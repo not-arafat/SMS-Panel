@@ -46,7 +46,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 # Filter for main reply menu buttons to prevent accidental conversation lock
-MENU_FILTER = filters.Regex("^(Get number|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Get number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Back)$")
 
 
 def get_db_connection():
@@ -258,7 +258,7 @@ def build_service_manage_view(service: str):
     ]
     if cnts:
         buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}", style="danger")])
-    buttons.append([create_button("⬅️ Back to Services", callback_data="adm:srv:list", style="danger")])
+    buttons.append([create_button("Back to Services", callback_data="adm:srv:list", style="danger")])
 
     return text, InlineKeyboardMarkup(buttons)
 
@@ -427,13 +427,23 @@ def run_flask():
 
 # ---------------- KEYBOARDS ----------------
 def get_main_keyboard(user_id: int):
-    keyboard = [
-        ["Get number"],
-        ["Channel", "Support"]
+    keyboard_layout = [
+        [
+            {"text": "Get Number", "style": "success"}
+        ],
+        [
+            {"text": "Profile", "style": "primary"},
+            {"text": "Wallet", "style": "primary"}
+        ],
+        [
+            {"text": "Channel", "style": "danger"},
+            {"text": "Support", "style": "danger"}
+        ]
     ]
     if user_id == ADMIN_ID:
-        keyboard.append(["Admin Panel"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        keyboard_layout.append([{"text": "Admin Panel", "style": "danger"}])
+        
+    return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 def get_admin_keyboard():
@@ -459,12 +469,36 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
 
-    if text == "Get number":
+    if text in ["Get Number", "Get number"]:
         kbd, msg = get_services_keyboard()
         if not kbd:
             await update.message.reply_text(msg)
         else:
             await update.message.reply_text(msg, reply_markup=kbd)
+
+    elif text == "Profile":
+        first_name = update.effective_user.first_name or "User"
+        bot_username = context.bot.username or "bot"
+        refer_link = f"https://t.me/{bot_username}?start={user_id}"
+        
+        profile_text = (
+            f"👤 **USER PROFILE**\n\n"
+            f"📝 **Name:** {first_name}\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"💰 **Balance:** `0.00 ৳`"
+        )
+        kbd = InlineKeyboardMarkup([
+            [create_button("📋 Copy Referral Link", copy_text=refer_link, style="success")]
+        ])
+        await update.message.reply_text(profile_text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif text == "Wallet":
+        wallet_text = (
+            f"👛 **YOUR WALLET**\n\n"
+            f"🆔 **User ID:** `{user_id}`\n"
+            f"💰 **Balance:** `0.00 ৳`"
+        )
+        await update.message.reply_text(wallet_text, parse_mode="Markdown")
 
     elif text == "Channel":
         ch_link = get_setting("channel", "https://t.me/your_channel")
@@ -725,7 +759,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = []
         for cnt in cnts.keys():
             buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
-        buttons.append([create_button("⬅️ Back", callback_data=f"adm:srv:view:{service}", style="danger")])
+        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
         await query.edit_message_text(f"**{service}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
@@ -762,7 +796,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         buttons = [[create_button(cnt, callback_data=f"cnt_{service}_{cnt}", style="primary")] for cnt in countries]
-        buttons.append([create_button("⬅️ Back", callback_data="back_to_services", style="danger")])
+        buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
         await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("cnt_"):
@@ -857,7 +891,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.commit()
             else:
                 cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_number))
-                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_number, user_id, service, country))
+                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
                 conn.commit()
             conn.close()
 
