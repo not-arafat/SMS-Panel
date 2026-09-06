@@ -17,7 +17,7 @@ except ImportError:
     HAS_FIREBASE_LIB = False
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -91,10 +91,24 @@ def init_sqlite():
     ''')
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
     conn.commit()
     conn.close()
 
 init_sqlite()
+
+
+def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> dict:
+    btn = {"text": text}
+    if callback_data:
+        btn["callback_data"] = callback_data
+    if url:
+        btn["url"] = url
+    if copy_text:
+        btn["copy_text"] = {"text": copy_text}
+    if style:
+        btn["style"] = style
+    return btn
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -205,7 +219,7 @@ def build_admin_services_view():
     summary = get_admin_services_summary()
     if not summary:
         text = "📱 **SERVICES MANAGEMENT**\n\nবর্তমানে কোনো সার্ভিস যুক্ত করা নেই।"
-        buttons = [[InlineKeyboardButton("➕ Add New Service", callback_data="adm:srv:add")]]
+        buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
         return text, InlineKeyboardMarkup(buttons)
 
     text = "📱 **SERVICES MANAGEMENT**\n\nনিচে আপনার সার্ভিসসমূহ এবং আনইউজড/এভেলেবল নম্বরের বিবরণ দেওয়া হলো:\n"
@@ -215,9 +229,9 @@ def build_admin_services_view():
         text += f"\n🔹 **{srv}** (Total Available: `{total_avail}`)"
         for cnt, count in cnts.items():
             text += f"\n   └ {cnt}: `{count}` টি"
-        buttons.append([InlineKeyboardButton(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}")])
+        buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
 
-    buttons.append([InlineKeyboardButton("➕ Add New Service / Numbers", callback_data="adm:srv:add")])
+    buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -236,12 +250,12 @@ def build_service_manage_view(service: str):
         text += "কোনো দেশ যুক্ত নেই।\n"
 
     buttons = [
-        [InlineKeyboardButton("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}")],
-        [InlineKeyboardButton("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}")],
+        [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}", style="success")],
+        [create_button("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}", style="danger")],
     ]
     if cnts:
-        buttons.append([InlineKeyboardButton("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}")])
-    buttons.append([InlineKeyboardButton("⬅️ Back to Services", callback_data="adm:srv:list")])
+        buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}", style="danger")])
+    buttons.append([create_button("⬅️ Back to Services", callback_data="adm:srv:list", style="danger")])
 
     return text, InlineKeyboardMarkup(buttons)
 
@@ -249,19 +263,57 @@ def build_service_manage_view(service: str):
 def build_global_settings_view():
     ch_val = get_setting("channel", "https://t.me/your_channel")
     sp_val = get_setting("support", "@your_support")
+    otp_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
     text = (
         f"⚙️ **GLOBAL SETTINGS**\n\n"
         f"📢 **Channel:** {ch_val}\n"
-        f"🎧 **Support:** {sp_val}\n\n"
+        f"🎧 **Support:** {sp_val}\n"
+        f"🔗 **OTP Group Link:** {otp_link}\n\n"
         f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
     )
     buttons = [
         [
-            InlineKeyboardButton("📢 Edit Channel", callback_data="adm:set:channel"),
-            InlineKeyboardButton("🎧 Edit Support", callback_data="adm:set:support")
+            create_button("📢 Edit Channel", callback_data="adm:set:channel", style="primary"),
+            create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")
+        ],
+        [
+            create_button("🔗 Edit OTP Group Link", callback_data="adm:set:otplink", style="primary")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
+
+
+def build_allocation_keyboard(service: str, country: str, number: str):
+    otp_group_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
+    buttons = [
+        [create_button(f"{number}", copy_text=number, style="success")],
+        [
+            create_button("Change", callback_data=f"change_{service}_{country}_{number}", style="primary"),
+            create_button("OTP Group", url=otp_group_link, style="primary")
+        ],
+        [create_button("Back", callback_data=f"srv_{service}", style="danger")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_services_keyboard():
+    services = []
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        services_ref = db.reference("services").get()
+        if services_ref and isinstance(services_ref, dict):
+            services = list(services_ref.keys())
+    else:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT service_name FROM services")
+        services = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+    if not services:
+        return None, "বর্তমানে কোনো সার্ভিস এভেলেবল নেই।"
+
+    buttons = [[create_button(srv, callback_data=f"srv_{srv}", style="primary")] for srv in services]
+    return InlineKeyboardMarkup(buttons), "একটি সার্ভিস সিলেক্ট করুন:"
 
 
 def init_firebase_system(run_migration=False, force_reinit=False):
@@ -366,7 +418,8 @@ def run_flask():
     WAIT_FIREBASE_FILE,
     WAIT_CHANNEL,
     WAIT_SUPPORT,
-) = range(6)
+    WAIT_OTP_LINK,
+) = range(7)
 
 
 # ---------------- KEYBOARDS ----------------
@@ -402,27 +455,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
-    current_menu = context.user_data.get('current_menu', 'main')
 
     if text == "Get number":
-        services = []
-        if CURRENT_DB_MODE == "Firebase (Cloud)":
-            services_ref = db.reference("services").get()
-            if services_ref and isinstance(services_ref, dict):
-                services = list(services_ref.keys())
+        kbd, msg = get_services_keyboard()
+        if not kbd:
+            await update.message.reply_text(msg)
         else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT service_name FROM services")
-            services = [row[0] for row in cursor.fetchall()]
-            conn.close()
-
-        if not services:
-            await update.message.reply_text("বর্তমানে কোনো সার্ভিস এভেলেবল নেই।")
-            return
-
-        buttons = [[InlineKeyboardButton(srv, callback_data=f"srv_{srv}")] for srv in services]
-        await update.message.reply_text("একটি সার্ভিস সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(buttons))
+            await update.message.reply_text(msg, reply_markup=kbd)
 
     elif text == "Channel":
         ch_link = get_setting("channel", "https://t.me/your_channel")
@@ -452,10 +491,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "Back":
         context.user_data['current_menu'] = 'main'
-        await update.message.reply_text(
-            "প্রধান মেনু:",
-            reply_markup=get_main_keyboard(user_id)
-        )
+        await update.message.reply_text("প্রধান মেনু:", reply_markup=get_main_keyboard(user_id))
 
 
 # ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
@@ -596,6 +632,23 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
+async def set_otplink_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        if query.from_user.id != ADMIN_ID:
+            return ConversationHandler.END
+        await query.message.reply_text("নতুন OTP Group লিঙ্ক লিখুন (যেমন: https://t.me/your_otp_group):")
+    return WAIT_OTP_LINK
+
+async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_link = update.message.text.strip()
+    set_setting("otp_group_link", new_link)
+    await update.message.reply_text(f"✅ সফলভাবে OTP Group লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}")
+    text_msg, kbd = build_global_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     context.user_data.pop('service_name', None)
@@ -634,16 +687,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
-    await query.answer()
+
+    if data == "back_to_services":
+        await query.answer()
+        kbd, msg = get_services_keyboard()
+        if not kbd:
+            await query.edit_message_text(msg)
+        else:
+            await query.edit_message_text(msg, reply_markup=kbd)
+        return
 
     # Admin Management Actions
     if data == "adm:srv:list":
+        await query.answer()
         if user_id != ADMIN_ID:
             return
         text, kbd = build_admin_services_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:view:"):
+        await query.answer()
         if user_id != ADMIN_ID:
             return
         service = data.split(":", 3)[3]
@@ -652,6 +715,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:srv:del:"):
         if user_id != ADMIN_ID:
+            await query.answer()
             return
         service = data.split(":", 3)[3]
         delete_service_db(service)
@@ -660,6 +724,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:delli:"):
+        await query.answer()
         if user_id != ADMIN_ID:
             return
         service = data.split(":", 3)[3]
@@ -667,12 +732,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cnts = summary.get(service, {})
         buttons = []
         for cnt in cnts.keys():
-            buttons.append([InlineKeyboardButton(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}")])
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"adm:srv:view:{service}")])
+            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
+        buttons.append([create_button("⬅️ Back", callback_data=f"adm:srv:view:{service}", style="danger")])
         await query.edit_message_text(f"**{service}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
         if user_id != ADMIN_ID:
+            await query.answer()
             return
         parts = data.split(":", 4)
         if len(parts) >= 5:
@@ -684,6 +750,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # User Get Number Flow
     elif data.startswith("srv_"):
+        await query.answer()
         service = data.split("_", 1)[1]
         countries = []
 
@@ -702,10 +769,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("এই সার্ভিসে কোনো দেশ পাওয়া যায়নি।")
             return
 
-        buttons = [[InlineKeyboardButton(cnt, callback_data=f"cnt_{service}_{cnt}")] for cnt in countries]
+        buttons = [[create_button(cnt, callback_data=f"cnt_{service}_{cnt}", style="primary")] for cnt in countries]
+        buttons.append([create_button("⬅️ Back", callback_data="back_to_services", style="danger")])
         await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("cnt_"):
+        await query.answer()
         parts = data.split("_", 2)
         if len(parts) < 3:
             await query.edit_message_text("অবৈধ কমান্ড।")
@@ -742,7 +811,77 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("দুঃখিত, এই ক্যাটাগরিতে কোনো নম্বর খালি নেই।")
             return
 
-        await query.edit_message_text(f"আপনার নম্বর: `{assigned_num}`\n\nওটিপি আসার সাথে সাথে জানিয়ে দেওয়া হবে।", parse_mode="Markdown")
+        alloc_msg = (
+            "━━━━━━━━━━━━━━━\n"
+            "Number Allocated \n"
+            "— — — — — — — — — —\n"
+            f"📘 {service} ➜ {country}\n"
+            "━━━━━━━━━━━━━━━"
+        )
+        kbd = build_allocation_keyboard(service, country, assigned_num)
+        await query.edit_message_text(alloc_msg, reply_markup=kbd)
+
+    elif data.startswith("change_"):
+        parts = data.split("_", 3)
+        if len(parts) < 4:
+            await query.answer("অবৈধ অনুরোধ!", show_alert=True)
+            return
+
+        service, country, old_number = parts[1], parts[2], parts[3]
+        new_num = None
+
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            db.reference(f"numbers/{service}/{country}/{old_number}").update({"status": "available", "user_id": 0})
+            db.reference(f"allocations/{old_number}").delete()
+
+            numbers_ref = db.reference(f"numbers/{service}/{country}").get()
+            if numbers_ref and isinstance(numbers_ref, dict):
+                for key, val in numbers_ref.items():
+                    if isinstance(val, dict) and val.get("status") == "available" and val.get("number") != old_number:
+                        new_num = val.get("number")
+                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
+                        db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
+                        break
+
+            if not new_num:
+                db.reference(f"numbers/{service}/{country}/{old_number}").update({"status": "allocated", "user_id": user_id})
+                db.reference(f"allocations/{old_number}").set({"user_id": user_id, "service": service, "country": country})
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_number,))
+            cursor.execute("DELETE FROM allocations WHERE number = ?", (old_number,))
+
+            cursor.execute(
+                "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number != ? LIMIT 1",
+                (service, country, old_number)
+            )
+            row = cursor.fetchone()
+            if row:
+                num_id, new_num = row
+                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
+                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
+                conn.commit()
+            else:
+                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_number))
+                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_number, user_id, service, country))
+                conn.commit()
+            conn.close()
+
+        if new_num:
+            await query.answer("successfully changed", show_alert=False)
+            alloc_msg = (
+                "━━━━━━━━━━━━━━━\n"
+                "Number Allocated \n"
+                "— — — — — — — — — —\n"
+                f"📘 {service} ➜ {country}\n"
+                "━━━━━━━━━━━━━━━"
+            )
+            kbd = build_allocation_keyboard(service, country, new_num)
+            await query.edit_message_text(alloc_msg, reply_markup=kbd)
+        else:
+            await query.answer("দুঃখিত, কোনো নতুন নম্বর খালি নেই!", show_alert=True)
 
 
 # ---------------- OTP POLLING SERVICE ----------------
@@ -841,6 +980,7 @@ def main():
             CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
+            CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
             MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
         ],
         states={
@@ -850,6 +990,7 @@ def main():
             WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL, receive_firebase_file)],
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_link)],
             WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_link)],
+            WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_otp_link)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
