@@ -83,10 +83,61 @@ def init_sqlite():
             msg_id TEXT PRIMARY KEY
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    # Default settings setup
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     conn.commit()
     conn.close()
 
 init_sqlite()
+
+
+def get_setting(key: str, default_val: str = "") -> str:
+    """Get setting value from Firebase or SQLite"""
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            val = db.reference(f"settings/{key}").get()
+            if val:
+                return str(val)
+        except Exception as e:
+            logging.error(f"Error reading setting from Firebase: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception as e:
+        logging.error(f"Error reading setting from SQLite: {e}")
+
+    return default_val
+
+
+def set_setting(key: str, value: str):
+    """Save setting value to Firebase and SQLite"""
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"settings/{key}").set(value)
+        except Exception as e:
+            logging.error(f"Error writing setting to Firebase: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error writing setting to SQLite: {e}")
 
 
 def init_firebase_system(run_migration=False):
@@ -152,6 +203,12 @@ def migrate_sqlite_to_firebase():
         num, uid, srv, cnt = row
         db.reference(f"allocations/{num}").set({"user_id": uid, "service": srv, "country": cnt})
 
+    cursor.execute("SELECT key, value FROM settings")
+    rows = cursor.fetchall()
+    for row in rows:
+        k, v = row
+        db.reference(f"settings/{k}").set(v)
+
     conn.close()
 
 
@@ -167,9 +224,18 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-ADD_SERVICE, ADD_COUNTRY, ADD_NUMBERS, WAIT_FIREBASE_FILE = range(4)
+# States for Admin Conversations
+(
+    ADD_SERVICE,
+    ADD_COUNTRY,
+    ADD_NUMBERS,
+    WAIT_FIREBASE_FILE,
+    WAIT_CHANNEL,
+    WAIT_SUPPORT,
+) = range(6)
 
 
+# ---------------- KEYBOARDS ----------------
 def get_main_keyboard(user_id: int):
     keyboard = [
         ["Get number"],
@@ -180,8 +246,27 @@ def get_main_keyboard(user_id: int):
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def get_admin_keyboard():
+    keyboard = [
+        ["Services", "Upload Firebase"],
+        ["Global Settings"],
+        ["Back"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def get_global_settings_keyboard():
+    keyboard = [
+        ["Channel", "Support"],
+        ["Back"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+# ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    context.user_data['current_menu'] = 'main'
     user_id = update.effective_user.id
     msg = f"Welcome!\nSelect an option from menu: **{CURRENT_DB_MODE}**"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
@@ -190,6 +275,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
+    current_menu = context.user_data.get('current_menu', 'main')
 
     if text == "Get number":
         services = []
@@ -211,26 +297,47 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [[InlineKeyboardButton(srv, callback_data=f"srv_{srv}")] for srv in services]
         await update.message.reply_text("একটি সার্ভিস সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(buttons))
 
-    elif text == "Channel":
-        await update.message.reply_text("আমাদের অফিশিয়াল চ্যানেল: https://t.me/your_channel")
-
-    elif text == "Support":
-        await update.message.reply_text("যেকোনো সাহায্যের জন্য যোগাযোগ করুন: @your_support")
-
     elif text == "Admin Panel" and user_id == ADMIN_ID:
-        buttons = [
-            [InlineKeyboardButton("➕ Add Service & Numbers", callback_data="admin_add_service")],
-            [InlineKeyboardButton("📤 Upload Firebase JSON", callback_data="admin_upload_firebase")]
-        ]
-        await update.message.reply_text(f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        context.user_data['current_menu'] = 'admin'
+        await update.message.reply_text(
+            f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**",
+            reply_markup=get_admin_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    elif text == "Global Settings" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'global_settings'
+        ch_val = get_setting("channel", "https://t.me/your_channel")
+        sp_val = get_setting("support", "@your_support")
+        msg = (
+            f"⚙️ **GLOBAL SETTINGS**\n\n"
+            f"📢 **Channel:** {ch_val}\n"
+            f"🎧 **Support:** {sp_val}\n\n"
+            f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
+        )
+        await update.message.reply_text(msg, reply_markup=get_global_settings_keyboard(), parse_mode="Markdown")
+
+    elif text == "Back":
+        if current_menu == 'global_settings':
+            context.user_data['current_menu'] = 'admin'
+            await update.message.reply_text(
+                f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**",
+                reply_markup=get_admin_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            context.user_data['current_menu'] = 'main'
+            await update.message.reply_text(
+                "প্রধান মেনু:",
+                reply_markup=get_main_keyboard(user_id)
+            )
 
 
+# ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await query.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
+    await update.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
     return ADD_SERVICE
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,19 +384,18 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
 
-        await update.message.reply_text(f"সফলভাবে {valid_count} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_main_keyboard(ADMIN_ID))
+        await update.message.reply_text(f"সফলভাবে {valid_count} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_admin_keyboard())
     else:
-        await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_main_keyboard(ADMIN_ID))
+        await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_admin_keyboard())
 
     context.user_data.clear()
+    context.user_data['current_menu'] = 'admin'
     return ConversationHandler.END
 
 async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await query.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
+    await update.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
     return WAIT_FIREBASE_FILE
 
 async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,19 +408,69 @@ async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TY
 
     success = init_firebase_system(run_migration=True)
     if success:
-        await update.message.reply_text("ফায়ারবেস ফাইল রিসিভড! ডাটাবেস সফলভাবে Firebase-এ সুইচেবল ও মাইগ্রেট হয়েছে। 🚀", reply_markup=get_main_keyboard(ADMIN_ID))
+        await update.message.reply_text("ফায়ারবেস ফাইল রিসিভড! ডাটাবেস সফলভাবে Firebase-এ সুইচেবল ও মাইগ্রেট হয়েছে। 🚀", reply_markup=get_admin_keyboard())
     else:
-        await update.message.reply_text("ফাইল সেভ হয়েছে কিন্তু ফায়ারবেসে কানেক্ট হতে পারেনি। JSON চেক করুন।", reply_markup=get_main_keyboard(ADMIN_ID))
+        await update.message.reply_text("ফাইল সেভ হয়েছে কিন্তু ফায়ারবেসে কানেক্ট হতে পারেনি। JSON চেক করুন।", reply_markup=get_admin_keyboard())
 
     context.user_data.clear()
+    context.user_data['current_menu'] = 'admin'
+    return ConversationHandler.END
+
+# Global Settings Handlers
+async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    current_menu = context.user_data.get('current_menu', 'main')
+
+    if user_id == ADMIN_ID and current_menu == 'global_settings':
+        await update.message.reply_text("নতুন চ্যানেল লিঙ্কটি লিখুন (যেমন: https://t.me/your_channel):")
+        return WAIT_CHANNEL
+    else:
+        ch_link = get_setting("channel", "https://t.me/your_channel")
+        await update.message.reply_text(f"আমাদের অফিশিয়াল চ্যানেল: {ch_link}")
+        return ConversationHandler.END
+
+async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_link = update.message.text.strip()
+    set_setting("channel", new_link)
+    await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}", reply_markup=get_global_settings_keyboard())
+    return ConversationHandler.END
+
+async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    current_menu = context.user_data.get('current_menu', 'main')
+
+    if user_id == ADMIN_ID and current_menu == 'global_settings':
+        await update.message.reply_text("নতুন সাপোর্ট ইউজারনেম/লিঙ্ক লিখুন (যেমন: @your_support):")
+        return WAIT_SUPPORT
+    else:
+        sp_link = get_setting("support", "@your_support")
+        await update.message.reply_text(f"যেকোনো সাহায্যের জন্য যোগাযোগ করুন: {sp_link}")
+        return ConversationHandler.END
+
+async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_link = update.message.text.strip()
+    set_setting("support", new_link)
+    await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {new_link}", reply_markup=get_global_settings_keyboard())
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=get_main_keyboard(update.effective_user.id))
+    user_id = update.effective_user.id
+    current_menu = context.user_data.get('current_menu', 'main')
+    context.user_data.pop('service_name', None)
+    context.user_data.pop('country_name', None)
+
+    if current_menu == 'global_settings':
+        reply_kbd = get_global_settings_keyboard()
+    elif current_menu == 'admin':
+        reply_kbd = get_admin_keyboard()
+    else:
+        reply_kbd = get_main_keyboard(user_id)
+
+    await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=reply_kbd)
     return ConversationHandler.END
 
 
+# ---------------- INLINE CALLBACK HANDLER ----------------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -364,7 +520,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             conn = get_db_connection()
             cursor = conn.cursor()
-            # SQLite Transaction for Race Condition Prevention
             cursor.execute("BEGIN IMMEDIATE")
             cursor.execute("SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT 1", (service, country))
             row = cursor.fetchone()
@@ -384,6 +539,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"আপনার নম্বর: `{assigned_num}`\n\nওটিপি আসার সাথে সাথে জানিয়ে দেওয়া হবে।", parse_mode="Markdown")
 
 
+# ---------------- OTP POLLING SERVICE ----------------
 async def otp_poller(application: Application):
     processed_ids = set()
 
@@ -398,7 +554,6 @@ async def otp_poller(application: Application):
         processed_ids = {row[0] for row in cursor.fetchall()}
         conn.close()
 
-    # Async HTTP client to prevent blocking event loop
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
@@ -415,7 +570,6 @@ async def otp_poller(application: Application):
                             if msg_id and msg_id not in processed_ids:
                                 processed_ids.add(msg_id)
 
-                                # Prevent infinite memory growth (Keep last 1000 items)
                                 if len(processed_ids) > 2000:
                                     processed_ids = set(list(processed_ids)[-1000:])
 
@@ -468,6 +622,7 @@ async def otp_poller(application: Application):
             await asyncio.sleep(5)
 
 
+# ---------------- MAIN FUNCTION ----------------
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
@@ -475,16 +630,23 @@ def main():
 
     admin_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(admin_add_service_start, pattern="^admin_add_service$"),
-            CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$")
+            MessageHandler(filters.Regex("^Services$") & filters.User(user_id=ADMIN_ID), admin_add_service_start),
+            MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
+            MessageHandler(filters.Regex("^Channel$"), set_channel_start),
+            MessageHandler(filters.Regex("^Support$"), set_support_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_service_name)],
             ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_country_name)],
             ADD_NUMBERS: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, receive_numbers)],
             WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL, receive_firebase_file)],
+            WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_link)],
+            WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_link)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Back$"), cancel)
+        ],
         per_message=False
     )
 
