@@ -312,11 +312,11 @@ def build_allocation_keyboard(service: str, country: str, numbers: list):
     otp_group_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
     buttons = []
     for num in numbers:
-        buttons.append([create_button(f"📋 {num}", copy_text=num, style="success")])
+        buttons.append([create_button(f"📋 {num}", copy_text=str(num), style="success")])
 
-    encoded_nums = "-".join(numbers)
+    # 64 byte limit fix: Only send service & country in callback data
     buttons.append([
-        create_button("Change All", callback_data=f"change_{service}_{country}_{encoded_nums}", style="primary"),
+        create_button("Change All", callback_data=f"chg:{service}:{country}", style="primary"),
         create_button("OTP Group", url=otp_group_link, style="primary")
     ])
     buttons.append([create_button("Back", callback_data=f"srv_{service}", style="danger")])
@@ -407,7 +407,7 @@ def migrate_sqlite_to_firebase():
     rows = cursor.fetchall()
     for row in rows:
         srv, cnt, num, st, uid = row
-        db.reference(f"numbers/{srv}/{cnt}/{num}").set({"number": num, "status": st, "user_id": uid})
+        db.reference(f"numbers/{srv}/{cnt}/{num}").set({"number": str(num), "status": st, "user_id": uid})
         db.reference(f"services/{srv}/{cnt}").set(True)
 
     cursor.execute("SELECT number, user_id, service, country FROM allocations")
@@ -879,7 +879,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if len(assigned_numbers) >= target_qty:
                         break
                     if isinstance(val, dict) and val.get("status") == "available":
-                        num_val = val.get("number")
+                        num_val = str(val.get("number"))
                         assigned_numbers.append(num_val)
                         db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
                         db.reference(f"allocations/{num_val}").set({"user_id": user_id, "service": service, "country": country})
@@ -894,16 +894,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = cursor.fetchall()
             if rows and len(rows) == target_qty:
                 for num_id, assigned_num in rows:
-                    assigned_numbers.append(assigned_num)
+                    num_str = str(assigned_num)
+                    assigned_numbers.append(num_str)
                     cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (assigned_num, user_id, service, country))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (num_str, user_id, service, country))
                 conn.commit()
             else:
                 conn.rollback()
             conn.close()
 
         if len(assigned_numbers) < target_qty:
-            # Revert any partially allocated ones if quantity requirement wasn't met
             if CURRENT_DB_MODE == "Firebase (Cloud)":
                 for num_val in assigned_numbers:
                     db.reference(f"numbers/{service}/{country}/{num_val}").update({"status": "available", "user_id": 0})
@@ -923,18 +923,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kbd = build_allocation_keyboard(service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif data.startswith("change_"):
-        parts = data.split("_", 3)
-        if len(parts) < 4:
+    elif data.startswith("chg:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
             await query.answer("অবৈধ অনুরোধ!", show_alert=True)
             return
 
-        service, country, old_nums_str = parts[1], parts[2], parts[3]
-        old_numbers = old_nums_str.split("-")
+        service, country = parts[1], parts[2]
         target_qty = int(get_setting("number_quantity", "2"))
+        old_numbers = []
+
+        # Find currently allocated numbers for this user
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            alloc_ref = db.reference("allocations").get()
+            if alloc_ref and isinstance(alloc_ref, dict):
+                for num_k, num_v in alloc_ref.items():
+                    if isinstance(num_v, dict) and num_v.get("user_id") == user_id and num_v.get("service") == service and num_v.get("country") == country:
+                        old_numbers.append(str(num_k))
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT number FROM allocations WHERE user_id = ? AND service = ? AND country = ?", (user_id, service, country))
+            old_numbers = [str(r[0]) for r in cursor.fetchall()]
+            conn.close()
+
         new_numbers = []
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
+            # Temporarily release old numbers
             for old_num in old_numbers:
                 db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "available", "user_id": 0})
                 db.reference(f"allocations/{old_num}").delete()
@@ -944,14 +960,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for key, val in numbers_ref.items():
                     if len(new_numbers) >= target_qty:
                         break
-                    if isinstance(val, dict) and val.get("status") == "available" and val.get("number") not in old_numbers:
-                        new_num = val.get("number")
+                    if isinstance(val, dict) and val.get("status") == "available" and str(val.get("number")) not in old_numbers:
+                        new_num = str(val.get("number"))
                         new_numbers.append(new_num)
                         db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
                         db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
 
             if len(new_numbers) < target_qty:
-                # Revert back to old state
+                # Revert back to old state if not enough new numbers available
                 for n in new_numbers:
                     db.reference(f"numbers/{service}/{country}/{n}").update({"status": "available", "user_id": 0})
                     db.reference(f"allocations/{n}").delete()
@@ -965,28 +981,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             
-            # Temporary release
             for old_num in old_numbers:
                 cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_num,))
                 cursor.execute("DELETE FROM allocations WHERE number = ?", (old_num,))
 
-            placeholders = ','.join(['?'] * len(old_numbers))
-            query_sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
-            params = [service, country] + old_numbers + [target_qty]
+            if old_numbers:
+                placeholders = ','.join(['?'] * len(old_numbers))
+                query_sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
+                params = [service, country] + old_numbers + [target_qty]
+            else:
+                query_sql = "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?"
+                params = [service, country, target_qty]
+
             cursor.execute(query_sql, params)
             rows = cursor.fetchall()
 
             if rows and len(rows) == target_qty:
                 for num_id, new_num in rows:
-                    new_numbers.append(new_num)
+                    new_num_str = str(new_num)
+                    new_numbers.append(new_num_str)
                     cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num_str, user_id, service, country))
                 conn.commit()
             else:
                 conn.rollback()
                 # Revert old numbers
                 for old_num in old_numbers:
-                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_num))
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_num, user_id))
                     cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
                 conn.commit()
             conn.close()
