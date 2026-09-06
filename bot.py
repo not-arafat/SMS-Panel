@@ -45,8 +45,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Filter for main reply menu buttons to prevent accidental conversation lock
-MENU_FILTER = filters.Regex("^(Get Number|Get number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Get number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Back)$")
 
 
 def get_db_connection():
@@ -95,6 +94,7 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
     conn.commit()
     conn.close()
 
@@ -267,11 +267,13 @@ def build_global_settings_view():
     ch_val = get_setting("channel", "https://t.me/your_channel")
     sp_val = get_setting("support", "@your_support")
     otp_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
+    num_qty = get_setting("number_quantity", "2")
     text = (
         f"⚙️ **GLOBAL SETTINGS**\n\n"
         f"📢 **Channel:** {ch_val}\n"
         f"🎧 **Support:** {sp_val}\n"
-        f"🔗 **OTP Group Link:** {otp_link}\n\n"
+        f"🔗 **OTP Group Link:** {otp_link}\n"
+        f"🔢 **Number Quantity (Per Request):** `{num_qty}` টি\n\n"
         f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
     )
     buttons = [
@@ -280,22 +282,44 @@ def build_global_settings_view():
             create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")
         ],
         [
-            create_button("🔗 Edit OTP Group Link", callback_data="adm:set:otplink", style="primary")
+            create_button("🔗 Edit OTP Group Link", callback_data="adm:set:otplink", style="primary"),
+            create_button("🔢 Set Quantity", callback_data="adm:set:qty", style="primary")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_allocation_keyboard(service: str, country: str, number: str):
-    otp_group_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
+def build_number_quantity_view():
+    current_qty = get_setting("number_quantity", "2")
+    text = f"🔢 **NUMBER QUANTITY SETTINGS**\n\nপ্রতিটি রিকোয়েস্টে ইউজার কয়টি করে নম্বর পাবে তা সিলেক্ট করুন।\nবর্তমান সেটআপ: `{current_qty}` টি"
     buttons = [
-        [create_button(f"{number}", copy_text=number, style="success")],
         [
-            create_button("Change", callback_data=f"change_{service}_{country}_{number}", style="primary"),
-            create_button("OTP Group", url=otp_group_link, style="primary")
+            create_button("1 টি", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success"),
+            create_button("2 টি", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success"),
+            create_button("3 টি", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success")
         ],
-        [create_button("Back", callback_data=f"srv_{service}", style="danger")]
+        [
+            create_button("4 টি", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
+            create_button("5 টি", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
+            create_button("6 টি", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")
+        ],
+        [create_button("Back", callback_data="adm:set:back", style="danger")]
     ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_allocation_keyboard(service: str, country: str, numbers: list):
+    otp_group_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
+    buttons = []
+    for num in numbers:
+        buttons.append([create_button(f"📋 {num}", copy_text=num, style="success")])
+
+    encoded_nums = "-".join(numbers)
+    buttons.append([
+        create_button("Change All", callback_data=f"change_{service}_{country}_{encoded_nums}", style="primary"),
+        create_button("OTP Group", url=otp_group_link, style="primary")
+    ])
+    buttons.append([create_button("Back", callback_data=f"srv_{service}", style="danger")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -453,7 +477,8 @@ def get_admin_keyboard():
             {"text": "Upload Firebase", "style": "primary"}
         ],
         [
-            {"text": "Global Settings", "style": "primary"}
+            {"text": "Global Settings", "style": "primary"},
+            {"text": "Number Quantity", "style": "primary"}
         ],
         [
             {"text": "Back", "style": "danger"}
@@ -531,6 +556,11 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "Global Settings" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = build_global_settings_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif text == "Number Quantity" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'admin'
+        text_msg, kbd = build_number_quantity_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text == "Back":
@@ -730,6 +760,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=kbd)
         return
 
+    # Admin Settings Quantity Handlers
+    if data == "adm:set:qty":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        text_msg, kbd = build_number_quantity_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:setqty:"):
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        qty_val = data.split(":", 2)[2]
+        set_setting("number_quantity", qty_val)
+        await query.answer(f"নম্বর কোয়ান্টিটি {qty_val} টি সেট করা হয়েছে!", show_alert=True)
+        text_msg, kbd = build_number_quantity_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:set:back":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        text_msg, kbd = build_global_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
     # Admin Management Actions
     if data == "adm:srv:list":
         await query.answer()
@@ -814,45 +869,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         service, country = parts[1], parts[2]
-        assigned_num = None
+        target_qty = int(get_setting("number_quantity", "2"))
+        assigned_numbers = []
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             numbers_ref = db.reference(f"numbers/{service}/{country}").get()
             if numbers_ref and isinstance(numbers_ref, dict):
                 for key, val in numbers_ref.items():
-                    if isinstance(val, dict) and val.get("status") == "available":
-                        assigned_num = val.get("number")
-                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
-                        db.reference(f"allocations/{assigned_num}").set({"user_id": user_id, "service": service, "country": country})
+                    if len(assigned_numbers) >= target_qty:
                         break
+                    if isinstance(val, dict) and val.get("status") == "available":
+                        num_val = val.get("number")
+                        assigned_numbers.append(num_val)
+                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
+                        db.reference(f"allocations/{num_val}").set({"user_id": user_id, "service": service, "country": country})
         else:
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute("SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT 1", (service, country))
-            row = cursor.fetchone()
-            if row:
-                num_id, assigned_num = row
-                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (assigned_num, user_id, service, country))
+            cursor.execute(
+                "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?",
+                (service, country, target_qty)
+            )
+            rows = cursor.fetchall()
+            if rows and len(rows) == target_qty:
+                for num_id, assigned_num in rows:
+                    assigned_numbers.append(assigned_num)
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (assigned_num, user_id, service, country))
                 conn.commit()
             else:
                 conn.rollback()
             conn.close()
 
-        if not assigned_num:
-            await query.edit_message_text("দুঃখিত, এই ক্যাটাগরিতে কোনো নম্বর খালি নেই।")
+        if len(assigned_numbers) < target_qty:
+            # Revert any partially allocated ones if quantity requirement wasn't met
+            if CURRENT_DB_MODE == "Firebase (Cloud)":
+                for num_val in assigned_numbers:
+                    db.reference(f"numbers/{service}/{country}/{num_val}").update({"status": "available", "user_id": 0})
+                    db.reference(f"allocations/{num_val}").delete()
+            await query.edit_message_text(f"দুঃখিত, এই ক্যাটাগরিতে পর্যাপ্ত ({target_qty} টি) নম্বর খালি নেই।")
             return
 
+        nums_formatted = "\n".join([f"📱 `{n}`" for n in assigned_numbers])
         alloc_msg = (
             "━━━━━━━━━━━━━━━\n"
-            "Number Allocated \n"
+            "Numbers Allocated \n"
             "— — — — — — — — — —\n"
             f"📘 {service} ➜ {country}\n"
+            f"{nums_formatted}\n"
             "━━━━━━━━━━━━━━━"
         )
-        kbd = build_allocation_keyboard(service, country, assigned_num)
-        await query.edit_message_text(alloc_msg, reply_markup=kbd)
+        kbd = build_allocation_keyboard(service, country, assigned_numbers)
+        await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("change_"):
         parts = data.split("_", 3)
@@ -860,61 +929,83 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("অবৈধ অনুরোধ!", show_alert=True)
             return
 
-        service, country, old_number = parts[1], parts[2], parts[3]
-        new_num = None
+        service, country, old_nums_str = parts[1], parts[2], parts[3]
+        old_numbers = old_nums_str.split("-")
+        target_qty = int(get_setting("number_quantity", "2"))
+        new_numbers = []
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
-            db.reference(f"numbers/{service}/{country}/{old_number}").update({"status": "available", "user_id": 0})
-            db.reference(f"allocations/{old_number}").delete()
+            for old_num in old_numbers:
+                db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "available", "user_id": 0})
+                db.reference(f"allocations/{old_num}").delete()
 
             numbers_ref = db.reference(f"numbers/{service}/{country}").get()
             if numbers_ref and isinstance(numbers_ref, dict):
                 for key, val in numbers_ref.items():
-                    if isinstance(val, dict) and val.get("status") == "available" and val.get("number") != old_number:
+                    if len(new_numbers) >= target_qty:
+                        break
+                    if isinstance(val, dict) and val.get("status") == "available" and val.get("number") not in old_numbers:
                         new_num = val.get("number")
+                        new_numbers.append(new_num)
                         db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
                         db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
-                        break
 
-            if not new_num:
-                db.reference(f"numbers/{service}/{country}/{old_number}").update({"status": "allocated", "user_id": user_id})
-                db.reference(f"allocations/{old_number}").set({"user_id": user_id, "service": service, "country": country})
+            if len(new_numbers) < target_qty:
+                # Revert back to old state
+                for n in new_numbers:
+                    db.reference(f"numbers/{service}/{country}/{n}").update({"status": "available", "user_id": 0})
+                    db.reference(f"allocations/{n}").delete()
+
+                for old_num in old_numbers:
+                    db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "allocated", "user_id": user_id})
+                    db.reference(f"allocations/{old_num}").set({"user_id": user_id, "service": service, "country": country})
+                new_numbers = []
         else:
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_number,))
-            cursor.execute("DELETE FROM allocations WHERE number = ?", (old_number,))
+            
+            # Temporary release
+            for old_num in old_numbers:
+                cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_num,))
+                cursor.execute("DELETE FROM allocations WHERE number = ?", (old_num,))
 
-            cursor.execute(
-                "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number != ? LIMIT 1",
-                (service, country, old_number)
-            )
-            row = cursor.fetchone()
-            if row:
-                num_id, new_num = row
-                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
+            placeholders = ','.join(['?'] * len(old_numbers))
+            query_sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
+            params = [service, country] + old_numbers + [target_qty]
+            cursor.execute(query_sql, params)
+            rows = cursor.fetchall()
+
+            if rows and len(rows) == target_qty:
+                for num_id, new_num in rows:
+                    new_numbers.append(new_num)
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
                 conn.commit()
             else:
-                cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_number,))
-                cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
+                conn.rollback()
+                # Revert old numbers
+                for old_num in old_numbers:
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_num))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
                 conn.commit()
             conn.close()
 
-        if new_num:
-            await query.answer("successfully changed", show_alert=False)
+        if len(new_numbers) == target_qty:
+            await query.answer("Successfully changed all numbers!", show_alert=False)
+            nums_formatted = "\n".join([f"📱 `{n}`" for n in new_numbers])
             alloc_msg = (
                 "━━━━━━━━━━━━━━━\n"
-                "Number Allocated \n"
+                "Numbers Allocated \n"
                 "— — — — — — — — — —\n"
                 f"📘 {service} ➜ {country}\n"
+                f"{nums_formatted}\n"
                 "━━━━━━━━━━━━━━━"
             )
-            kbd = build_allocation_keyboard(service, country, new_num)
-            await query.edit_message_text(alloc_msg, reply_markup=kbd)
+            kbd = build_allocation_keyboard(service, country, new_numbers)
+            await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
         else:
-            await query.answer("দুঃখিত, কোনো নতুন নম্বর খালি নেই!", show_alert=True)
+            await query.answer(f"দুঃখিত, পরিবর্তন করার জন্য নতুন {target_qty} টি নম্বর খালি নেই!", show_alert=True)
 
 
 # ---------------- OTP POLLING SERVICE ----------------
