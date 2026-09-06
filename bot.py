@@ -17,14 +17,7 @@ except ImportError:
     HAS_FIREBASE_LIB = False
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
-
-try:
-    from telegram import CopyTextButton
-    HAS_COPY_TEXT = True
-except ImportError:
-    HAS_COPY_TEXT = False
-
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -109,16 +102,18 @@ init_sqlite()
 
 
 def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> InlineKeyboardButton:
-    if copy_text:
-        if HAS_COPY_TEXT:
-            return InlineKeyboardButton(text=text, copy_text=CopyTextButton(text=copy_text))
-        else:
-            return InlineKeyboardButton(text=text, callback_data=f"copy_{copy_text}")
-    if url:
-        return InlineKeyboardButton(text=text, url=url)
+    kwargs = {"text": text}
     if callback_data:
-        return InlineKeyboardButton(text=text, callback_data=callback_data)
-    return InlineKeyboardButton(text=text, callback_data="noop")
+        kwargs["callback_data"] = callback_data
+    if url:
+        kwargs["url"] = url
+    if copy_text:
+        try:
+            from telegram import CopyTextButton
+            kwargs["copy_text"] = CopyTextButton(text=copy_text)
+        except Exception:
+            pass
+    return InlineKeyboardButton(**kwargs)
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -321,9 +316,9 @@ def build_allocation_keyboard(service: str, country: str, numbers: list):
     for num in numbers:
         buttons.append([create_button(f"📋 {num}", copy_text=num)])
 
-    encoded_nums = "-".join(numbers)
+    # Callback data optimized to avoid exceeding 64 bytes limit
     buttons.append([
-        create_button("Change All", callback_data=f"change_{service}_{country}_{encoded_nums}"),
+        create_button("Change All", callback_data=f"change_{service}_{country}"),
         create_button("OTP Group", url=otp_group_link)
     ])
     buttons.append([create_button("Back", callback_data=f"srv_{service}")])
@@ -459,21 +454,21 @@ def run_flask():
 # ---------------- KEYBOARDS ----------------
 def get_main_keyboard(user_id: int):
     keyboard_layout = [
-        ["Get Number"],
-        ["Profile", "Wallet"],
-        ["Channel", "Support"]
+        [KeyboardButton("Get Number")],
+        [KeyboardButton("Profile"), KeyboardButton("Wallet")],
+        [KeyboardButton("Channel"), KeyboardButton("Support")]
     ]
     if user_id == ADMIN_ID:
-        keyboard_layout.append(["Admin Panel"])
+        keyboard_layout.append([KeyboardButton("Admin Panel")])
         
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 def get_admin_keyboard():
     keyboard_layout = [
-        ["Services", "Upload Firebase"],
-        ["Global Settings", "Number Quantity"],
-        ["Back"]
+        [KeyboardButton("Services"), KeyboardButton("Upload Firebase")],
+        [KeyboardButton("Global Settings"), KeyboardButton("Number Quantity")],
+        [KeyboardButton("Back")]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
@@ -742,176 +737,269 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    try:
-        if data.startswith("copy_"):
-            copy_val = data.split("_", 1)[1]
-            await query.answer(f"নম্বর: {copy_val}", show_alert=True)
+    if data == "back_to_services":
+        await query.answer()
+        kbd, msg = get_services_keyboard()
+        if not kbd:
+            await query.edit_message_text(msg)
+        else:
+            await query.edit_message_text(msg, reply_markup=kbd)
+        return
+
+    # Admin Settings Quantity Handlers
+    if data == "adm:set:qty":
+        await query.answer()
+        if user_id != ADMIN_ID:
             return
+        text_msg, kbd = build_number_quantity_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-        if data == "noop":
+    elif data.startswith("adm:setqty:"):
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        qty_val = data.split(":", 2)[2]
+        set_setting("number_quantity", qty_val)
+        await query.answer(f"নম্বর কোয়ান্টিটি {qty_val} টি সেট করা হয়েছে!", show_alert=True)
+        text_msg, kbd = build_number_quantity_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:set:back":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        text_msg, kbd = build_global_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    # Admin Management Actions
+    if data == "adm:srv:list":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        text, kbd = build_admin_services_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:srv:view:"):
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        service = data.split(":", 3)[3]
+        text, kbd = build_service_manage_view(service)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:srv:del:"):
+        if user_id != ADMIN_ID:
             await query.answer()
             return
+        service = data.split(":", 3)[3]
+        delete_service_db(service)
+        await query.answer(f"{service} সার্ভিসটি সফলভাবে ডিলিট করা হয়েছে!", show_alert=True)
+        text, kbd = build_admin_services_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
-        if data == "back_to_services":
-            await query.answer()
-            kbd, msg = get_services_keyboard()
-            if not kbd:
-                await query.edit_message_text(msg)
-            else:
-                await query.edit_message_text(msg, reply_markup=kbd)
+    elif data.startswith("adm:cnt:delli:"):
+        await query.answer()
+        if user_id != ADMIN_ID:
             return
+        service = data.split(":", 3)[3]
+        summary = get_admin_services_summary()
+        cnts = summary.get(service, {})
+        buttons = []
+        for cnt in cnts.keys():
+            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}")])
+        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}")])
+        await query.edit_message_text(f"**{service}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
-        # Admin Settings Quantity Handlers
-        if data == "adm:set:qty":
+    elif data.startswith("adm:cnt:del:"):
+        if user_id != ADMIN_ID:
             await query.answer()
-            if user_id != ADMIN_ID:
-                return
-            text_msg, kbd = build_number_quantity_view()
-            await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
-        elif data.startswith("adm:setqty:"):
-            await query.answer()
-            if user_id != ADMIN_ID:
-                return
-            qty_val = data.split(":", 2)[2]
-            set_setting("number_quantity", qty_val)
-            await query.answer(f"নম্বর কোয়ান্টিটি {qty_val} টি সেট করা হয়েছে!", show_alert=True)
-            text_msg, kbd = build_number_quantity_view()
-            await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
-        elif data == "adm:set:back":
-            await query.answer()
-            if user_id != ADMIN_ID:
-                return
-            text_msg, kbd = build_global_settings_view()
-            await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
-        # Admin Management Actions
-        if data == "adm:srv:list":
-            await query.answer()
-            if user_id != ADMIN_ID:
-                return
-            text, kbd = build_admin_services_view()
-            await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
-
-        elif data.startswith("adm:srv:view:"):
-            await query.answer()
-            if user_id != ADMIN_ID:
-                return
-            service = data.split(":", 3)[3]
+            return
+        parts = data.split(":", 4)
+        if len(parts) >= 5:
+            service, country = parts[3], parts[4]
+            delete_country_db(service, country)
+            await query.answer(f"{service} থেকে {country} ডিলিট করা হয়েছে!", show_alert=True)
             text, kbd = build_service_manage_view(service)
             await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
-        elif data.startswith("adm:srv:del:"):
-            if user_id != ADMIN_ID:
-                await query.answer()
-                return
-            service = data.split(":", 3)[3]
-            delete_service_db(service)
-            await query.answer(f"{service} সার্ভিসটি সফলভাবে ডিলিট করা হয়েছে!", show_alert=True)
-            text, kbd = build_admin_services_view()
-            await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+    # User Get Number Flow
+    elif data.startswith("srv_"):
+        await query.answer()
+        service = data.split("_", 1)[1]
+        countries = []
 
-        elif data.startswith("adm:cnt:delli:"):
-            await query.answer()
-            if user_id != ADMIN_ID:
-                return
-            service = data.split(":", 3)[3]
-            summary = get_admin_services_summary()
-            cnts = summary.get(service, {})
-            buttons = []
-            for cnt in cnts.keys():
-                buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}")])
-            buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}")])
-            await query.edit_message_text(f"**{service}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            countries_ref = db.reference(f"services/{service}").get()
+            if countries_ref and isinstance(countries_ref, dict):
+                countries = list(countries_ref.keys())
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT country_name FROM services WHERE service_name = ?", (service,))
+            countries = [row[0] for row in cursor.fetchall()]
+            conn.close()
 
-        elif data.startswith("adm:cnt:del:"):
-            if user_id != ADMIN_ID:
-                await query.answer()
-                return
-            parts = data.split(":", 4)
-            if len(parts) >= 5:
-                service, country = parts[3], parts[4]
-                delete_country_db(service, country)
-                await query.answer(f"{service} থেকে {country} ডিলিট করা হয়েছে!", show_alert=True)
-                text, kbd = build_service_manage_view(service)
-                await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        if not countries:
+            await query.edit_message_text("এই সার্ভিসে কোনো দেশ পাওয়া যায়নি।")
+            return
 
-        # User Get Number Flow
-        elif data.startswith("srv_"):
-            await query.answer()
-            service = data.split("_", 1)[1]
-            countries = []
+        buttons = [[create_button(cnt, callback_data=f"cnt_{service}_{cnt}")] for cnt in countries]
+        buttons.append([create_button("Back", callback_data="back_to_services")])
+        await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
 
-            if CURRENT_DB_MODE == "Firebase (Cloud)":
-                countries_ref = db.reference(f"services/{service}").get()
-                if countries_ref and isinstance(countries_ref, dict):
-                    countries = list(countries_ref.keys())
+    elif data.startswith("cnt_"):
+        await query.answer()
+        parts = data.split("_", 2)
+        if len(parts) < 3:
+            await query.edit_message_text("অবৈধ কমান্ড।")
+            return
+        
+        service, country = parts[1], parts[2]
+        target_qty = int(get_setting("number_quantity", "2"))
+        assigned_numbers = []
+
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            numbers_ref = db.reference(f"numbers/{service}/{country}").get()
+            if numbers_ref and isinstance(numbers_ref, dict):
+                for key, val in numbers_ref.items():
+                    if len(assigned_numbers) >= target_qty:
+                        break
+                    if isinstance(val, dict) and val.get("status") == "available":
+                        num_val = val.get("number")
+                        assigned_numbers.append(num_val)
+                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
+                        db.reference(f"allocations/{num_val}").set({"user_id": user_id, "service": service, "country": country})
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?",
+                (service, country, target_qty)
+            )
+            rows = cursor.fetchall()
+            if rows and len(rows) == target_qty:
+                for num_id, assigned_num in rows:
+                    assigned_numbers.append(assigned_num)
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (assigned_num, user_id, service, country))
+                conn.commit()
             else:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("SELECT country_name FROM services WHERE service_name = ?", (service,))
-                countries = [row[0] for row in cursor.fetchall()]
-                conn.close()
+                conn.rollback()
+            conn.close()
 
-            if not countries:
-                await query.edit_message_text("এই সার্ভিসে কোনো দেশ পাওয়া যায়নি।")
-                return
+        if len(assigned_numbers) < target_qty:
+            if CURRENT_DB_MODE == "Firebase (Cloud)":
+                for num_val in assigned_numbers:
+                    db.reference(f"numbers/{service}/{country}/{num_val}").update({"status": "available", "user_id": 0})
+                    db.reference(f"allocations/{num_val}").delete()
+            await query.edit_message_text(f"দুঃখিত, এই ক্যাটাগরিতে পর্যাপ্ত ({target_qty} টি) নম্বর খালি নেই।")
+            return
 
-            buttons = [[create_button(cnt, callback_data=f"cnt_{service}_{cnt}")] for cnt in countries]
-            buttons.append([create_button("Back", callback_data="back_to_services")])
-            await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
+        nums_formatted = "\n".join([f"📱 `{n}`" for n in assigned_numbers])
+        alloc_msg = (
+            "━━━━━━━━━━━━━━━\n"
+            "Numbers Allocated \n"
+            "— — — — — — — — — —\n"
+            f"📘 {service} ➜ {country}\n"
+            f"{nums_formatted}\n"
+            "━━━━━━━━━━━━━━━"
+        )
+        kbd = build_allocation_keyboard(service, country, assigned_numbers)
+        await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
 
-        elif data.startswith("cnt_"):
-            await query.answer()
-            parts = data.split("_", 2)
-            if len(parts) < 3:
-                await query.edit_message_text("অবৈধ কমান্ড।")
-                return
+    elif data.startswith("change_"):
+        parts = data.split("_", 2)
+        if len(parts) < 3:
+            await query.answer("অবৈধ অনুরোধ!", show_alert=True)
+            return
+
+        service, country = parts[1], parts[2]
+        target_qty = int(get_setting("number_quantity", "2"))
+        
+        # ডাটাবেস থেকে ইউজারের বর্তমান অ্যালোকোট করা পুরানো নম্বরগুলো খুঁজে বের করা
+        old_numbers = []
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            alloc_ref = db.reference("allocations").get()
+            if alloc_ref and isinstance(alloc_ref, dict):
+                for num_k, num_v in alloc_ref.items():
+                    if isinstance(num_v, dict) and num_v.get("user_id") == user_id and num_v.get("service") == service and num_v.get("country") == country:
+                        old_numbers.append(num_k)
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT number FROM allocations WHERE user_id = ? AND service = ? AND country = ?", (user_id, service, country))
+            rows = cursor.fetchall()
+            old_numbers = [r[0] for r in rows]
+            conn.close()
+
+        new_numbers = []
+
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            # পুরানো নম্বরগুলো মুক্ত করা
+            for old_num in old_numbers:
+                db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "available", "user_id": 0})
+                db.reference(f"allocations/{old_num}").delete()
+
+            # নতুন নম্বর বরাদ্দ করা
+            numbers_ref = db.reference(f"numbers/{service}/{country}").get()
+            if numbers_ref and isinstance(numbers_ref, dict):
+                for key, val in numbers_ref.items():
+                    if len(new_numbers) >= target_qty:
+                        break
+                    if isinstance(val, dict) and val.get("status") == "available" and val.get("number") not in old_numbers:
+                        new_num = val.get("number")
+                        new_numbers.append(new_num)
+                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
+                        db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
+
+            if len(new_numbers) < target_qty:
+                # নতুন নম্বর পর্যাপ্ত না থাকলে আগের অবস্থায় রোলব্যাক
+                for n in new_numbers:
+                    db.reference(f"numbers/{service}/{country}/{n}").update({"status": "available", "user_id": 0})
+                    db.reference(f"allocations/{n}").delete()
+
+                for old_num in old_numbers:
+                    db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "allocated", "user_id": user_id})
+                    db.reference(f"allocations/{old_num}").set({"user_id": user_id, "service": service, "country": country})
+                new_numbers = []
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
             
-            service, country = parts[1], parts[2]
-            target_qty = int(get_setting("number_quantity", "2"))
-            assigned_numbers = []
+            for old_num in old_numbers:
+                cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_num,))
+                cursor.execute("DELETE FROM allocations WHERE number = ?", (old_num,))
 
-            if CURRENT_DB_MODE == "Firebase (Cloud)":
-                numbers_ref = db.reference(f"numbers/{service}/{country}").get()
-                if numbers_ref and isinstance(numbers_ref, dict):
-                    for key, val in numbers_ref.items():
-                        if len(assigned_numbers) >= target_qty:
-                            break
-                        if isinstance(val, dict) and val.get("status") == "available":
-                            num_val = val.get("number")
-                            assigned_numbers.append(num_val)
-                            db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
-                            db.reference(f"allocations/{num_val}").set({"user_id": user_id, "service": service, "country": country})
+            if old_numbers:
+                placeholders = ','.join(['?'] * len(old_numbers))
+                query_sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
+                params = [service, country] + old_numbers + [target_qty]
             else:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("BEGIN IMMEDIATE")
-                cursor.execute(
-                    "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?",
-                    (service, country, target_qty)
-                )
-                rows = cursor.fetchall()
-                if rows and len(rows) == target_qty:
-                    for num_id, assigned_num in rows:
-                        assigned_numbers.append(assigned_num)
-                        cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                        cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (assigned_num, user_id, service, country))
-                    conn.commit()
-                else:
-                    conn.rollback()
-                conn.close()
+                query_sql = "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?"
+                params = [service, country, target_qty]
 
-            if len(assigned_numbers) < target_qty:
-                if CURRENT_DB_MODE == "Firebase (Cloud)":
-                    for num_val in assigned_numbers:
-                        db.reference(f"numbers/{service}/{country}/{num_val}").update({"status": "available", "user_id": 0})
-                        db.reference(f"allocations/{num_val}").delete()
-                await query.edit_message_text(f"দুঃখিত, এই ক্যাটাগরিতে পর্যাপ্ত ({target_qty} টি) নম্বর খালি নেই।")
-                return
+            cursor.execute(query_sql, params)
+            rows = cursor.fetchall()
 
-            nums_formatted = "\n".join([f"📱 `{n}`" for n in assigned_numbers])
+            if rows and len(rows) == target_qty:
+                for num_id, new_num in rows:
+                    new_numbers.append(new_num)
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
+                conn.commit()
+            else:
+                conn.rollback()
+                for old_num in old_numbers:
+                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_num))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
+                conn.commit()
+            conn.close()
+
+        if len(new_numbers) == target_qty:
+            await query.answer("Successfully changed all numbers!", show_alert=False)
+            nums_formatted = "\n".join([f"📱 `{n}`" for n in new_numbers])
             alloc_msg = (
                 "━━━━━━━━━━━━━━━\n"
                 "Numbers Allocated \n"
@@ -920,91 +1008,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{nums_formatted}\n"
                 "━━━━━━━━━━━━━━━"
             )
-            kbd = build_allocation_keyboard(service, country, assigned_numbers)
+            kbd = build_allocation_keyboard(service, country, new_numbers)
             await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
-
-        elif data.startswith("change_"):
-            parts = data.split("_", 3)
-            if len(parts) < 4:
-                await query.answer("অবৈধ অনুরোধ!", show_alert=True)
-                return
-
-            service, country, old_nums_str = parts[1], parts[2], parts[3]
-            old_numbers = old_nums_str.split("-")
-            target_qty = int(get_setting("number_quantity", "2"))
-            new_numbers = []
-
-            if CURRENT_DB_MODE == "Firebase (Cloud)":
-                for old_num in old_numbers:
-                    db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "available", "user_id": 0})
-                    db.reference(f"allocations/{old_num}").delete()
-
-                numbers_ref = db.reference(f"numbers/{service}/{country}").get()
-                if numbers_ref and isinstance(numbers_ref, dict):
-                    for key, val in numbers_ref.items():
-                        if len(new_numbers) >= target_qty:
-                            break
-                        if isinstance(val, dict) and val.get("status") == "available" and val.get("number") not in old_numbers:
-                            new_num = val.get("number")
-                            new_numbers.append(new_num)
-                            db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
-                            db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
-
-                if len(new_numbers) < target_qty:
-                    for n in new_numbers:
-                        db.reference(f"numbers/{service}/{country}/{n}").update({"status": "available", "user_id": 0})
-                        db.reference(f"allocations/{n}").delete()
-
-                    for old_num in old_numbers:
-                        db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "allocated", "user_id": user_id})
-                        db.reference(f"allocations/{old_num}").set({"user_id": user_id, "service": service, "country": country})
-                    new_numbers = []
-            else:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("BEGIN IMMEDIATE")
-                
-                for old_num in old_numbers:
-                    cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_num,))
-                    cursor.execute("DELETE FROM allocations WHERE number = ?", (old_num,))
-
-                placeholders = ','.join(['?'] * len(old_numbers))
-                query_sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
-                params = [service, country] + old_numbers + [target_qty]
-                cursor.execute(query_sql, params)
-                rows = cursor.fetchall()
-
-                if rows and len(rows) == target_qty:
-                    for num_id, new_num in rows:
-                        new_numbers.append(new_num)
-                        cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                        cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num, user_id, service, country))
-                    conn.commit()
-                else:
-                    conn.rollback()
-                    for old_num in old_numbers:
-                        cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (user_id, old_num))
-                        cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (user_id, old_num, service, country))
-                    conn.commit()
-                conn.close()
-
-            if len(new_numbers) == target_qty:
-                await query.answer("Successfully changed all numbers!", show_alert=False)
-                nums_formatted = "\n".join([f"📱 `{n}`" for n in new_numbers])
-                alloc_msg = (
-                    "━━━━━━━━━━━━━━━\n"
-                    "Numbers Allocated \n"
-                    "— — — — — — — — — —\n"
-                    f"📘 {service} ➜ {country}\n"
-                    f"{nums_formatted}\n"
-                    "━━━━━━━━━━━━━━━"
-                )
-                kbd = build_allocation_keyboard(service, country, new_numbers)
-                await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
-            else:
-                await query.answer(f"দুঃখিত, পরিবর্তন করার জন্য নতুন {target_qty} টি নম্বর খালি নেই!", show_alert=True)
-    except Exception as e:
-        logging.error(f"Error handling callback {data}: {e}", exc_info=True)
+        else:
+            await query.answer(f"দুঃখিত, পরিবর্তন করার জন্য নতুন {target_qty} টি নম্বর খালি নেই!", show_alert=True)
 
 
 # ---------------- OTP POLLING SERVICE ----------------
@@ -1038,8 +1045,8 @@ async def otp_poller(application: Application):
                             if msg_id and msg_id not in processed_ids:
                                 processed_ids.add(msg_id)
 
-                                if len(processed_ids) > 2000:
-                                    processed_ids = set(list(processed_ids)[-1000:])
+                                if len(processed_ids) > 3000:
+                                    processed_ids = set(list(processed_ids)[1500:])
 
                                 if CURRENT_DB_MODE == "Firebase (Cloud)":
                                     db.reference(f"seen_otp_ids/{msg_id}").set(True)
