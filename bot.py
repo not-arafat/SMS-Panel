@@ -246,6 +246,24 @@ def build_service_manage_view(service: str):
     return text, InlineKeyboardMarkup(buttons)
 
 
+def build_global_settings_view():
+    ch_val = get_setting("channel", "https://t.me/your_channel")
+    sp_val = get_setting("support", "@your_support")
+    text = (
+        f"⚙️ **GLOBAL SETTINGS**\n\n"
+        f"📢 **Channel:** {ch_val}\n"
+        f"🎧 **Support:** {sp_val}\n\n"
+        f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("📢 Edit Channel", callback_data="adm:set:channel"),
+            InlineKeyboardButton("🎧 Edit Support", callback_data="adm:set:support")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
 def init_firebase_system(run_migration=False, force_reinit=False):
     global CURRENT_DB_MODE
     if not HAS_FIREBASE_LIB:
@@ -371,14 +389,6 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-def get_global_settings_keyboard():
-    keyboard = [
-        ["Channel", "Support"],
-        ["Back"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
 # ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('service_name', None)
@@ -414,6 +424,14 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [[InlineKeyboardButton(srv, callback_data=f"srv_{srv}")] for srv in services]
         await update.message.reply_text("একটি সার্ভিস সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(buttons))
 
+    elif text == "Channel":
+        ch_link = get_setting("channel", "https://t.me/your_channel")
+        await update.message.reply_text(f"📢 আমাদের অফিশিয়াল চ্যানেল: {ch_link}")
+
+    elif text == "Support":
+        sp_link = get_setting("support", "@your_support")
+        await update.message.reply_text(f"🎧 যেকোনো সাহায্যের জন্য যোগাযোগ করুন: {sp_link}")
+
     elif text == "Admin Panel" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
         await update.message.reply_text(
@@ -428,31 +446,16 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text == "Global Settings" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'global_settings'
-        ch_val = get_setting("channel", "https://t.me/your_channel")
-        sp_val = get_setting("support", "@your_support")
-        msg = (
-            f"⚙️ **GLOBAL SETTINGS**\n\n"
-            f"📢 **Channel:** {ch_val}\n"
-            f"🎧 **Support:** {sp_val}\n\n"
-            f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
-        )
-        await update.message.reply_text(msg, reply_markup=get_global_settings_keyboard(), parse_mode="Markdown")
+        context.user_data['current_menu'] = 'admin'
+        text_msg, kbd = build_global_settings_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text == "Back":
-        if current_menu == 'global_settings':
-            context.user_data['current_menu'] = 'admin'
-            await update.message.reply_text(
-                f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**",
-                reply_markup=get_admin_keyboard(),
-                parse_mode="Markdown"
-            )
-        else:
-            context.user_data['current_menu'] = 'main'
-            await update.message.reply_text(
-                "প্রধান মেনু:",
-                reply_markup=get_main_keyboard(user_id)
-            )
+        context.user_data['current_menu'] = 'main'
+        await update.message.reply_text(
+            "প্রধান মেনু:",
+            reply_markup=get_main_keyboard(user_id)
+        )
 
 
 # ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
@@ -560,41 +563,37 @@ async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TY
 
 # Global Settings Handlers
 async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    current_menu = context.user_data.get('current_menu', 'main')
-
-    if user_id == ADMIN_ID and current_menu == 'global_settings':
-        await update.message.reply_text("নতুন চ্যানেল লিঙ্কটি লিখুন (যেমন: https://t.me/your_channel):")
-        return WAIT_CHANNEL
-    else:
-        ch_link = get_setting("channel", "https://t.me/your_channel")
-        await update.message.reply_text(f"আমাদের অফিশিয়াল চ্যানেল: {ch_link}")
-        return ConversationHandler.END
+    query = update.callback_query
+    if query:
+        await query.answer()
+        if query.from_user.id != ADMIN_ID:
+            return ConversationHandler.END
+        await query.message.reply_text("নতুন চ্যানেল লিঙ্কটি লিখুন (যেমন: https://t.me/your_channel):")
+    return WAIT_CHANNEL
 
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     set_setting("channel", new_link)
-    context.user_data['current_menu'] = 'global_settings'
-    await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}", reply_markup=get_global_settings_keyboard())
+    await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}")
+    text_msg, kbd = build_global_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    current_menu = context.user_data.get('current_menu', 'main')
-
-    if user_id == ADMIN_ID and current_menu == 'global_settings':
-        await update.message.reply_text("নতুন সাপোর্ট ইউজারনেম/লিঙ্ক লিখুন (যেমন: @your_support):")
-        return WAIT_SUPPORT
-    else:
-        sp_link = get_setting("support", "@your_support")
-        await update.message.reply_text(f"যেকোনো সাহায্যের জন্য যোগাযোগ করুন: {sp_link}")
-        return ConversationHandler.END
+    query = update.callback_query
+    if query:
+        await query.answer()
+        if query.from_user.id != ADMIN_ID:
+            return ConversationHandler.END
+        await query.message.reply_text("নতুন সাপোর্ট ইউজারনেম/লিঙ্ক লিখুন (যেমন: @your_support):")
+    return WAIT_SUPPORT
 
 async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     set_setting("support", new_link)
-    context.user_data['current_menu'] = 'global_settings'
-    await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {new_link}", reply_markup=get_global_settings_keyboard())
+    await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {new_link}")
+    text_msg, kbd = build_global_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -605,16 +604,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text if update.message else ""
 
     if text == "Global Settings" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'global_settings'
-        ch_val = get_setting("channel", "https://t.me/your_channel")
-        sp_val = get_setting("support", "@your_support")
-        msg = (
-            f"⚙️ **GLOBAL SETTINGS**\n\n"
-            f"📢 **Channel:** {ch_val}\n"
-            f"🎧 **Support:** {sp_val}\n\n"
-            f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
-        )
-        await update.message.reply_text(msg, reply_markup=get_global_settings_keyboard(), parse_mode="Markdown")
+        text_msg, kbd = build_global_settings_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     elif text == "Admin Panel" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
         await update.message.reply_text(
@@ -628,9 +619,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     else:
         current_menu = context.user_data.get('current_menu', 'main')
-        if current_menu == 'global_settings':
-            reply_kbd = get_global_settings_keyboard()
-        elif current_menu == 'admin':
+        if current_menu == 'admin':
             reply_kbd = get_admin_keyboard()
         else:
             reply_kbd = get_main_keyboard(user_id)
@@ -850,9 +839,9 @@ def main():
             CallbackQueryHandler(admin_add_service_start, pattern="^adm:srv:add$"),
             CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
             CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
+            CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
+            CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
-            MessageHandler(filters.Regex("^Channel$"), set_channel_start),
-            MessageHandler(filters.Regex("^Support$"), set_support_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_service_name)],
