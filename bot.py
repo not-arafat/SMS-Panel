@@ -45,6 +45,9 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
+# Filter for main reply menu buttons to prevent accidental conversation lock
+MENU_FILTER = filters.Regex("^(Get number|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Back)$")
+
 
 def get_db_connection():
     return sqlite3.connect("bot_database.db", timeout=10)
@@ -609,6 +612,10 @@ async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
+        await update.message.reply_text("❌ অবৈধ লিঙ্ক! অনুগ্রহ করে একটি সঠিক লিঙ্ক দিন (যেমন: https://t.me/your_channel)।\nবাতিল করতে /cancel লিখুন।")
+        return WAIT_CHANNEL
+
     set_setting("channel", new_link)
     await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}")
     text_msg, kbd = build_global_settings_view()
@@ -626,6 +633,10 @@ async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
+        await update.message.reply_text("❌ অবৈধ লিঙ্ক! অনুগ্রহ করে একটি সঠিক ইউজারনেম বা লিঙ্ক দিন (যেমন: @your_support)।\nবাতিল করতে /cancel লিখুন।")
+        return WAIT_SUPPORT
+
     set_setting("support", new_link)
     await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {new_link}")
     text_msg, kbd = build_global_settings_view()
@@ -643,6 +654,10 @@ async def set_otplink_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/")):
+        await update.message.reply_text("❌ অবৈধ লিঙ্ক! অনুগ্রহ করে একটি সঠিক লিঙ্ক দিন (যেমন: https://t.me/your_otp_group)।\nবাতিল করতে /cancel লিখুন।")
+        return WAIT_OTP_LINK
+
     set_setting("otp_group_link", new_link)
     await update.message.reply_text(f"✅ সফলভাবে OTP Group লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}")
     text_msg, kbd = build_global_settings_view()
@@ -650,34 +665,11 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
 
-    text = update.message.text if update.message else ""
-
-    if text == "Global Settings" and user_id == ADMIN_ID:
-        text_msg, kbd = build_global_settings_view()
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-    elif text == "Admin Panel" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'admin'
-        await update.message.reply_text(
-            f"**ADMIN PANEL**\n\nবর্তমান ডাটাবেস: **{CURRENT_DB_MODE}**",
-            reply_markup=get_admin_keyboard(),
-            parse_mode="Markdown"
-        )
-    elif text == "Services" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = build_admin_services_view()
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-    else:
-        current_menu = context.user_data.get('current_menu', 'main')
-        if current_menu == 'admin':
-            reply_kbd = get_admin_keyboard()
-        else:
-            reply_kbd = get_main_keyboard(user_id)
-
-        await update.message.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=reply_kbd)
+    if update.message and update.message.text:
+        await handle_text_menu(update, context)
 
     return ConversationHandler.END
 
@@ -984,17 +976,17 @@ def main():
             MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
         ],
         states={
-            ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_service_name)],
-            ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_country_name)],
-            ADD_NUMBERS: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, receive_numbers)],
-            WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL, receive_firebase_file)],
-            WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_link)],
-            WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_link)],
-            WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_otp_link)],
+            ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
+            ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_name)],
+            ADD_NUMBERS: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & ~MENU_FILTER, receive_numbers)],
+            WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL & ~MENU_FILTER, receive_firebase_file)],
+            WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
+            WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_support_link)],
+            WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_link)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^(Back|Cancel|Admin Panel|Global Settings|Services|Get number)$"), cancel)
+            MessageHandler(MENU_FILTER, cancel)
         ],
         per_message=False
     )
