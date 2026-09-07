@@ -48,6 +48,13 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 MENU_FILTER = filters.Regex("^(Get Number|Get number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Back)$")
 
 
+def escape_md(text: str) -> str:
+    """Markdown special characters escape logic"""
+    if not text:
+        return ""
+    return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
+
 def get_db_connection():
     return sqlite3.connect("bot_database.db", timeout=10)
 
@@ -118,7 +125,7 @@ def get_setting(key: str, default_val: str = "") -> str:
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             val = db.reference(f"settings/{key}").get()
-            if val:
+            if val is not None:
                 return str(val)
         except Exception as e:
             logging.error(f"Error reading setting from Firebase: {e}")
@@ -229,9 +236,9 @@ def build_admin_services_view():
     buttons = []
     for srv, cnts in summary.items():
         total_avail = sum(cnts.values())
-        text += f"\n🔹 **{srv}** (Total Available: `{total_avail}`)"
+        text += f"\n🔹 **{escape_md(srv)}** (Total Available: `{total_avail}`)"
         for cnt, count in cnts.items():
-            text += f"\n   └ {cnt}: `{count}` টি"
+            text += f"\n   └ {escape_md(cnt)}: `{count}` টি"
         buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
 
     buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
@@ -243,12 +250,12 @@ def build_service_manage_view(service: str):
     cnts = summary.get(service, {})
     total_avail = sum(cnts.values())
 
-    text = f"⚙️ **SERVICE DETAILS: {service}**\n\n"
+    text = f"⚙️ **SERVICE DETAILS: {escape_md(service)}**\n\n"
     text += f"📊 মোট এভেলেবল নম্বর: `{total_avail}` টি\n\n"
     text += "🏳️ **দেশ এবং আনইউজড নম্বর:**\n"
     if cnts:
         for cnt, count in cnts.items():
-            text += f"• **{cnt}**: `{count}` টি এভেলেবল\n"
+            text += f"• **{escape_md(cnt)}**: `{count}` টি এভেলেবল\n"
     else:
         text += "কোনো দেশ যুক্ত নেই।\n"
 
@@ -268,11 +275,12 @@ def build_global_settings_view():
     sp_val = get_setting("support", "@your_support")
     otp_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
     num_qty = get_setting("number_quantity", "2")
+    
     text = (
         f"⚙️ **GLOBAL SETTINGS**\n\n"
-        f"📢 **Channel:** {ch_val}\n"
-        f"🎧 **Support:** {sp_val}\n"
-        f"🔗 **OTP Group Link:** {otp_link}\n"
+        f"📢 **Channel:** {escape_md(ch_val)}\n"
+        f"🎧 **Support:** {escape_md(sp_val)}\n"
+        f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n"
         f"🔢 **Number Quantity (Per Request):** `{num_qty}` টি\n\n"
         f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
     )
@@ -314,7 +322,6 @@ def build_allocation_keyboard(service: str, country: str, numbers: list):
     for num in numbers:
         buttons.append([create_button(f"📋 {num}", copy_text=str(num), style="success")])
 
-    # 64 byte limit fix: Only send service & country in callback data
     buttons.append([
         create_button("Change All", callback_data=f"chg:{service}:{country}", style="primary"),
         create_button("OTP Group", url=otp_group_link, style="primary")
@@ -339,7 +346,15 @@ def get_services_keyboard():
     if not services:
         return None, "বর্তমানে কোনো সার্ভিস এভেলেবল নেই।"
 
-    buttons = [[create_button(srv, callback_data=f"srv_{srv}", style="primary")] for srv in services]
+    # 2 Services Per Row Grid Layout
+    buttons = []
+    for i in range(0, len(services), 2):
+        row = []
+        row.append(create_button(services[i], callback_data=f"srv_{services[i]}", style="primary"))
+        if i + 1 < len(services):
+            row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}", style="primary"))
+        buttons.append(row)
+
     return InlineKeyboardMarkup(buttons), "একটি সার্ভিস সিলেক্ট করুন:"
 
 
@@ -509,7 +524,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=kbd)
 
     elif text == "Profile":
-        first_name = update.effective_user.first_name or "User"
+        first_name = escape_md(update.effective_user.first_name or "User")
         bot_username = context.bot.username or "bot"
         refer_link = f"https://t.me/{bot_username}?start={user_id}"
         
@@ -584,7 +599,7 @@ async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END
     service = query.data.split(":", 3)[3]
     context.user_data['service_name'] = service
-    await query.message.reply_text(f"সার্ভিস **{service}** সিলেক্ট করা হয়েছে।\n\nদেশের নাম লিখুন (যেমন: Bangladesh, Nepal):", parse_mode="Markdown")
+    await query.message.reply_text(f"সার্ভিস **{escape_md(service)}** সিলেক্ট করা হয়েছে।\n\nদেশের নাম লিখুন (যেমন: Bangladesh, Nepal):", parse_mode="Markdown")
     return ADD_COUNTRY
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -688,7 +703,7 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
         return WAIT_CHANNEL
 
     set_setting("channel", new_link)
-    await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}")
+    await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_global_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
@@ -709,7 +724,7 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
         return WAIT_SUPPORT
 
     set_setting("support", new_link)
-    await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {new_link}")
+    await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_global_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
@@ -730,7 +745,7 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_OTP_LINK
 
     set_setting("otp_group_link", new_link)
-    await update.message.reply_text(f"✅ সফলভাবে OTP Group লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {new_link}")
+    await update.message.reply_text(f"✅ সফলভাবে OTP Group লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_global_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
@@ -822,7 +837,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for cnt in cnts.keys():
             buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
         buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
-        await query.edit_message_text(f"**{service}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        await query.edit_message_text(f"**{escape_md(service)}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
         if user_id != ADMIN_ID:
@@ -857,9 +872,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("এই সার্ভিসে কোনো দেশ পাওয়া যায়নি।")
             return
 
-        buttons = [[create_button(cnt, callback_data=f"cnt_{service}_{cnt}", style="primary")] for cnt in countries]
+        # 2 Countries Per Row Grid Layout
+        buttons = []
+        for i in range(0, len(countries), 2):
+            row = []
+            row.append(create_button(countries[i], callback_data=f"cnt_{service}_{countries[i]}", style="primary"))
+            if i + 1 < len(countries):
+                row.append(create_button(countries[i+1], callback_data=f"cnt_{service}_{countries[i+1]}", style="primary"))
+            buttons.append(row)
+
         buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
-        await query.edit_message_text(f"{service} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(f"{escape_md(service)} এর জন্য দেশ নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("cnt_"):
         await query.answer()
@@ -916,7 +939,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━\n"
             "Numbers Allocated \n"
             "— — — — — — — — — —\n"
-            f"📘 {service} ➜ {country}\n"
+            f"📘 {escape_md(service)} ➜ {escape_md(country)}\n"
             f"{nums_formatted}\n"
             "━━━━━━━━━━━━━━━"
         )
@@ -933,7 +956,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_qty = int(get_setting("number_quantity", "2"))
         old_numbers = []
 
-        # Find currently allocated numbers for this user
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             alloc_ref = db.reference("allocations").get()
             if alloc_ref and isinstance(alloc_ref, dict):
@@ -950,7 +972,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_numbers = []
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
-            # Temporarily release old numbers
             for old_num in old_numbers:
                 db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "available", "user_id": 0})
                 db.reference(f"allocations/{old_num}").delete()
@@ -967,7 +988,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
 
             if len(new_numbers) < target_qty:
-                # Revert back to old state if not enough new numbers available
                 for n in new_numbers:
                     db.reference(f"numbers/{service}/{country}/{n}").update({"status": "available", "user_id": 0})
                     db.reference(f"allocations/{n}").delete()
@@ -1005,7 +1025,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.commit()
             else:
                 conn.rollback()
-                # Revert old numbers
                 for old_num in old_numbers:
                     cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_num, user_id))
                     cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
@@ -1019,7 +1038,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "━━━━━━━━━━━━━━━\n"
                 "Numbers Allocated \n"
                 "— — — — — — — — — —\n"
-                f"📘 {service} ➜ {country}\n"
+                f"📘 {escape_md(service)} ➜ {escape_md(country)}\n"
                 f"{nums_formatted}\n"
                 "━━━━━━━━━━━━━━━"
             )
@@ -1076,7 +1095,7 @@ async def otp_poller(application: Application):
                                     try:
                                         await application.bot.send_message(
                                             chat_id=OTP_GROUP_ID,
-                                            text=f"📩 **New OTP Received**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{msg}`",
+                                            text=f"📩 **New OTP Received**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{escape_md(msg)}`",
                                             parse_mode="Markdown"
                                         )
                                     except Exception as e:
@@ -1100,7 +1119,7 @@ async def otp_poller(application: Application):
                                     try:
                                         await application.bot.send_message(
                                             chat_id=allocated_user,
-                                            text=f"🎉 **আপনার OTP কোড এসেছে!**\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{msg}`",
+                                            text=f"🎉 **আপনার OTP কোড এসেছে!**\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{escape_md(msg)}`",
                                             parse_mode="Markdown"
                                         )
                                     except Exception as e:
