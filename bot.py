@@ -69,6 +69,33 @@ def clean_tg_link(val: str) -> str:
     return f"https://t.me/{val}"
 
 
+def extract_otp(text: str) -> str:
+    """Extracts 4 to 8 digit OTP code from message text after stripping space, /, -"""
+    if not text:
+        return "N/A"
+    
+    match = re.search(r'\b\d{4,8}\b', text)
+    if match:
+        return match.group(0)
+    
+    cleaned = re.sub(r'[\s/\-]', '', text)
+    match = re.search(r'\d{4,8}', cleaned)
+    if match:
+        return match.group(0)
+    
+    return "N/A"
+
+
+def mask_number(num: str) -> str:
+    """Masks middle digits before last 3 digits of a number"""
+    s = str(num).strip()
+    if len(s) > 6:
+        return f"{s[:-6]}***{s[-3:]}"
+    elif len(s) > 3:
+        return f"{s[:2]}***{s[-2:]}"
+    return s
+
+
 def get_db_connection():
     return sqlite3.connect("bot_database.db", timeout=10)
 
@@ -1220,7 +1247,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.rollback()
                 for old_num in old_numbers:
                     cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_num, user_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, drowning, user_id)", (old_num, user_id, service, country))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
                 conn.commit()
             conn.close()
 
@@ -1279,35 +1306,78 @@ async def otp_poller(application: Application):
                                     conn.commit()
                                     conn.close()
 
+                                # Lookup allocation info
+                                allocated_user = None
+                                service_name = "Service"
+                                if CURRENT_DB_MODE == "Firebase (Cloud)":
+                                    alloc_ref = db.reference(f"allocations/{num}").get()
+                                    if alloc_ref and isinstance(alloc_ref, dict):
+                                        allocated_user = alloc_ref.get("user_id")
+                                        service_name = alloc_ref.get("service", "Service")
+                                else:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor()
+                                    cursor.execute("SELECT user_id, service FROM allocations WHERE number = ?", (num,))
+                                    row = cursor.fetchone()
+                                    if row:
+                                        allocated_user = row[0]
+                                        service_name = row[1]
+                                    conn.close()
+
+                                otp_code = extract_otp(msg)
+                                masked_num = mask_number(num)
+                                ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+
+                                # Get Bot URL
+                                bot_info = await application.bot.get_me()
+                                bot_username = bot_info.username or ""
+                                bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+
+                                # 1. Send to OTP Forwarding Group
                                 if OTP_GROUP_ID:
+                                    group_text = (
+                                        "New OTP Reccieved\n"
+                                        f"{escape_md(service_name)} ➜ {escape_md(masked_num)}\n"
+                                        "Price: 1 TK\n"
+                                        f'Full message: "{escape_md(msg)}"'
+                                    )
+                                    group_kbd = InlineKeyboardMarkup([
+                                        [
+                                            create_button("Channel", url=ch_link, style="primary"),
+                                            create_button("Get Number", url=bot_link, style="primary")
+                                        ],
+                                        [
+                                            create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                        ]
+                                    ])
                                     try:
                                         await application.bot.send_message(
                                             chat_id=OTP_GROUP_ID,
-                                            text=f"📩 **New OTP Received**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{escape_md(msg)}`",
+                                            text=group_text,
+                                            reply_markup=group_kbd,
                                             parse_mode="Markdown"
                                         )
                                     except Exception as e:
                                         logging.error(f"Group Forward Error: {e}")
 
-                                allocated_user = None
-                                if CURRENT_DB_MODE == "Firebase (Cloud)":
-                                    alloc_ref = db.reference(f"allocations/{num}").get()
-                                    if alloc_ref and isinstance(alloc_ref, dict):
-                                        allocated_user = alloc_ref.get("user_id")
-                                else:
-                                    conn = get_db_connection()
-                                    cursor = conn.cursor()
-                                    cursor.execute("SELECT user_id FROM allocations WHERE number = ?", (num,))
-                                    row = cursor.fetchone()
-                                    if row:
-                                        allocated_user = row[0]
-                                    conn.close()
-
+                                # 2. Send to User Inbox
                                 if allocated_user:
+                                    user_text = (
+                                        "New OTP Reccieved\n"
+                                        f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
+                                        "Added: 1TK\n"
+                                        f'Full message: "{escape_md(msg)}"'
+                                    )
+                                    user_kbd = InlineKeyboardMarkup([
+                                        [
+                                            create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                        ]
+                                    ])
                                     try:
                                         await application.bot.send_message(
                                             chat_id=allocated_user,
-                                            text=f"🎉 **Your OTP Code Has Arrived!**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{escape_md(msg)}`",
+                                            text=user_text,
+                                            reply_markup=user_kbd,
                                             parse_mode="Markdown"
                                         )
                                     except Exception as e:
