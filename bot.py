@@ -161,6 +161,24 @@ def set_setting(key: str, value: str):
         logging.error(f"Error writing setting to SQLite: {e}")
 
 
+def sync_firebase_to_sqlite():
+    """Firebase থেকে সেটিংস লোকাল SQLite এ সিঙ্ক করে যেন রিসেট হলেও লিংক না হারায়"""
+    if not HAS_FIREBASE_LIB or not firebase_admin._apps:
+        return
+    try:
+        fb_settings = db.reference("settings").get()
+        if fb_settings and isinstance(fb_settings, dict):
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            for k, v in fb_settings.items():
+                if v:
+                    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (str(k), str(v)))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logging.error(f"Error syncing Firebase settings to SQLite: {e}")
+
+
 def get_admin_services_summary():
     summary = {}
     if CURRENT_DB_MODE == "Firebase (Cloud)":
@@ -372,6 +390,7 @@ def init_firebase_system(run_migration=False, force_reinit=False):
 
     if firebase_admin._apps:
         CURRENT_DB_MODE = "Firebase (Cloud)"
+        sync_firebase_to_sqlite()
         if run_migration:
             migrate_sqlite_to_firebase()
         return True
@@ -399,6 +418,10 @@ def init_firebase_system(run_migration=False, force_reinit=False):
                 options['databaseURL'] = DATABASE_URL
             firebase_admin.initialize_app(cred, options if options else None)
             CURRENT_DB_MODE = "Firebase (Cloud)"
+            
+            # Firebase কানেক্ট হওয়ার পরই সেটিংস সিঙ্ক
+            sync_firebase_to_sqlite()
+            
             if run_migration:
                 migrate_sqlite_to_firebase()
             logging.info("Firebase connected successfully!")
@@ -430,12 +453,20 @@ def migrate_sqlite_to_firebase():
         num, uid, srv, cnt = row
         db.reference(f"allocations/{num}").set({"user_id": uid, "service": srv, "country": cnt})
 
+    # Firebase-এ বিদ্যমান সেটিংস আগে চেক করা হচ্ছে
+    existing_fb_settings = db.reference("settings").get() or {}
     cursor.execute("SELECT key, value FROM settings")
     rows = cursor.fetchall()
     for row in rows:
         k, v = row
-        db.reference(f"settings/{k}").set(v)
+        # Firebase-এ যদি ভ্যালু না থাকে কেবল তখনই SQLite থেকে ওভাররাইট করবে
+        if k not in existing_fb_settings or not existing_fb_settings[k]:
+            db.reference(f"settings/{k}").set(v)
+        else:
+            # Firebase-এ ভ্যালু থাকলে সেটি লোকাল SQLite-এ আপডেট রেখে দেবে
+            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, existing_fb_settings[k]))
 
+    conn.commit()
     conn.close()
 
 
