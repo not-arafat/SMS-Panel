@@ -1132,14 +1132,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Sorry, not enough ({target_qty}) numbers available in this category.")
             return
 
-        nums_formatted = "\n".join([f"📱 `{n}`" for n in assigned_numbers])
         alloc_msg = (
             "━━━━━━━━━━━━━━━\n"
-            "Numbers Allocated \n"
-            "— — — — — — — — — —\n"
-            f"📘 {escape_md(service)} ➜ {escape_md(country)}\n"
-            f"{nums_formatted}\n"
-            "━━━━━━━━━━━━━━━"
+            f"{escape_md(service)} ➜ {escape_md(country)} {len(assigned_numbers)} Numbers Allocated:"
         )
         kbd = build_allocation_keyboard(service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -1225,20 +1220,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.rollback()
                 for old_num in old_numbers:
                     cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_num, user_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
+                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, drowning, user_id)", (old_num, user_id, service, country))
                 conn.commit()
             conn.close()
 
         if len(new_numbers) == target_qty:
             await query.answer("Successfully changed all numbers!", show_alert=False)
-            nums_formatted = "\n".join([f"📱 `{n}`" for n in new_numbers])
             alloc_msg = (
                 "━━━━━━━━━━━━━━━\n"
-                "Numbers Allocated \n"
-                "— — — — — — — — — —\n"
-                f"📘 {escape_md(service)} ➜ {escape_md(country)}\n"
-                f"{nums_formatted}\n"
-                "━━━━━━━━━━━━━━━"
+                f"{escape_md(service)} ➜ {escape_md(country)} {len(new_numbers)} Numbers Allocated:"
             )
             kbd = build_allocation_keyboard(service, country, new_numbers)
             await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
