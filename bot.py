@@ -33,7 +33,7 @@ load_dotenv()
 # ---------------- CONFIGURATION ----------------
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("BOT_TOKEN পরিবেশক ভ্যারিয়েবল পাওয়া যায়নি! .env ফাইল বা এনভায়রনমেন্ট চেক করুন।")
+    raise ValueError("BOT_TOKEN environment variable not found! Check your .env file or environment settings.")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
@@ -45,7 +45,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("^(Get Number|Get number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -53,6 +53,20 @@ def escape_md(text: str) -> str:
     if not text:
         return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
+
+def clean_tg_link(val: str) -> str:
+    """Converts usernames (@user), t.me links, or standard URLs into valid HTTPS Telegram links."""
+    if not val:
+        return "https://t.me"
+    val = val.strip()
+    if val.startswith("http://") or val.startswith("https://"):
+        return val
+    if val.startswith("t.me/"):
+        return f"https://{val}"
+    if val.startswith("@"):
+        return f"https://t.me/{val[1:]}"
+    return f"https://t.me/{val}"
 
 
 def get_db_connection():
@@ -162,7 +176,6 @@ def set_setting(key: str, value: str):
 
 
 def sync_firebase_to_sqlite():
-    """Firebase থেকে সেটিংস লোকাল SQLite এ সিঙ্ক করে যেন রিসেট হলেও লিংক না হারায়"""
     if not HAS_FIREBASE_LIB or not firebase_admin._apps:
         return
     try:
@@ -246,17 +259,17 @@ def delete_country_db(service: str, country: str):
 def build_admin_services_view():
     summary = get_admin_services_summary()
     if not summary:
-        text = "📱 **SERVICES MANAGEMENT**\n\nবর্তমানে কোনো সার্ভিস যুক্ত করা নেই।"
+        text = "📱 **SERVICES MANAGEMENT**\n\nNo services added yet."
         buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
         return text, InlineKeyboardMarkup(buttons)
 
-    text = "📱 **SERVICES MANAGEMENT**\n\nনিচে আপনার সার্ভিসসমূহ এবং আনইউজড/এভেলেবল নম্বরের বিবরণ দেওয়া হলো:\n"
+    text = "📱 **SERVICES MANAGEMENT**\n\nBelow is the summary of your added services and available numbers:\n"
     buttons = []
     for srv, cnts in summary.items():
         total_avail = sum(cnts.values())
         text += f"\n🔹 **{escape_md(srv)}** (Total Available: `{total_avail}`)"
         for cnt, count in cnts.items():
-            text += f"\n   └ {escape_md(cnt)}: `{count}` টি"
+            text += f"\n   └ {escape_md(cnt)}: `{count}`"
         buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
 
     buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
@@ -269,13 +282,13 @@ def build_service_manage_view(service: str):
     total_avail = sum(cnts.values())
 
     text = f"⚙️ **SERVICE DETAILS: {escape_md(service)}**\n\n"
-    text += f"📊 মোট এভেলেবল নম্বর: `{total_avail}` টি\n\n"
-    text += "🏳️ **দেশ এবং আনইউজড নম্বর:**\n"
+    text += f"📊 Total Available Numbers: `{total_avail}`\n\n"
+    text += "🏳️ **Countries & Available Quantities:**\n"
     if cnts:
         for cnt, count in cnts.items():
-            text += f"• **{escape_md(cnt)}**: `{count}` টি এভেলেবল\n"
+            text += f"• **{escape_md(cnt)}**: `{count}` available\n"
     else:
-        text += "কোনো দেশ যুক্ত নেই।\n"
+        text += "No countries configured.\n"
 
     buttons = [
         [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}", style="success")],
@@ -299,8 +312,8 @@ def build_global_settings_view():
         f"📢 **Channel:** {escape_md(ch_val)}\n"
         f"🎧 **Support:** {escape_md(sp_val)}\n"
         f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n"
-        f"🔢 **Number Quantity (Per Request):** `{num_qty}` টি\n\n"
-        f"পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
+        f"🔢 **Number Quantity (Per Request):** `{num_qty}`\n\n"
+        f"Click below to modify configuration:"
     )
     buttons = [
         [
@@ -317,17 +330,17 @@ def build_global_settings_view():
 
 def build_number_quantity_view():
     current_qty = get_setting("number_quantity", "2")
-    text = f"🔢 **NUMBER QUANTITY SETTINGS**\n\nপ্রতিটি রিকোয়েস্টে ইউজার কয়টি করে নম্বর পাবে তা সিলেক্ট করুন।\nবর্তমান সেটআপ: `{current_qty}` টি"
+    text = f"🔢 **NUMBER QUANTITY SETTINGS**\n\nSelect how many numbers a user receives per request.\nCurrent setting: `{current_qty}`"
     buttons = [
         [
-            create_button("1 টি", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success"),
-            create_button("2 টি", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success"),
-            create_button("3 টি", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success")
+            create_button("1", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success"),
+            create_button("2", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success"),
+            create_button("3", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success")
         ],
         [
-            create_button("4 টি", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
-            create_button("5 টি", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
-            create_button("6 টি", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")
+            create_button("4", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
+            create_button("5", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
+            create_button("6", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")
         ],
         [create_button("Back", callback_data="adm:set:back", style="danger")]
     ]
@@ -335,7 +348,7 @@ def build_number_quantity_view():
 
 
 def build_allocation_keyboard(service: str, country: str, numbers: list):
-    otp_group_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
+    otp_group_link = clean_tg_link(get_setting("otp_group_link", "https://t.me/your_otp_group"))
     buttons = []
     for num in numbers:
         buttons.append([create_button(f"{num}", copy_text=str(num), style="success")])
@@ -362,7 +375,7 @@ def get_services_keyboard():
         conn.close()
 
     if not services:
-        return None, "বর্তমানে কোনো সার্ভিস এভেলেবল নেই।"
+        return None, "No services currently available."
 
     buttons = []
     for i in range(0, len(services), 2):
@@ -372,7 +385,7 @@ def get_services_keyboard():
             row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}", style="primary"))
         buttons.append(row)
 
-    return InlineKeyboardMarkup(buttons), "📍 Please select a service: "
+    return InlineKeyboardMarkup(buttons), "📍 Please select a service:"
 
 
 def init_firebase_system(run_migration=False, force_reinit=False):
@@ -419,9 +432,7 @@ def init_firebase_system(run_migration=False, force_reinit=False):
             firebase_admin.initialize_app(cred, options if options else None)
             CURRENT_DB_MODE = "Firebase (Cloud)"
             
-            # Firebase কানেক্ট হওয়ার পরই সেটিংস সিঙ্ক
             sync_firebase_to_sqlite()
-            
             if run_migration:
                 migrate_sqlite_to_firebase()
             logging.info("Firebase connected successfully!")
@@ -453,17 +464,14 @@ def migrate_sqlite_to_firebase():
         num, uid, srv, cnt = row
         db.reference(f"allocations/{num}").set({"user_id": uid, "service": srv, "country": cnt})
 
-    # Firebase-এ বিদ্যমান সেটিংস আগে চেক করা হচ্ছে
     existing_fb_settings = db.reference("settings").get() or {}
     cursor.execute("SELECT key, value FROM settings")
     rows = cursor.fetchall()
     for row in rows:
         k, v = row
-        # Firebase-এ যদি ভ্যালু না থাকে কেবল তখনই SQLite থেকে ওভাররাইট করবে
         if k not in existing_fb_settings or not existing_fb_settings[k]:
             db.reference(f"settings/{k}").set(v)
         else:
-            # Firebase-এ ভ্যালু থাকলে সেটি লোকাল SQLite-এ আপডেট রেখে দেবে
             cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, existing_fb_settings[k]))
 
     conn.commit()
@@ -539,7 +547,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['current_menu'] = 'main'
     user_id = update.effective_user.id
     first_name = escape_md(update.effective_user.first_name or "User")
-    msg = f"Welcome, {first_name}!\nSelect an option from menu:"
+    msg = f"Welcome, {first_name}!\nPlease select an option from the menu:"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
 
 
@@ -566,7 +574,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 **Balance:** `0.00 ৳`"
         )
         kbd = InlineKeyboardMarkup([
-            [create_button("Refer Link", copy_text=refer_link, style="success")]
+            [create_button("Referral Link", copy_text=refer_link, style="success")]
         ])
         await update.message.reply_text(profile_text, reply_markup=kbd, parse_mode="Markdown")
 
@@ -579,13 +587,23 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(wallet_text, parse_mode="Markdown")
 
     elif text == "Channel":
-        ch_link = get_setting("channel", "https://t.me/your_channel")
-        await update.message.reply_text(f"📢 আমাদের অফিশিয়াল চ্যানেল: {ch_link}")
+        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+        kbd = InlineKeyboardMarkup([
+            [create_button("Join Channel", url=ch_link, style="primary")]
+        ])
+        await update.message.reply_text("Click below to join our official channel:", reply_markup=kbd)
 
     elif text == "Support":
-        sp_link = get_setting("support", "@your_support")
-        ch_link = get_setting("channel", "https://t.me/your_channel")
-        await update.message.reply_text(f"🎧 Here is your Support and Channel:\n Support: {sp_link}\n Channel: {ch_link}")
+        sp_link = clean_tg_link(get_setting("support", "@your_support"))
+        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+        
+        kbd = InlineKeyboardMarkup([
+            [
+                create_button("Support", url=sp_link, style="primary"),
+                create_button("Channel", url=ch_link, style="primary")
+            ]
+        ])
+        await update.message.reply_text("Click below to contact support or join our channel:", reply_markup=kbd)
 
     elif text == "Admin Panel" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
@@ -621,7 +639,7 @@ async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await query.message.reply_text("সার্ভিসের নাম লিখুন (যেমন: TikTok, Facebook):")
+    await query.message.reply_text("Enter the service name (e.g., TikTok, Facebook):")
     return ADD_SERVICE
 
 async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -631,17 +649,17 @@ async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END
     service = query.data.split(":", 3)[3]
     context.user_data['service_name'] = service
-    await query.message.reply_text(f"সার্ভিস **{escape_md(service)}** সিলেক্ট করা হয়েছে।\n\nদেশের নাম লিখুন (যেমন: Bangladesh, Nepal):", parse_mode="Markdown")
+    await query.message.reply_text(f"Service **{escape_md(service)}** selected.\n\nEnter country name (e.g., Bangladesh, Nepal):", parse_mode="Markdown")
     return ADD_COUNTRY
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['service_name'] = update.message.text.strip()
-    await update.message.reply_text("দেশের নাম লিখুন (যেমন: Bangladesh, Nepal):")
+    await update.message.reply_text("Enter country name (e.g., Bangladesh, Nepal):")
     return ADD_COUNTRY
 
 async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['country_name'] = update.message.text.strip()
-    await update.message.reply_text("নম্বরগুলো পাঠাও (টেক্সট ফাইল অথবা প্রতি লাইনে একটি করে নম্বর):")
+    await update.message.reply_text("Send the numbers (as a text file or one number per line):")
     return ADD_NUMBERS
 
 async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -678,9 +696,9 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
 
-        await update.message.reply_text(f"সফলভাবে {valid_count} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(f"Successfully added {valid_count} numbers!", reply_markup=get_admin_keyboard())
     else:
-        await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("Incomplete data provided. Please try again.", reply_markup=get_admin_keyboard())
 
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
@@ -694,14 +712,14 @@ async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFA
 
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
+        await update.callback_query.message.reply_text("Please send the Firebase `.json` service account file:")
     else:
-        await update.message.reply_text("দয়া করে ফায়ারবেসের `.json` ফাইলটি সেন্ড করুন:")
+        await update.message.reply_text("Please send the Firebase `.json` service account file:")
     return WAIT_FIREBASE_FILE
 
 async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.document or not update.message.document.file_name.endswith('.json'):
-        await update.message.reply_text("ভুল ফাইল! শুধুমাত্র `.json` সার্ভিস একাউন্ট ফাইল আপলোড দিন।", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("Invalid file! Please upload only `.json` service account files.", reply_markup=get_admin_keyboard())
         return ConversationHandler.END
 
     file = await context.bot.get_file(update.message.document.file_id)
@@ -709,9 +727,9 @@ async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TY
 
     success = init_firebase_system(run_migration=True, force_reinit=True)
     if success:
-        await update.message.reply_text("ফায়ারবেস ফাইল রিসিভড! ডাটাবেস সফলভাবে Firebase-এ সুইচেবল ও মাইগ্রেট হয়েছে। 🚀", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("Firebase file received! Database successfully connected and migrated to Firebase. 🚀", reply_markup=get_admin_keyboard())
     else:
-        await update.message.reply_text("ফাইল সেভ হয়েছে কিন্তু ফায়ারবেসে কানেক্ট হতে পারেনি। JSON চেক করুন।", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("File saved, but failed to connect to Firebase. Please check the JSON content.", reply_markup=get_admin_keyboard())
 
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
@@ -725,17 +743,17 @@ async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         if query.from_user.id != ADMIN_ID:
             return ConversationHandler.END
-        await query.message.reply_text("নতুন চ্যানেল লিঙ্কটি লিখুন (যেমন: https://t.me/your_channel):")
+        await query.message.reply_text("Enter the new channel link (e.g., https://t.me/your_channel or @your_channel):")
     return WAIT_CHANNEL
 
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
-        await update.message.reply_text("❌ অবৈধ লিঙ্ক! অনুগ্রহ করে একটি সঠিক লিঙ্ক দিন (যেমন: https://t.me/your_channel)।\nবাতিল করতে /cancel লিখুন।")
+        await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
 
     set_setting("channel", new_link)
-    await update.message.reply_text(f"✅ সফলভাবে চ্যানেল লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {escape_md(new_link)}", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Channel link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_global_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
@@ -746,17 +764,17 @@ async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         if query.from_user.id != ADMIN_ID:
             return ConversationHandler.END
-        await query.message.reply_text("নতুন সাপোর্ট ইউজারনেম/লিঙ্ক লিখুন (যেমন: @your_support):")
+        await query.message.reply_text("Enter the new support username/link (e.g., @your_support or https://t.me/your_support):")
     return WAIT_SUPPORT
 
 async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
-        await update.message.reply_text("❌ অবৈধ লিঙ্ক! অনুগ্রহ করে একটি সঠিক ইউজারনেম বা লিঙ্ক দিন (যেমন: @your_support)।\nবাতিল করতে /cancel লিখুন।")
+        await update.message.reply_text("❌ Invalid username/link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_SUPPORT
 
     set_setting("support", new_link)
-    await update.message.reply_text(f"✅ সফলভাবে সাপোর্ট ইউজারনেম/লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান সাপোর্ট: {escape_md(new_link)}", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Support username/link updated successfully!\nCurrent support: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_global_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
@@ -767,17 +785,17 @@ async def set_otplink_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         if query.from_user.id != ADMIN_ID:
             return ConversationHandler.END
-        await query.message.reply_text("নতুন OTP Group লিঙ্ক লিখুন (যেমন: https://t.me/your_otp_group):")
+        await query.message.reply_text("Enter the new OTP Group link (e.g., https://t.me/your_otp_group):")
     return WAIT_OTP_LINK
 
 async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
     if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/")):
-        await update.message.reply_text("❌ অবৈধ লিঙ্ক! অনুগ্রহ করে একটি সঠিক লিঙ্ক দিন (যেমন: https://t.me/your_otp_group)।\nবাতিল করতে /cancel লিখুন।")
+        await update.message.reply_text("❌ Invalid link! Please enter a valid group link.\nType /cancel to abort.")
         return WAIT_OTP_LINK
 
     set_setting("otp_group_link", new_link)
-    await update.message.reply_text(f"✅ সফলভাবে OTP Group লিঙ্ক আপডেট করা হয়েছে!\nবর্তমান লিঙ্ক: {escape_md(new_link)}", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ OTP Group link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_global_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
@@ -821,7 +839,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         qty_val = data.split(":", 2)[2]
         set_setting("number_quantity", qty_val)
-        await query.answer(f"নম্বর কোয়ান্টিটি {qty_val} টি সেট করা হয়েছে!", show_alert=True)
+        await query.answer(f"Number quantity set to {qty_val}!", show_alert=True)
         text_msg, kbd = build_number_quantity_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
@@ -854,7 +872,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         service = data.split(":", 3)[3]
         delete_service_db(service)
-        await query.answer(f"{service} সার্ভিসটি সফলভাবে ডিলিট করা হয়েছে!", show_alert=True)
+        await query.answer(f"Service {service} deleted successfully!", show_alert=True)
         text, kbd = build_admin_services_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
@@ -869,7 +887,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for cnt in cnts.keys():
             buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
         buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
-        await query.edit_message_text(f"**{escape_md(service)}** থেকে কোন দেশটি ডিলিট করতে চান নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        await query.edit_message_text(f"Select country to delete from **{escape_md(service)}**:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
         if user_id != ADMIN_ID:
@@ -879,7 +897,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) >= 5:
             service, country = parts[3], parts[4]
             delete_country_db(service, country)
-            await query.answer(f"{service} থেকে {country} ডিলিট করা হয়েছে!", show_alert=True)
+            await query.answer(f"Deleted {country} from {service}!", show_alert=True)
             text, kbd = build_service_manage_view(service)
             await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
@@ -901,7 +919,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
         if not countries:
-            await query.edit_message_text("এই সার্ভিসে কোনো দেশ পাওয়া যায়নি।")
+            await query.edit_message_text("No countries available for this service.")
             return
 
         buttons = []
@@ -919,7 +937,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         parts = data.split("_", 2)
         if len(parts) < 3:
-            await query.edit_message_text("অবৈধ কমান্ড।")
+            await query.edit_message_text("Invalid command.")
             return
         
         service, country = parts[1], parts[2]
@@ -962,7 +980,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for num_val in assigned_numbers:
                     db.reference(f"numbers/{service}/{country}/{num_val}").update({"status": "available", "user_id": 0})
                     db.reference(f"allocations/{num_val}").delete()
-            await query.edit_message_text(f"দুঃখিত, এই ক্যাটাগরিতে পর্যাপ্ত ({target_qty} টি) নম্বর খালি নেই।")
+            await query.edit_message_text(f"Sorry, not enough ({target_qty}) numbers available in this category.")
             return
 
         nums_formatted = "\n".join([f"📱 `{n}`" for n in assigned_numbers])
@@ -980,7 +998,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("chg:"):
         parts = data.split(":", 2)
         if len(parts) < 3:
-            await query.answer("অবৈধ অনুরোধ!", show_alert=True)
+            await query.answer("Invalid request!", show_alert=True)
             return
 
         service, country = parts[1], parts[2]
@@ -1076,7 +1094,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kbd = build_allocation_keyboard(service, country, new_numbers)
             await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
         else:
-            await query.answer(f"দুঃখিত, পরিবর্তন করার জন্য নতুন {target_qty} টি নম্বর খালি নেই!", show_alert=True)
+            await query.answer(f"Sorry, not enough ({target_qty}) new numbers available to change!", show_alert=True)
 
 
 # ---------------- OTP POLLING SERVICE ----------------
@@ -1150,7 +1168,7 @@ async def otp_poller(application: Application):
                                     try:
                                         await application.bot.send_message(
                                             chat_id=allocated_user,
-                                            text=f"🎉 **আপনার OTP কোড এসেছে!**\n📱 **নম্বর:** `{num}`\n💬 **মেসেজ:**\n`{escape_md(msg)}`",
+                                            text=f"🎉 **Your OTP Code Has Arrived!**\n📱 **Number:** `{num}`\n💬 **Message:**\n`{escape_md(msg)}`",
                                             parse_mode="Markdown"
                                         )
                                     except Exception as e:
