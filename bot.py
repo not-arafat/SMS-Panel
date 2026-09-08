@@ -45,7 +45,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Broadcast|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Edit Links|Edit API|Number Quantity|Admin Control|Broadcast|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -356,19 +356,17 @@ def build_service_manage_view(service: str):
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_global_settings_view():
+def build_edit_links_view():
     ch_val = get_setting("channel", "https://t.me/your_channel")
     sp_val = get_setting("support", "@your_support")
     otp_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
-    num_qty = get_setting("number_quantity", "2")
-    
+
     text = (
-        f"⚙️ **GLOBAL SETTINGS**\n\n"
+        f"🔗 **EDIT LINKS SETTINGS**\n\n"
         f"📢 **Channel:** {escape_md(ch_val)}\n"
         f"🎧 **Support:** {escape_md(sp_val)}\n"
-        f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n"
-        f"🔢 **Number Quantity (Per Request):** `{num_qty}`\n\n"
-        f"Click below to modify configuration:"
+        f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n\n"
+        f"Click below to modify links:"
     )
     buttons = [
         [
@@ -376,8 +374,7 @@ def build_global_settings_view():
             create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")
         ],
         [
-            create_button("🔗 Edit OTP Group Link", callback_data="adm:set:otplink", style="primary"),
-            create_button("🔢 Set Quantity", callback_data="adm:set:qty", style="primary")
+            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -396,8 +393,7 @@ def build_number_quantity_view():
             create_button("4", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
             create_button("5", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
             create_button("6", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")
-        ],
-        [create_button("Back", callback_data="adm:set:back", style="danger")]
+        ]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -592,10 +588,26 @@ def get_admin_keyboard():
         ],
         [
             {"text": "Global Settings", "style": "primary"},
-            {"text": "Number Quantity", "style": "primary"}
+            {"text": "Broadcast", "style": "success"}
         ],
         [
-            {"text": "Broadcast", "style": "success"},
+            {"text": "Back", "style": "danger"}
+        ]
+    ]
+    return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
+
+
+def get_global_settings_keyboard():
+    keyboard_layout = [
+        [
+            {"text": "Edit Links", "style": "primary"},
+            {"text": "Edit API", "style": "primary"}
+        ],
+        [
+            {"text": "Number Quantity", "style": "primary"},
+            {"text": "Admin Control", "style": "primary"}
+        ],
+        [
             {"text": "Back", "style": "danger"}
         ]
     ]
@@ -687,18 +699,46 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text == "Global Settings" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = build_global_settings_view()
+        context.user_data['current_menu'] = 'global_settings'
+        await update.message.reply_text(
+            "⚙️ **GLOBAL SETTINGS MENU**\n\nSelect an option from below keyboard:",
+            reply_markup=get_global_settings_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    elif text == "Edit Links" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'global_settings'
+        text_msg, kbd = build_edit_links_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
+    elif text == "Edit API" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'global_settings'
+        await update.message.reply_text("⚠️ **Edit API feature is currently unavailable.**", parse_mode="Markdown")
+
     elif text == "Number Quantity" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'admin'
+        context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_number_quantity_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
+    elif text == "Admin Control" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'global_settings'
+        await update.message.reply_text("🛠 **ADMIN CONTROL**\n\nSystem control settings panel.", parse_mode="Markdown")
+
     elif text == "Back":
-        context.user_data['current_menu'] = 'main'
-        await update.message.reply_text("Main Menu", reply_markup=get_main_keyboard(user_id))
+        curr_menu = context.user_data.get('current_menu', 'main')
+        if curr_menu == 'global_settings' and user_id == ADMIN_ID:
+            context.user_data['current_menu'] = 'admin'
+            total_users = len(get_all_users())
+            await update.message.reply_text(
+                f"**ADMIN PANEL**\n\n"
+                f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
+                f"👥 Total Registered Users: `{total_users}`",
+                reply_markup=get_admin_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            context.user_data['current_menu'] = 'main'
+            await update.message.reply_text("Main Menu", reply_markup=get_main_keyboard(user_id))
 
 
 # ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
@@ -822,7 +862,7 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
 
     set_setting("channel", new_link)
     await update.message.reply_text(f"✅ Channel link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = build_global_settings_view()
+    text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -843,7 +883,7 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
 
     set_setting("support", new_link)
     await update.message.reply_text(f"✅ Support username/link updated successfully!\nCurrent support: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = build_global_settings_view()
+    text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -864,7 +904,7 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     set_setting("otp_group_link", new_link)
     await update.message.reply_text(f"✅ OTP Group link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = build_global_settings_view()
+    text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -907,7 +947,7 @@ async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TY
                 message_id=update.message.message_id
             )
             success_count += 1
-            await asyncio.sleep(0.05) # Prevent hit hitting flood limits
+            await asyncio.sleep(0.05)
         except Exception as e:
             logging.error(f"Failed to send broadcast to {target_id}: {e}")
             failed_count += 1
@@ -949,13 +989,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Admin Settings Quantity Handlers
-    if data == "adm:set:qty":
-        await query.answer()
-        if user_id != ADMIN_ID:
-            return
-        text_msg, kbd = build_number_quantity_view()
-        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
     elif data.startswith("adm:setqty:"):
         await query.answer()
         if user_id != ADMIN_ID:
@@ -964,13 +997,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting("number_quantity", qty_val)
         await query.answer(f"Number quantity set to {qty_val}!", show_alert=True)
         text_msg, kbd = build_number_quantity_view()
-        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
-    elif data == "adm:set:back":
-        await query.answer()
-        if user_id != ADMIN_ID:
-            return
-        text_msg, kbd = build_global_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     # Admin Management Actions
