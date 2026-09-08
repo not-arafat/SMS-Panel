@@ -17,7 +17,14 @@ except ImportError:
     HAS_FIREBASE_LIB = False
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    KeyboardButton,
+    CopyTextButton
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -108,20 +115,14 @@ def init_sqlite():
 init_sqlite()
 
 
-def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> InlineKeyboardButton:
-    """PTB Compatible InlineKeyboardButton Generator"""
-    kwargs = {"text": text}
-    if callback_data:
-        kwargs["callback_data"] = callback_data
-    if url:
-        kwargs["url"] = url
+def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None) -> InlineKeyboardButton:
     if copy_text:
-        try:
-            from telegram import CopyTextButton
-            kwargs["copy_text"] = CopyTextButton(text=copy_text)
-        except Exception:
-            pass
-    return InlineKeyboardButton(**kwargs)
+        return InlineKeyboardButton(text=text, copy_text=CopyTextButton(text=copy_text))
+    if url:
+        return InlineKeyboardButton(text=text, url=url)
+    if callback_data:
+        return InlineKeyboardButton(text=text, callback_data=callback_data)
+    return InlineKeyboardButton(text=text, callback_data="none")
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -539,8 +540,8 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📢 আমাদের অফিশিয়াল চ্যানেল: {ch_link}")
 
     elif text == "Support":
-        sp_link = get_setting("support", "@your_support")
         ch_link = get_setting("channel", "https://t.me/your_channel")
+        sp_link = get_setting("support", "@your_support")
         await update.message.reply_text(f"🎧 Here is your Support and Channel:\n Support: {sp_link}\n Channel: {ch_link}")
 
     elif text == "Admin Panel" and user_id == ADMIN_ID:
@@ -613,33 +614,39 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = context.user_data.get('country_name')
 
     if service and country and numbers:
-        valid_count = 0
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
+        await update.message.reply_text("⏳ নম্বরগুলো প্রসেস ও আপলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
+        
+        clean_numbers = list(set([re.sub(r'\D', '', num) for num in numbers if re.sub(r'\D', '', num)]))
+        total_unique = len(clean_numbers)
+
+        if total_unique == 0:
+            await update.message.reply_text("❌ কোনো ভ্যালিড নম্বর পাওয়া যায়নি!", reply_markup=get_admin_keyboard())
+            return ConversationHandler.END
 
         if CURRENT_DB_MODE == "Firebase (Cloud)":
             ref = db.reference(f"numbers/{service}/{country}")
-            for num in numbers:
-                clean_num = re.sub(r'\D', '', num)
-                if clean_num:
-                    ref.child(clean_num).set({"number": clean_num, "status": "available", "user_id": 0})
-                    cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
-                    valid_count += 1
+            chunk_size = 1000
+            for i in range(0, total_unique, chunk_size):
+                chunk = clean_numbers[i:i + chunk_size]
+                payload = {num: {"number": num, "status": "available", "user_id": 0} for num in chunk}
+                ref.update(payload)
+
             db.reference(f"services/{service}/{country}").set(True)
+            valid_count = total_unique
         else:
-            for num in numbers:
-                clean_num = re.sub(r'\D', '', num)
-                if clean_num:
-                    cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
-                    valid_count += 1
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
+            
+            data_to_insert = [(service, country, num, 'available', 0) for num in clean_numbers]
+            cursor.executemany("INSERT INTO numbers (service, country, number, status, user_id) VALUES (?, ?, ?, ?, ?)", data_to_insert)
+            conn.commit()
+            conn.close()
+            valid_count = total_unique
 
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(f"সফলভাবে {valid_count} টি নম্বর যোগ করা হয়েছে!", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(f"✅ সফলভাবে {valid_count} টি ইউনিক নম্বর যোগ করা হয়েছে!", reply_markup=get_admin_keyboard())
     else:
-        await update.message.reply_text("তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("❌ তথ্য অসম্পূর্ণ ছিল, আবার চেষ্টা করুন।", reply_markup=get_admin_keyboard())
 
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
