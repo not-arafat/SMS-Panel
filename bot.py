@@ -45,7 +45,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Edit Links|Edit API|Number Quantity|Admin Control|Broadcast|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Upload Firebase|Broadcast|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -611,7 +611,7 @@ def get_admin_keyboard():
     keyboard_layout = [
         [
             {"text": "Services", "style": "primary"},
-            {"text": "Upload Firebase", "style": "primary"}
+            {"text": "Admin Control", "style": "primary"}
         ],
         [
             {"text": "Global Settings", "style": "primary"},
