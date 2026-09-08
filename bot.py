@@ -45,7 +45,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Upload Firebase|Global Settings|Number Quantity|Broadcast|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -76,6 +76,11 @@ def get_db_connection():
 def init_sqlite():
     conn = get_db_connection()
     cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY
+        )
+    ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS services (
             service_name TEXT,
@@ -120,6 +125,46 @@ def init_sqlite():
     conn.close()
 
 init_sqlite()
+
+
+def save_user(user_id: int):
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"users/{user_id}").set(True)
+        except Exception as e:
+            logging.error(f"Error saving user to Firebase: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error saving user to SQLite: {e}")
+
+
+def get_all_users() -> list:
+    users = []
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_users = db.reference("users").get()
+            if fb_users and isinstance(fb_users, dict):
+                users = [int(uid) for uid in fb_users.keys() if uid.isdigit()]
+        except Exception as e:
+            logging.error(f"Error fetching users from Firebase: {e}")
+
+    if not users:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users")
+            users = [row[0] for row in cursor.fetchall()]
+            conn.close()
+        except Exception as e:
+            logging.error(f"Error fetching users from SQLite: {e}")
+
+    return list(set(users))
 
 
 def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> dict:
@@ -188,8 +233,18 @@ def sync_firebase_to_sqlite():
                     cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (str(k), str(v)))
             conn.commit()
             conn.close()
+
+        fb_users = db.reference("users").get()
+        if fb_users and isinstance(fb_users, dict):
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            for uid in fb_users.keys():
+                if uid.isdigit():
+                    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (int(uid),))
+            conn.commit()
+            conn.close()
     except Exception as e:
-        logging.error(f"Error syncing Firebase settings to SQLite: {e}")
+        logging.error(f"Error syncing Firebase data to SQLite: {e}")
 
 
 def get_admin_services_summary():
@@ -451,6 +506,11 @@ def migrate_sqlite_to_firebase():
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    for u in users:
+        db.reference(f"users/{u[0]}").set(True)
+
     cursor.execute("SELECT service, country, number, status, user_id FROM numbers")
     rows = cursor.fetchall()
     for row in rows:
@@ -499,7 +559,8 @@ def run_flask():
     WAIT_CHANNEL,
     WAIT_SUPPORT,
     WAIT_OTP_LINK,
-) = range(7)
+    WAIT_BROADCAST_MSG,
+) = range(8)
 
 
 # ---------------- KEYBOARDS ----------------
@@ -534,6 +595,7 @@ def get_admin_keyboard():
             {"text": "Number Quantity", "style": "primary"}
         ],
         [
+            {"text": "Broadcast", "style": "success"},
             {"text": "Back", "style": "danger"}
         ]
     ]
@@ -542,10 +604,12 @@ def get_admin_keyboard():
 
 # ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    save_user(user_id)
+
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'main'
-    user_id = update.effective_user.id
     first_name = escape_md(update.effective_user.first_name or "User")
     msg = f"Welcome, {first_name}!\nPlease select an option from the menu:"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
@@ -554,6 +618,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
+    save_user(user_id)
 
     if text in ["Get Number", "Get number"]:
         kbd, msg = get_services_keyboard()
@@ -607,8 +672,11 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "Admin Panel" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
+        total_users = len(get_all_users())
         await update.message.reply_text(
-            f"**ADMIN PANEL**\n\nCurrent DB: **{CURRENT_DB_MODE}**",
+            f"**ADMIN PANEL**\n\n"
+            f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
+            f"👥 Total Registered Users: `{total_users}`",
             reply_markup=get_admin_keyboard(),
             parse_mode="Markdown"
         )
@@ -800,6 +868,60 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
+# Broadcast Handlers
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return ConversationHandler.END
+
+    all_users = get_all_users()
+    await update.message.reply_text(
+        f"📢 **BROADCAST SYSTEM**\n\n"
+        f"Target Audience: `{len(all_users)}` users\n\n"
+        f"Please send or forward the message (text, photo, video, document, etc.) you want to broadcast to all users.\n"
+        f"Type /cancel to abort.",
+        parse_mode="Markdown"
+    )
+    return WAIT_BROADCAST_MSG
+
+async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return ConversationHandler.END
+
+    all_users = get_all_users()
+    if not all_users:
+        await update.message.reply_text("No users found in database to broadcast.", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+
+    status_msg = await update.message.reply_text(f"⏳ Broadcasting message to `{len(all_users)}` users...", parse_mode="Markdown")
+
+    success_count = 0
+    failed_count = 0
+
+    for target_id in all_users:
+        try:
+            await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id
+            )
+            success_count += 1
+            await asyncio.sleep(0.05) # Prevent hit hitting flood limits
+        except Exception as e:
+            logging.error(f"Failed to send broadcast to {target_id}: {e}")
+            failed_count += 1
+
+    report = (
+        f"📢 **BROADCAST COMPLETED**\n\n"
+        f"✅ **Successfully Sent:** `{success_count}`\n"
+        f"❌ **Failed / Blocked:** `{failed_count}`\n"
+        f"📊 **Total Target Users:** `{len(all_users)}`"
+    )
+    await status_msg.edit_text(report, parse_mode="Markdown")
+    await update.message.reply_text("Select an option from Admin Menu:", reply_markup=get_admin_keyboard())
+    return ConversationHandler.END
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
@@ -815,6 +937,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
+    save_user(user_id)
 
     if data == "back_to_services":
         await query.answer()
@@ -1195,6 +1318,7 @@ def main():
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
             MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
+            MessageHandler(filters.Regex("^Broadcast$") & filters.User(user_id=ADMIN_ID), broadcast_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
@@ -1204,6 +1328,7 @@ def main():
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
             WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_support_link)],
             WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_link)],
+            WAIT_BROADCAST_MSG: [MessageHandler(~filters.COMMAND & ~MENU_FILTER, receive_broadcast_msg)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
