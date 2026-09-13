@@ -614,11 +614,11 @@ def get_admin_keyboard():
     keyboard_layout = [
         [
             {"text": "SERVICES", "style": "primary"},
-            {"text": "ADMIN CONTROL", "style": "primary"}
+            {"text": "BROADCAST", "style": "primary"}
         ],
         [
-            {"text": "GLOBAL SETTINGS", "style": "primary"},
-            {"text": "BROADCAST", "style": "success"}
+            {"text": "ADMIN CONTROL", "style": "primary"},
+            {"text": "GLOBAL SETTINGS", "style": "primary"}
         ],
         [
             {"text": "BACK", "style": "danger"}
