@@ -634,7 +634,7 @@ def get_global_settings_keyboard():
         ],
         [
             {"text": "Number Quantity", "style": "primary"},
-            {"text": "Admin Control", "style": "primary"}
+            {"text": "Upload Firebase", "style": "primary"}
         ],
         [
             {"text": "Back", "style": "danger"}
@@ -1163,7 +1163,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         alloc_msg = (
             "━━━━━━━━━━━━━━━\n"
-            f"{escape_md(service)} ➜ {escape_md(country)} {len(assigned_numbers)} Numbers Allocated:"
+            f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers Allocated:"
         )
         kbd = build_allocation_keyboard(service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -1386,7 +1386,8 @@ async def otp_poller(application: Application):
                                         if allocated_user:
                                             user_text = (
                                                 "New OTP Reccieved\n"
-                                                f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
+                                                f"Service: {escape_md(service_name)}\n"
+                                                "Number: {escape_md(num)}\n"
                                                 "Added: 1TK\n"
                                                 f'Full message: "{escape_md(msg)}"'
                                             )
