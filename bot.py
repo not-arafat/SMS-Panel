@@ -1425,7 +1425,7 @@ def main():
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
-            MessageHandler(filters.Regex("^connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
+            MessageHandler(filters.Regex("^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("^Broadcast$") & filters.User(user_id=ADMIN_ID), broadcast_start),
         ],
         states={
