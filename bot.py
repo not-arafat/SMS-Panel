@@ -7,6 +7,7 @@ import base64
 import sqlite3
 import threading
 import hashlib
+import html
 import httpx
 from dotenv import load_dotenv
 
@@ -1358,14 +1359,18 @@ async def otp_poller(application: Application):
                                         bot_username = bot_info.username or ""
                                         bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
 
-                                        # Telegram Inbuilt Blockquote Format
-                                        quoted_msg = "\n".join([f">{line}" for line in escape_md(msg).splitlines()])
+                                        # HTML escaping and Telegram Expandable Blockquote Format
+                                        safe_msg = html.escape(msg)
+                                        safe_service = html.escape(service_name)
+                                        safe_masked_num = html.escape(masked_num)
+                                        safe_num = html.escape(num)
+                                        quoted_msg = f"<blockquote expandable>{safe_msg}</blockquote>"
 
                                         # 1. Send to OTP Forwarding Group
                                         if OTP_GROUP_ID:
                                             group_text = (
                                                 "New OTP Received\n"
-                                                f"{escape_md(service_name)} ➜ {escape_md(masked_num)}\n"
+                                                f"{safe_service} ➜ {safe_masked_num}\n"
                                                 "Price: 1 TK\n"
                                                 f"{quoted_msg}"
                                             )
@@ -1383,7 +1388,7 @@ async def otp_poller(application: Application):
                                                     chat_id=OTP_GROUP_ID,
                                                     text=group_text,
                                                     reply_markup=group_kbd,
-                                                    parse_mode="Markdown"
+                                                    parse_mode="HTML"
                                                 )
                                             except Exception as e:
                                                 logging.error(f"Group Forward Error: {e}")
@@ -1392,7 +1397,7 @@ async def otp_poller(application: Application):
                                         if allocated_user:
                                             user_text = (
                                                 "New OTP Received\n"
-                                                f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
+                                                f"{safe_service} ➜ {safe_num}\n"
                                                 "Added: 1TK\n"
                                                 f"{quoted_msg}"
                                             )
@@ -1406,7 +1411,7 @@ async def otp_poller(application: Application):
                                                     chat_id=allocated_user,
                                                     text=user_text,
                                                     reply_markup=user_kbd,
-                                                    parse_mode="Markdown"
+                                                    parse_mode="HTML"
                                                 )
                                             except Exception as e:
                                                 logging.error(f"User Forward Error: {e}")
