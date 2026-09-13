@@ -6,6 +6,7 @@ import json
 import base64
 import sqlite3
 import threading
+import hashlib
 import httpx
 from dotenv import load_dotenv
 
@@ -38,7 +39,8 @@ if not TOKEN:
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-API_URL = os.environ.get("API_URL")
+API_URL = os.environ.get("API_URL", "http://147.135.212.197/crapi/had/viewstats")
+API_TOKEN = os.environ.get("API_TOKEN", "")
 
 FIREBASE_JSON_PATH = "temp_firebase.json"
 CURRENT_DB_MODE = "SQLite (Local)"
@@ -1263,7 +1265,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Sorry, not enough ({target_qty}) new numbers available to change!", show_alert=True)
 
 
-# ---------------- OTP POLLING SERVICE ----------------
+# ---------------- OTP POLLING SERVICE (CR API) ----------------
 async def otp_poller(application: Application):
     processed_ids = set()
 
@@ -1282,106 +1284,126 @@ async def otp_poller(application: Application):
         while True:
             try:
                 if API_URL:
-                    res = await client.get(API_URL)
+                    params = {}
+                    if API_TOKEN and "token=" not in API_URL:
+                        params["token"] = API_TOKEN
+                        params["records"] = 200
+
+                    res = await client.get(API_URL, params=params if params else None)
                     if res.status_code == 200:
-                        docs = res.json().get("data", {}).get("docs", [])
+                        res_data = res.json()
+                        if res_data.get("status") == "success":
+                            items = res_data.get("data", [])
+                            if isinstance(items, list):
+                                for item in items:
+                                    if not isinstance(item, dict):
+                                        continue
 
-                        for item in docs:
-                            msg_id = item.get("_id")
-                            num = item.get("number")
-                            msg = item.get("message")
+                                    num = str(item.get("num", "")).strip()
+                                    msg = item.get("message", "")
+                                    dt = item.get("dt", "")
+                                    cli = item.get("cli", "")
 
-                            if msg_id and msg_id not in processed_ids:
-                                processed_ids.add(msg_id)
+                                    if not num or not msg:
+                                        continue
 
-                                if len(processed_ids) > 2000:
-                                    processed_ids = set(list(processed_ids)[-1000:])
+                                    # Generating unique MD5 key for deduplication
+                                    unique_str = f"{num}_{dt}_{msg}"
+                                    msg_id = hashlib.md5(unique_str.encode()).hexdigest()
 
-                                if CURRENT_DB_MODE == "Firebase (Cloud)":
-                                    db.reference(f"seen_otp_ids/{msg_id}").set(True)
-                                else:
-                                    conn = get_db_connection()
-                                    cursor = conn.cursor()
-                                    cursor.execute("INSERT OR IGNORE INTO seen_otps (msg_id) VALUES (?)", (msg_id,))
-                                    conn.commit()
-                                    conn.close()
+                                    if msg_id not in processed_ids:
+                                        processed_ids.add(msg_id)
 
-                                # Lookup allocation info
-                                allocated_user = None
-                                service_name = "Service"
-                                if CURRENT_DB_MODE == "Firebase (Cloud)":
-                                    alloc_ref = db.reference(f"allocations/{num}").get()
-                                    if alloc_ref and isinstance(alloc_ref, dict):
-                                        allocated_user = alloc_ref.get("user_id")
-                                        service_name = alloc_ref.get("service", "Service")
-                                else:
-                                    conn = get_db_connection()
-                                    cursor = conn.cursor()
-                                    cursor.execute("SELECT user_id, service FROM allocations WHERE number = ?", (num,))
-                                    row = cursor.fetchone()
-                                    if row:
-                                        allocated_user = row[0]
-                                        service_name = row[1]
-                                    conn.close()
+                                        if len(processed_ids) > 2000:
+                                            processed_ids = set(list(processed_ids)[-1000:])
 
-                                otp_code = extract_otp(msg)
-                                masked_num = mask_number(num)
-                                ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+                                        if CURRENT_DB_MODE == "Firebase (Cloud)":
+                                            db.reference(f"seen_otp_ids/{msg_id}").set(True)
+                                        else:
+                                            conn = get_db_connection()
+                                            cursor = conn.cursor()
+                                            cursor.execute("INSERT OR IGNORE INTO seen_otps (msg_id) VALUES (?)", (msg_id,))
+                                            conn.commit()
+                                            conn.close()
 
-                                # Get Bot URL
-                                bot_info = await application.bot.get_me()
-                                bot_username = bot_info.username or ""
-                                bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+                                        # Lookup allocation info
+                                        allocated_user = None
+                                        service_name = cli if cli else "Service"
+                                        clean_num = re.sub(r'\D', '', num)
 
-                                # 1. Send to OTP Forwarding Group
-                                if OTP_GROUP_ID:
-                                    group_text = (
-                                        "New OTP Reccieved\n"
-                                        f"{escape_md(service_name)} ➜ {escape_md(masked_num)}\n"
-                                        "Price: 1 TK\n"
-                                        f'Full message: "{escape_md(msg)}"'
-                                    )
-                                    group_kbd = InlineKeyboardMarkup([
-                                        [
-                                            create_button("Channel", url=ch_link, style="primary"),
-                                            create_button("Get Number", url=bot_link, style="primary")
-                                        ],
-                                        [
-                                            create_button(f"{otp_code}", copy_text=otp_code, style="success")
-                                        ]
-                                    ])
-                                    try:
-                                        await application.bot.send_message(
-                                            chat_id=OTP_GROUP_ID,
-                                            text=group_text,
-                                            reply_markup=group_kbd,
-                                            parse_mode="Markdown"
-                                        )
-                                    except Exception as e:
-                                        logging.error(f"Group Forward Error: {e}")
+                                        if CURRENT_DB_MODE == "Firebase (Cloud)":
+                                            alloc_ref = db.reference(f"allocations/{num}").get() or db.reference(f"allocations/{clean_num}").get()
+                                            if alloc_ref and isinstance(alloc_ref, dict):
+                                                allocated_user = alloc_ref.get("user_id")
+                                                service_name = alloc_ref.get("service", service_name)
+                                        else:
+                                            conn = get_db_connection()
+                                            cursor = conn.cursor()
+                                            cursor.execute("SELECT user_id, service FROM allocations WHERE number = ? OR number = ?", (num, clean_num))
+                                            row = cursor.fetchone()
+                                            if row:
+                                                allocated_user = row[0]
+                                                service_name = row[1]
+                                            conn.close()
 
-                                # 2. Send to User Inbox
-                                if allocated_user:
-                                    user_text = (
-                                        "New OTP Reccieved\n"
-                                        f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
-                                        "Added: 1TK\n"
-                                        f'Full message: "{escape_md(msg)}"'
-                                    )
-                                    user_kbd = InlineKeyboardMarkup([
-                                        [
-                                            create_button(f"{otp_code}", copy_text=otp_code, style="success")
-                                        ]
-                                    ])
-                                    try:
-                                        await application.bot.send_message(
-                                            chat_id=allocated_user,
-                                            text=user_text,
-                                            reply_markup=user_kbd,
-                                            parse_mode="Markdown"
-                                        )
-                                    except Exception as e:
-                                        logging.error(f"User Forward Error: {e}")
+                                        otp_code = extract_otp(msg)
+                                        masked_num = mask_number(num)
+                                        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+
+                                        # Get Bot URL
+                                        bot_info = await application.bot.get_me()
+                                        bot_username = bot_info.username or ""
+                                        bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+
+                                        # 1. Send to OTP Forwarding Group
+                                        if OTP_GROUP_ID:
+                                            group_text = (
+                                                "New OTP Reccieved\n"
+                                                f"{escape_md(service_name)} ➜ {escape_md(masked_num)}\n"
+                                                "Price: 1 TK\n"
+                                                f'Full message: "{escape_md(msg)}"'
+                                            )
+                                            group_kbd = InlineKeyboardMarkup([
+                                                [
+                                                    create_button("Channel", url=ch_link, style="primary"),
+                                                    create_button("Get Number", url=bot_link, style="primary")
+                                                ],
+                                                [
+                                                    create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                                ]
+                                            ])
+                                            try:
+                                                await application.bot.send_message(
+                                                    chat_id=OTP_GROUP_ID,
+                                                    text=group_text,
+                                                    reply_markup=group_kbd,
+                                                    parse_mode="Markdown"
+                                                )
+                                            except Exception as e:
+                                                logging.error(f"Group Forward Error: {e}")
+
+                                        # 2. Send to User Inbox
+                                        if allocated_user:
+                                            user_text = (
+                                                "New OTP Reccieved\n"
+                                                f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
+                                                "Added: 1TK\n"
+                                                f'Full message: "{escape_md(msg)}"'
+                                            )
+                                            user_kbd = InlineKeyboardMarkup([
+                                                [
+                                                    create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                                ]
+                                            ])
+                                            try:
+                                                await application.bot.send_message(
+                                                    chat_id=allocated_user,
+                                                    text=user_text,
+                                                    reply_markup=user_kbd,
+                                                    parse_mode="Markdown"
+                                                )
+                                            except Exception as e:
+                                                logging.error(f"User Forward Error: {e}")
 
             except Exception as e:
                 logging.error(f"Polling Exception: {e}")
