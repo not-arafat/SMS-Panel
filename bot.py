@@ -47,7 +47,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Upload Firebase|Broadcast|Back)$")
+MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -634,7 +634,7 @@ def get_global_settings_keyboard():
         ],
         [
             {"text": "Number Quantity", "style": "primary"},
-            {"text": "Upload Firebase", "style": "primary"}
+            {"text": "Connect Firebase", "style": "primary"}
         ],
         [
             {"text": "Back", "style": "danger"}
@@ -1163,7 +1163,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         alloc_msg = (
             "━━━━━━━━━━━━━━━\n"
-            f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers Allocated:"
+            f"{escape_md(service)} ➜ {escape_md(country)} {len(assigned_numbers)} Numbers Allocated:"
         )
         kbd = build_allocation_keyboard(service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -1386,8 +1386,7 @@ async def otp_poller(application: Application):
                                         if allocated_user:
                                             user_text = (
                                                 "New OTP Reccieved\n"
-                                                f"Service: {escape_md(service_name)}\n"
-                                                "Number: {escape_md(num)}\n"
+                                                f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
                                                 "Added: 1TK\n"
                                                 f'Full message: "{escape_md(msg)}"'
                                             )
@@ -1426,7 +1425,7 @@ def main():
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
-            MessageHandler(filters.Regex("^Upload Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
+            MessageHandler(filters.Regex("^connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("^Broadcast$") & filters.User(user_id=ADMIN_ID), broadcast_start),
         ],
         states={
