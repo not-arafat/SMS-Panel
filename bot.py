@@ -47,7 +47,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -197,7 +197,7 @@ def get_all_users() -> list:
 
 
 def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> dict:
-    btn = {"text": text}
+    btn = {"text": str(text).upper() if text else ""}
     if callback_data:
         btn["callback_data"] = callback_data
     if url:
@@ -592,19 +592,19 @@ def run_flask():
 def get_main_keyboard(user_id: int):
     keyboard_layout = [
         [
-            {"text": "Get Number", "style": "success"}
+            {"text": "GET NUMBER", "style": "success"}
         ],
         [
-            {"text": "Profile", "style": "primary"},
-            {"text": "Wallet", "style": "primary"}
+            {"text": "PROFILE", "style": "primary"},
+            {"text": "WALLET", "style": "primary"}
         ],
         [
-            {"text": "Channel", "style": "danger"},
-            {"text": "Support", "style": "danger"}
+            {"text": "CHANNEL", "style": "danger"},
+            {"text": "SUPPORT", "style": "danger"}
         ]
     ]
     if user_id == ADMIN_ID:
-        keyboard_layout.append([{"text": "Admin Panel", "style": "danger"}])
+        keyboard_layout.append([{"text": "ADMIN PANEL", "style": "danger"}])
         
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
@@ -612,15 +612,15 @@ def get_main_keyboard(user_id: int):
 def get_admin_keyboard():
     keyboard_layout = [
         [
-            {"text": "Services", "style": "primary"},
-            {"text": "Admin Control", "style": "primary"}
+            {"text": "SERVICES", "style": "primary"},
+            {"text": "ADMIN CONTROL", "style": "primary"}
         ],
         [
-            {"text": "Global Settings", "style": "primary"},
-            {"text": "Broadcast", "style": "success"}
+            {"text": "GLOBAL SETTINGS", "style": "primary"},
+            {"text": "BROADCAST", "style": "success"}
         ],
         [
-            {"text": "Back", "style": "danger"}
+            {"text": "BACK", "style": "danger"}
         ]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
@@ -629,15 +629,15 @@ def get_admin_keyboard():
 def get_global_settings_keyboard():
     keyboard_layout = [
         [
-            {"text": "Edit Links", "style": "primary"},
-            {"text": "Edit API", "style": "primary"}
+            {"text": "EDIT LINKS", "style": "primary"},
+            {"text": "EDIT API", "style": "primary"}
         ],
         [
-            {"text": "Number Quantity", "style": "primary"},
-            {"text": "Connect Firebase", "style": "primary"}
+            {"text": "NUMBER QUANTITY", "style": "primary"},
+            {"text": "CONNECT FIREBASE", "style": "primary"}
         ],
         [
-            {"text": "Back", "style": "danger"}
+            {"text": "BACK", "style": "danger"}
         ]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
@@ -661,14 +661,16 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     save_user(user_id)
 
-    if text in ["Get Number", "Get number"]:
+    text_upper = text.strip().upper()
+
+    if text_upper == "GET NUMBER":
         kbd, msg = get_services_keyboard()
         if not kbd:
             await update.message.reply_text(msg)
         else:
             await update.message.reply_text(msg, reply_markup=kbd)
 
-    elif text == "Profile":
+    elif text_upper == "PROFILE":
         first_name = escape_md(update.effective_user.first_name or "User")
         bot_username = context.bot.username or "bot"
         refer_link = f"https://t.me/{bot_username}?start={user_id}"
@@ -684,7 +686,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_text(profile_text, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text == "Wallet":
+    elif text_upper == "WALLET":
         wallet_text = (
             f"👛 **YOUR WALLET**\n\n"
             f"🆔 **User ID:** `{user_id}`\n"
@@ -692,14 +694,14 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(wallet_text, parse_mode="Markdown")
 
-    elif text == "Channel":
+    elif text_upper == "CHANNEL":
         ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
         kbd = InlineKeyboardMarkup([
             [create_button("Join Channel", url=ch_link, style="primary")]
         ])
         await update.message.reply_text("Click below to join our official channel:", reply_markup=kbd)
 
-    elif text == "Support":
+    elif text_upper == "SUPPORT":
         sp_link = clean_tg_link(get_setting("support", "@your_support"))
         ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
         
@@ -711,7 +713,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_text("Click below to contact support or join our channel:", reply_markup=kbd)
 
-    elif text == "Admin Panel" and user_id == ADMIN_ID:
+    elif text_upper == "ADMIN PANEL" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
         total_users = len(get_all_users())
         await update.message.reply_text(
@@ -722,12 +724,12 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif text == "Services" and user_id == ADMIN_ID:
+    elif text_upper == "SERVICES" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = build_admin_services_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text == "Global Settings" and user_id == ADMIN_ID:
+    elif text_upper == "GLOBAL SETTINGS" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         await update.message.reply_text(
             "⚙️ **GLOBAL SETTINGS MENU**\n\nSelect an option from below keyboard:",
@@ -735,25 +737,25 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif text == "Edit Links" and user_id == ADMIN_ID:
+    elif text_upper == "EDIT LINKS" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_edit_links_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text == "Edit API" and user_id == ADMIN_ID:
+    elif text_upper == "EDIT API" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         await update.message.reply_text("⚠️ **Edit API feature is currently unavailable.**", parse_mode="Markdown")
 
-    elif text == "Number Quantity" and user_id == ADMIN_ID:
+    elif text_upper == "NUMBER QUANTITY" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_number_quantity_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text == "Admin Control" and user_id == ADMIN_ID:
+    elif text_upper == "ADMIN CONTROL" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         await update.message.reply_text("🛠 **ADMIN CONTROL**\n\nSystem control settings panel.", parse_mode="Markdown")
 
-    elif text == "Back":
+    elif text_upper == "BACK":
         curr_menu = context.user_data.get('current_menu', 'main')
         if curr_menu == 'global_settings' and user_id == ADMIN_ID:
             context.user_data['current_menu'] = 'admin'
@@ -1356,13 +1358,16 @@ async def otp_poller(application: Application):
                                         bot_username = bot_info.username or ""
                                         bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
 
+                                        # Telegram Inbuilt Blockquote Format
+                                        quoted_msg = "\n".join([f">{line}" for line in escape_md(msg).splitlines()])
+
                                         # 1. Send to OTP Forwarding Group
                                         if OTP_GROUP_ID:
                                             group_text = (
-                                                "New OTP Reccieved\n"
+                                                "New OTP Received\n"
                                                 f"{escape_md(service_name)} ➜ {escape_md(masked_num)}\n"
                                                 "Price: 1 TK\n"
-                                                f'Full message: "{escape_md(msg)}"'
+                                                f"{quoted_msg}"
                                             )
                                             group_kbd = InlineKeyboardMarkup([
                                                 [
@@ -1386,10 +1391,10 @@ async def otp_poller(application: Application):
                                         # 2. Send to User Inbox
                                         if allocated_user:
                                             user_text = (
-                                                "New OTP Reccieved\n"
+                                                "New OTP Received\n"
                                                 f"{escape_md(service_name)} ➜ {escape_md(num)}\n"
                                                 "Added: 1TK\n"
-                                                f'Full message: "{escape_md(msg)}"'
+                                                f"{quoted_msg}"
                                             )
                                             user_kbd = InlineKeyboardMarkup([
                                                 [
@@ -1426,8 +1431,8 @@ def main():
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
-            MessageHandler(filters.Regex("^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
-            MessageHandler(filters.Regex("^Broadcast$") & filters.User(user_id=ADMIN_ID), broadcast_start),
+            MessageHandler(filters.Regex("(?i)^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
+            MessageHandler(filters.Regex("(?i)^Broadcast$") & filters.User(user_id=ADMIN_ID), broadcast_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
