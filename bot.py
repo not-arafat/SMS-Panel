@@ -1163,7 +1163,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         alloc_msg = (
             "━━━━━━━━━━━━━━━\n"
-            f"{escape_md(service)} ➜ {escape_md(country)} {len(assigned_numbers)} Numbers Allocated:"
+            f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers Allocated:"
         )
         kbd = build_allocation_keyboard(service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -1267,17 +1267,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- OTP POLLING SERVICE (CR API) ----------------
 async def otp_poller(application: Application):
-    processed_ids = set()
+    processed_ids = {}
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         seen_ref = db.reference("seen_otp_ids").get()
         if seen_ref and isinstance(seen_ref, dict):
-            processed_ids = set(seen_ref.keys())
+            processed_ids = {k: True for k in seen_ref.keys()}
     else:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT msg_id FROM seen_otps")
-        processed_ids = {row[0] for row in cursor.fetchall()}
+        processed_ids = {row[0]: True for row in cursor.fetchall()}
         conn.close()
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1312,10 +1312,11 @@ async def otp_poller(application: Application):
                                     msg_id = hashlib.md5(unique_str.encode()).hexdigest()
 
                                     if msg_id not in processed_ids:
-                                        processed_ids.add(msg_id)
+                                        processed_ids[msg_id] = True
 
                                         if len(processed_ids) > 2000:
-                                            processed_ids = set(list(processed_ids)[-1000:])
+                                            for old_id in list(processed_ids.keys())[:1000]:
+                                                del processed_ids[old_id]
 
                                         if CURRENT_DB_MODE == "Firebase (Cloud)":
                                             db.reference(f"seen_otp_ids/{msg_id}").set(True)
