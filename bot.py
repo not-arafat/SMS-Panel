@@ -53,6 +53,10 @@ CURRENT_DB_MODE = "SQLite (Local)"
 OTP_ID_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
 CLEANUP_EVERY_N_CYCLES = 720  # ~1 hour at 5s interval
 
+# ---------------- IN-MEMORY GLOBAL CACHE ----------------
+SETTINGS_CACHE = {}
+SERVICES_CACHE = {}  # {service_name: {country_name: available_count}}
+
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 if not API_URL:
@@ -95,15 +99,6 @@ def extract_otp(text: str) -> str:
         return match.group(0)
 
     return "N/A"
-
-
-def mask_number(num: str) -> str:
-    s = str(num).strip()
-    if len(s) > 6:
-        return f"{s[:-6]}***{s[-3:]}"
-    elif len(s) > 3:
-        return f"{s[:2]}***{s[-2:]}"
-    return s
 
 
 def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> dict:
@@ -200,11 +195,112 @@ def init_sqlite():
 init_sqlite()
 
 
+# ---------------- CACHE MANAGEMENT ----------------
+def refresh_all_caches_sync():
+    global SETTINGS_CACHE, SERVICES_CACHE
+    SETTINGS_CACHE.clear()
+    SERVICES_CACHE.clear()
+
+    # 1. Load Settings from SQLite
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        for k, v in cursor.fetchall():
+            SETTINGS_CACHE[str(k)] = str(v)
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error loading settings into cache: {e}")
+
+    # Overlay with Firebase settings if Firebase is active
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_settings = db.reference("settings").get()
+            if fb_settings and isinstance(fb_settings, dict):
+                for k, v in fb_settings.items():
+                    if v is not None:
+                        SETTINGS_CACHE[str(k)] = str(v)
+        except Exception as e:
+            logging.error(f"Error merging Firebase settings to cache: {e}")
+
+    # 2. Load Services Summary into RAM
+    refresh_services_cache_sync()
+
+
+def refresh_services_cache_sync():
+    global SERVICES_CACHE
+    SERVICES_CACHE.clear()
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            srv_ref = db.reference("services").get()
+            if srv_ref and isinstance(srv_ref, dict):
+                for srv in srv_ref.keys():
+                    SERVICES_CACHE[srv] = {}
+                    cnt_ref = db.reference(f"services/{srv}").get()
+                    if cnt_ref and isinstance(cnt_ref, dict):
+                        for cnt in cnt_ref.keys():
+                            num_ref = db.reference(f"numbers/{srv}/{cnt}").get()
+                            avail_count = 0
+                            if num_ref and isinstance(num_ref, dict):
+                                for n_key, n_val in num_ref.items():
+                                    if isinstance(n_val, dict) and n_val.get("status") == "available":
+                                        avail_count += 1
+                            SERVICES_CACHE[srv][cnt] = avail_count
+            return
+        except Exception as e:
+            logging.error(f"Error populating services cache from Firebase: {e}")
+
+    # Fallback / Local SQLite Cache Loading
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT service_name, country_name FROM services")
+        pairs = cursor.fetchall()
+        for srv, cnt in pairs:
+            if srv not in SERVICES_CACHE:
+                SERVICES_CACHE[srv] = {}
+            cursor.execute("SELECT COUNT(*) FROM numbers WHERE service = ? AND country = ? AND status = 'available'", (srv, cnt))
+            cnt_val = cursor.fetchone()[0]
+            SERVICES_CACHE[srv][cnt] = cnt_val
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error populating services cache from SQLite: {e}")
+
+
+# ---------------- SETTINGS & CONFIG READ/WRITE (CACHE-FIRST) ----------------
+def get_setting(key: str, default_val: str = "") -> str:
+    if key in SETTINGS_CACHE:
+        return SETTINGS_CACHE[key]
+    return default_val
+
+
+def set_setting(key: str, value: str):
+    str_val = str(value)
+    SETTINGS_CACHE[key] = str_val  # Direct RAM update
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"settings/{key}").set(str_val)
+        except Exception as e:
+            logging.error(f"Error writing setting to Firebase: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str_val))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error writing setting to SQLite: {e}")
+
+
 # ---------------- ASYNC <-> BLOCKING BRIDGE ----------------
 async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+# ---------------- SENSITIVE REAL-TIME DATA (BALANCE / ALLOCATION) ----------------
 def save_user(user_id: int):
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
@@ -225,6 +321,7 @@ def save_user(user_id: int):
 
 
 def get_user_balance_sync(user_id: int) -> float:
+    # Sensitive data: Always fetch realtime from DB
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             bal = db.reference(f"users/{user_id}/balance").get()
@@ -247,6 +344,7 @@ def get_user_balance_sync(user_id: int) -> float:
 
 
 def add_user_balance_sync(user_id: int, amount: float = 1.0) -> float:
+    # Sensitive data: Realtime update
     curr_bal = get_user_balance_sync(user_id)
     new_bal = curr_bal + amount
 
@@ -293,46 +391,6 @@ def get_all_users() -> list:
     return list(set(users))
 
 
-def get_setting(key: str, default_val: str = "") -> str:
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            val = db.reference(f"settings/{key}").get()
-            if val is not None:
-                return str(val)
-        except Exception as e:
-            logging.error(f"Error reading setting from Firebase: {e}")
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0]:
-            return row[0]
-    except Exception as e:
-        logging.error(f"Error reading setting from SQLite: {e}")
-
-    return default_val
-
-
-def set_setting(key: str, value: str):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"settings/{key}").set(value)
-        except Exception as e:
-            logging.error(f"Error writing setting to Firebase: {e}")
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Error writing setting to SQLite: {e}")
-
-
 def sync_firebase_to_sqlite():
     if not HAS_FIREBASE_LIB or not firebase_admin._apps:
         return
@@ -365,40 +423,14 @@ def sync_firebase_to_sqlite():
                     cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (bal, int(uid)))
             conn.commit()
             conn.close()
+
+        refresh_all_caches_sync()
     except Exception as e:
         logging.error(f"Error syncing Firebase data to SQLite: {e}")
 
 
 def get_admin_services_summary():
-    summary = {}
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        srv_ref = db.reference("services").get()
-        if srv_ref and isinstance(srv_ref, dict):
-            for srv in srv_ref.keys():
-                summary[srv] = {}
-                cnt_ref = db.reference(f"services/{srv}").get()
-                if cnt_ref and isinstance(cnt_ref, dict):
-                    for cnt in cnt_ref.keys():
-                        num_ref = db.reference(f"numbers/{srv}/{cnt}").get()
-                        avail_count = 0
-                        if num_ref and isinstance(num_ref, dict):
-                            for n_key, n_val in num_ref.items():
-                                if isinstance(n_val, dict) and n_val.get("status") == "available":
-                                    avail_count += 1
-                        summary[srv][cnt] = avail_count
-    else:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT service_name, country_name FROM services")
-        pairs = cursor.fetchall()
-        for srv, cnt in pairs:
-            if srv not in summary:
-                summary[srv] = {}
-            cursor.execute("SELECT COUNT(*) FROM numbers WHERE service = ? AND country = ? AND status = 'available'", (srv, cnt))
-            cnt_val = cursor.fetchone()[0]
-            summary[srv][cnt] = cnt_val
-        conn.close()
-    return summary
+    return SERVICES_CACHE
 
 
 def delete_service_db(service: str):
@@ -415,6 +447,7 @@ def delete_service_db(service: str):
     cursor.execute("DELETE FROM numbers WHERE service = ?", (service,))
     conn.commit()
     conn.close()
+    refresh_services_cache_sync()
 
 
 def delete_country_db(service: str, country: str):
@@ -431,21 +464,13 @@ def delete_country_db(service: str, country: str):
     cursor.execute("DELETE FROM numbers WHERE service = ? AND country = ?", (service, country))
     conn.commit()
     conn.close()
+    refresh_services_cache_sync()
 
 
 def get_countries_for_service(service: str) -> list:
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        countries_ref = db.reference(f"services/{service}").get()
-        if countries_ref and isinstance(countries_ref, dict):
-            return list(countries_ref.keys())
-        return []
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT country_name FROM services WHERE service_name = ?", (service,))
-    countries = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return countries
+    if service in SERVICES_CACHE:
+        return list(SERVICES_CACHE[service].keys())
+    return []
 
 
 def save_numbers_sync(service: str, country: str, numbers: list) -> int:
@@ -461,7 +486,6 @@ def save_numbers_sync(service: str, country: str, numbers: list) -> int:
         if batch:
             ref.update(batch)
             db.reference(f"services/{service}/{country}").set(True)
-        return valid_count
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -470,9 +494,12 @@ def save_numbers_sync(service: str, country: str, numbers: list) -> int:
         clean_num = re.sub(r'\D', '', num)
         if clean_num:
             cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
-            valid_count += 1
+            if CURRENT_DB_MODE != "Firebase (Cloud)":
+                valid_count += 1
     conn.commit()
     conn.close()
+
+    refresh_services_cache_sync()
     return valid_count
 
 
@@ -516,6 +543,8 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
 
         for num in assigned:
             db.reference(f"allocations/{num}").set({"user_id": user_id, "service": service, "country": country})
+
+        refresh_services_cache_sync()
         return assigned
 
     conn = get_db_connection()
@@ -544,6 +573,7 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
             cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
             cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (num_str, user_id, service, country))
         conn.commit()
+        refresh_services_cache_sync()
         return assigned
     finally:
         conn.close()
@@ -556,7 +586,6 @@ def release_numbers_sync(service: str, country: str, numbers: list):
         for num in numbers:
             db.reference(f"numbers/{service}/{country}/{num}").update({"status": "available", "user_id": 0})
             db.reference(f"allocations/{num}").delete()
-        return
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -565,6 +594,7 @@ def release_numbers_sync(service: str, country: str, numbers: list):
         cursor.execute("DELETE FROM allocations WHERE number = ?", (num,))
     conn.commit()
     conn.close()
+    refresh_services_cache_sync()
 
 
 def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
@@ -703,17 +733,7 @@ def build_allocation_keyboard(service: str, country: str, numbers: list):
 
 
 def get_services_keyboard():
-    services = []
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        services_ref = db.reference("services").get()
-        if services_ref and isinstance(services_ref, dict):
-            services = list(services_ref.keys())
-    else:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT service_name FROM services")
-        services = [row[0] for row in cursor.fetchall()]
-        conn.close()
+    services = list(SERVICES_CACHE.keys())
 
     if not services:
         return None, "No services currently available."
@@ -734,6 +754,7 @@ def init_firebase_system(run_migration=False, force_reinit=False):
     global CURRENT_DB_MODE
     if not HAS_FIREBASE_LIB:
         CURRENT_DB_MODE = "SQLite (Local)"
+        refresh_all_caches_sync()
         return False
 
     if force_reinit and firebase_admin._apps:
@@ -783,6 +804,7 @@ def init_firebase_system(run_migration=False, force_reinit=False):
         logging.error(f"Firebase Init Error: {e}")
 
     CURRENT_DB_MODE = "SQLite (Local)"
+    refresh_all_caches_sync()
     return False
 
 
@@ -823,6 +845,7 @@ def migrate_sqlite_to_firebase():
 
     conn.commit()
     conn.close()
+    refresh_all_caches_sync()
 
 
 init_firebase_system(run_migration=False)
@@ -941,7 +964,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_upper = text.strip().upper()
 
     if text_upper == "GET NUMBER":
-        kbd, msg = await run_db(get_services_keyboard)
+        kbd, msg = get_services_keyboard()
         if not kbd:
             await update.message.reply_text(msg)
         else:
@@ -976,15 +999,15 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(wallet_text, parse_mode="Markdown")
 
     elif text_upper == "CHANNEL":
-        ch_link = clean_tg_link(await run_db(get_setting, "channel", "https://t.me/your_channel"))
+        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
         kbd = InlineKeyboardMarkup([
             [create_button("Join Channel", url=ch_link, style="primary")]
         ])
         await update.message.reply_text("Click below to join our official channel:", reply_markup=kbd)
 
     elif text_upper == "SUPPORT":
-        sp_link = clean_tg_link(await run_db(get_setting, "support", "@your_support"))
-        ch_link = clean_tg_link(await run_db(get_setting, "channel", "https://t.me/your_channel"))
+        sp_link = clean_tg_link(get_setting("support", "@your_support"))
+        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
 
         kbd = InlineKeyboardMarkup([
             [
@@ -1007,7 +1030,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "SERVICES" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = await run_db(build_admin_services_view)
+        text_msg, kbd = build_admin_services_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "GLOBAL SETTINGS" and user_id == ADMIN_ID:
@@ -1020,7 +1043,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "EDIT LINKS" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = await run_db(build_edit_links_view)
+        text_msg, kbd = build_edit_links_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "EDIT API" and user_id == ADMIN_ID:
@@ -1029,12 +1052,12 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "NUMBER QUANTITY" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = await run_db(build_number_quantity_view)
+        text_msg, kbd = build_number_quantity_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "EXTRA" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = await run_db(build_extra_settings_view)
+        text_msg, kbd = build_extra_settings_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "ADMIN CONTROL" and user_id == ADMIN_ID:
@@ -1146,9 +1169,9 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
 
-    await run_db(set_setting, "channel", new_link)
+    set_setting("channel", new_link)
     await update.message.reply_text(f"✅ Channel link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = await run_db(build_edit_links_view)
+    text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -1165,9 +1188,9 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid username/link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_SUPPORT
 
-    await run_db(set_setting, "support", new_link)
+    set_setting("support", new_link)
     await update.message.reply_text(f"✅ Support username/link updated successfully!\nCurrent support: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = await run_db(build_edit_links_view)
+    text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -1184,9 +1207,9 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid link! Please enter a valid group link.\nType /cancel to abort.")
         return WAIT_OTP_LINK
 
-    await run_db(set_setting, "otp_group_link", new_link)
+    set_setting("otp_group_link", new_link)
     await update.message.reply_text(f"✅ OTP Group link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = await run_db(build_edit_links_view)
+    text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -1256,7 +1279,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "back_to_services":
         await query.answer()
-        kbd, msg = await run_db(get_services_keyboard)
+        kbd, msg = get_services_keyboard()
         if not kbd:
             await query.edit_message_text(msg)
         else:
@@ -1267,28 +1290,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             return
         qty_val = data.split(":", 2)[2]
-        await run_db(set_setting, "number_quantity", qty_val)
+        set_setting("number_quantity", qty_val)
         await query.answer(f"Number quantity set to {qty_val}!", show_alert=True)
-        text_msg, kbd = await run_db(build_number_quantity_view)
+        text_msg, kbd = build_number_quantity_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:toggle:show_msg":
         await query.answer()
         if user_id != ADMIN_ID:
             return
-        curr_val = await run_db(get_setting, "show_message", "true")
+        curr_val = get_setting("show_message", "true")
         new_val = "false" if curr_val == "true" else "true"
-        await run_db(set_setting, "show_message", new_val)
+        set_setting("show_message", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Show Message option is now {status_text}!", show_alert=True)
-        text_msg, kbd = await run_db(build_extra_settings_view)
+        text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:srv:list":
         await query.answer()
         if user_id != ADMIN_ID:
             return
-        text, kbd = await run_db(build_admin_services_view)
+        text, kbd = build_admin_services_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:view:"):
@@ -1296,7 +1319,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             return
         service = data.split(":", 3)[3]
-        text, kbd = await run_db(build_service_manage_view, service)
+        text, kbd = build_service_manage_view(service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:del:"):
@@ -1306,7 +1329,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service = data.split(":", 3)[3]
         await run_db(delete_service_db, service)
         await query.answer(f"Service {service} deleted successfully!", show_alert=True)
-        text, kbd = await run_db(build_admin_services_view)
+        text, kbd = build_admin_services_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:delli:"):
@@ -1314,7 +1337,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             return
         service = data.split(":", 3)[3]
-        summary = await run_db(get_admin_services_summary)
+        summary = get_admin_services_summary()
         cnts = summary.get(service, {})
         buttons = []
         for cnt in cnts.keys():
@@ -1331,7 +1354,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             service, country = parts[3], parts[4]
             await run_db(delete_country_db, service, country)
             await query.answer(f"Deleted {country} from {service}!", show_alert=True)
-            text, kbd = await run_db(build_service_manage_view, service)
+            text, kbd = build_service_manage_view(service)
             await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
         else:
             await query.answer()
@@ -1340,7 +1363,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("srv_"):
         await query.answer()
         service = data.split("_", 1)[1]
-        countries = await run_db(get_countries_for_service, service)
+        countries = get_countries_for_service(service)
 
         if not countries:
             await query.edit_message_text("No countries available for this service.")
@@ -1364,7 +1387,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         service, country = parts[1], parts[2]
-        target_qty = int(await run_db(get_setting, "number_quantity", "2"))
+        target_qty = int(get_setting("number_quantity", "2"))
 
         assigned_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty)
 
@@ -1376,7 +1399,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━\n"
             f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers Allocated:"
         )
-        kbd = await run_db(build_allocation_keyboard, service, country, assigned_numbers)
+        kbd = build_allocation_keyboard(service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("chg:"):
@@ -1386,7 +1409,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         service, country = parts[1], parts[2]
-        target_qty = int(await run_db(get_setting, "number_quantity", "2"))
+        target_qty = int(get_setting("number_quantity", "2"))
 
         old_numbers = await run_db(get_user_allocations_sync, user_id, service, country)
         new_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty, old_numbers)
@@ -1399,7 +1422,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "━━━━━━━━━━━━━━━\n"
                 f"{escape_md(service)} ➜ {escape_md(country)} {len(new_numbers)} Numbers Allocated:"
             )
-            kbd = await run_db(build_allocation_keyboard, service, country, new_numbers)
+            kbd = build_allocation_keyboard(service, country, new_numbers)
             await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
         else:
             await query.answer(f"Sorry, not enough ({target_qty}) new numbers available to change!", show_alert=True)
@@ -1488,10 +1511,10 @@ async def otp_poller(application: Application):
                         if res_data.get("status") == "success":
                             items = res_data.get("data", [])
                             if isinstance(items, list) and items:
-                                ch_link = clean_tg_link(await run_db(get_setting, "channel", "https://t.me/your_channel"))
-                                show_msg_enabled = (await run_db(get_setting, "show_message", "true")) == "true"
-                                dev_username = await run_db(get_setting, "dev_username", "developer")
-                                dev_link = clean_tg_link(await run_db(get_setting, "dev_link", "https://t.me/developer"))
+                                ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+                                show_msg_enabled = get_setting("show_message", "true") == "true"
+                                dev_username = get_setting("dev_username", "developer")
+                                dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
                                 dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
 
                                 for item in items:
@@ -1571,7 +1594,7 @@ async def otp_poller(application: Application):
                                         except Exception as e:
                                             logging.error(f"Group Forward Error: {e}")
 
-                                    # 2. Send to User Inbox & Update Balance
+                                    # 2. Send to User Inbox & Update Balance (Realtime Sync)
                                     if allocated_user:
                                         new_bal = await run_db(add_user_balance_sync, allocated_user, 1.0)
                                         bal_str = f"{int(new_bal)}" if new_bal.is_integer() else f"{new_bal:.2f}"
