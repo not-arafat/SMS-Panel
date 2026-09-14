@@ -22,7 +22,7 @@ except ImportError:
     HAS_FIREBASE_LIB = False
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -208,14 +208,16 @@ async def run_db(func, *args, **kwargs):
 def save_user(user_id: int):
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
-            db.reference(f"users/{user_id}/exists").set(True)
+            user_ref = db.reference(f"users/{user_id}")
+            if not user_ref.get():
+                user_ref.set({"exists": True, "balance": 0.0})
         except Exception as e:
             logging.error(f"Error saving user to Firebase: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0.0)", (user_id,))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -251,6 +253,7 @@ def add_user_balance_sync(user_id: int, amount: float = 1.0) -> float:
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             db.reference(f"users/{user_id}/balance").set(new_bal)
+            db.reference(f"users/{user_id}/exists").set(True)
         except Exception as e:
             logging.error(f"Firebase update balance error: {e}")
 
@@ -273,7 +276,7 @@ def get_all_users() -> list:
         try:
             fb_users = db.reference("users").get()
             if fb_users and isinstance(fb_users, dict):
-                users = [int(uid) for uid in fb_users.keys() if uid.isdigit()]
+                users = [int(uid) for uid in fb_users.keys() if str(uid).isdigit()]
         except Exception as e:
             logging.error(f"Error fetching users from Firebase: {e}")
 
@@ -334,23 +337,32 @@ def sync_firebase_to_sqlite():
     if not HAS_FIREBASE_LIB or not firebase_admin._apps:
         return
     try:
+        # Sync Settings
         fb_settings = db.reference("settings").get()
         if fb_settings and isinstance(fb_settings, dict):
             conn = get_db_connection()
             cursor = conn.cursor()
             for k, v in fb_settings.items():
-                if v:
+                if v is not None:
                     cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (str(k), str(v)))
             conn.commit()
             conn.close()
 
+        # Sync Users & Balances
         fb_users = db.reference("users").get()
         if fb_users and isinstance(fb_users, dict):
             conn = get_db_connection()
             cursor = conn.cursor()
-            for uid in fb_users.keys():
-                if uid.isdigit():
-                    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (int(uid),))
+            for uid, udata in fb_users.items():
+                if str(uid).isdigit():
+                    bal = 0.0
+                    if isinstance(udata, dict):
+                        bal = float(udata.get("balance", 0.0))
+                    elif isinstance(udata, (int, float)):
+                        bal = float(udata)
+
+                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (int(uid), bal))
+                    cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (bal, int(uid)))
             conn.commit()
             conn.close()
     except Exception as e:
@@ -876,12 +888,12 @@ def get_main_keyboard(user_id: int):
 def get_admin_keyboard():
     keyboard_layout = [
         [
-            {"text": "SERVICES", "style": "success"},
-            {"text": "BROADCAST", "style": "success"}
+            {"text": "SERVICES", "style": "primary"},
+            {"text": "ADMIN CONTROL", "style": "primary"}
         ],
         [
-            {"text": "ADMIN CONTROL", "style": "primary"},
-            {"text": "GLOBAL SETTINGS", "style": "primary"}
+            {"text": "GLOBAL SETTINGS", "style": "primary"},
+            {"text": "BROADCAST", "style": "success"}
         ],
         [
             {"text": "BACK", "style": "danger"}
@@ -893,8 +905,8 @@ def get_admin_keyboard():
 def get_global_settings_keyboard():
     keyboard_layout = [
         [
-            {"text": "EDIT LINKS", "style": "success"},
-            {"text": "EDIT API", "style": "success"}
+            {"text": "EDIT LINKS", "style": "primary"},
+            {"text": "EDIT API", "style": "primary"}
         ],
         [
             {"text": "NUMBER QUANTITY", "style": "primary"},
@@ -1518,7 +1530,7 @@ async def otp_poller(application: Application):
                                     safe_service = html.escape(service_name)
                                     safe_num = html.escape(num)
 
-                                    # 1. Send to OTP Forwarding Group
+                                    # 1. Send to OTP Forwarding Group (Web Page Preview Disabled)
                                     if OTP_GROUP_ID:
                                         if show_msg_enabled:
                                             group_text = (
@@ -1553,12 +1565,13 @@ async def otp_poller(application: Application):
                                                 chat_id=OTP_GROUP_ID,
                                                 text=group_text,
                                                 reply_markup=group_kbd,
-                                                parse_mode="HTML"
+                                                parse_mode="HTML",
+                                                link_preview_options=LinkPreviewOptions(is_disabled=True)
                                             )
                                         except Exception as e:
                                             logging.error(f"Group Forward Error: {e}")
 
-                                    # 2. Send to User Inbox
+                                    # 2. Send to User Inbox & Update Balance
                                     if allocated_user:
                                         new_bal = await run_db(add_user_balance_sync, allocated_user, 1.0)
                                         bal_str = f"{int(new_bal)}" if new_bal.is_integer() else f"{new_bal:.2f}"
