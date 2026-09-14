@@ -194,6 +194,7 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', 'true')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_link', 'https://t.me/developer')")
     conn.commit()
@@ -241,6 +242,14 @@ def refresh_services_cache_sync():
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             srv_ref = db.reference("services").get()
+            globally_allocated = set()
+            try:
+                alloc_data = db.reference("allocations").get() or {}
+                if isinstance(alloc_data, dict):
+                    globally_allocated = {str(k) for k in alloc_data.keys()}
+            except Exception as e:
+                logging.error(f"Error loading global allocation locks for cache: {e}")
+
             if srv_ref and isinstance(srv_ref, dict):
                 for srv in srv_ref.keys():
                     SERVICES_CACHE[srv] = {}
@@ -251,7 +260,10 @@ def refresh_services_cache_sync():
                             avail_count = 0
                             if num_ref and isinstance(num_ref, dict):
                                 for n_key, n_val in num_ref.items():
-                                    if isinstance(n_val, dict) and n_val.get("status") == "available":
+                                    if not isinstance(n_val, dict):
+                                        continue
+                                    num_val = str(n_val.get("number", n_key))
+                                    if n_val.get("status") == "available" and num_val not in globally_allocated:
                                         avail_count += 1
                             SERVICES_CACHE[srv][cnt] = avail_count
             return
@@ -267,7 +279,11 @@ def refresh_services_cache_sync():
         for srv, cnt in pairs:
             if srv not in SERVICES_CACHE:
                 SERVICES_CACHE[srv] = {}
-            cursor.execute("SELECT COUNT(*) FROM numbers WHERE service = ? AND country = ? AND status = 'available'", (srv, cnt))
+            cursor.execute("""
+                SELECT COUNT(*) FROM numbers n
+                WHERE n.service = ? AND n.country = ? AND n.status = 'available'
+                  AND NOT EXISTS (SELECT 1 FROM allocations a WHERE a.number = n.number)
+            """, (srv, cnt))
             cnt_val = cursor.fetchone()[0]
             SERVICES_CACHE[srv][cnt] = cnt_val
         conn.close()
@@ -477,127 +493,250 @@ def get_countries_for_service(service: str) -> list:
 
 
 def save_numbers_sync(service: str, country: str, numbers: list) -> int:
-    valid_count = 0
+    """Add numbers without creating duplicate inventory entries.
+
+    A number is globally considered used once it has ever been allocated.
+    Uploading it again only refreshes/creates an available inventory entry if
+    it has never been allocated before.
+    """
+    cleaned_numbers = []
+    seen = set()
+    for num in numbers:
+        clean_num = re.sub(r'\D', '', str(num))
+        if clean_num and clean_num not in seen:
+            seen.add(clean_num)
+            cleaned_numbers.append(clean_num)
+
+    if not cleaned_numbers:
+        return 0
+
+    # Build a global set of numbers that have already been allocated.
+    globally_used = set()
     if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            used = db.reference("allocations").get() or {}
+            if isinstance(used, dict):
+                globally_used.update(str(k) for k in used.keys())
+        except Exception as e:
+            logging.error(f"Error reading Firebase allocations before upload: {e}")
+
         ref = db.reference(f"numbers/{service}/{country}")
+        existing = ref.get() or {}
         batch = {}
-        for num in numbers:
-            clean_num = re.sub(r'\D', '', num)
-            if clean_num:
-                batch[clean_num] = {"number": clean_num, "status": "available", "user_id": 0}
-                valid_count += 1
+        for num in cleaned_numbers:
+            if num in globally_used:
+                # Never make an already-allocated number available again.
+                continue
+            if isinstance(existing, dict) and num in existing:
+                # Keep existing state; importantly, do not reset an allocated number.
+                continue
+            batch[num] = {"number": num, "status": "available", "user_id": 0}
+
         if batch:
             ref.update(batch)
-            db.reference(f"services/{service}/{country}").set(True)
+        db.reference(f"services/{service}/{country}").set(True)
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
-    for num in numbers:
-        clean_num = re.sub(r'\D', '', num)
-        if clean_num:
-            cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
-            if CURRENT_DB_MODE != "Firebase (Cloud)":
-                valid_count += 1
-    conn.commit()
-    conn.close()
+        # Return the number of newly inserted inventory records.
+        inserted = len(batch)
+    else:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
+
+        # Existing allocations are permanent and globally block re-use.
+        cursor.execute("SELECT number FROM allocations")
+        globally_used = {str(row[0]) for row in cursor.fetchall()}
+
+        inserted = 0
+        for num in cleaned_numbers:
+            if num in globally_used:
+                continue
+            cursor.execute(
+                "SELECT id, status FROM numbers WHERE service = ? AND country = ? AND number = ? LIMIT 1",
+                (service, country, num)
+            )
+            row = cursor.fetchone()
+            if row:
+                # Never reset an existing allocated row to available.
+                continue
+            cursor.execute(
+                "INSERT INTO numbers (service, country, number, status, user_id) VALUES (?, ?, ?, 'available', 0)",
+                (service, country, num)
+            )
+            inserted += 1
+
+        conn.commit()
+        conn.close()
 
     refresh_services_cache_sync()
-    return valid_count
+    return inserted
 
 
 def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: int, exclude: list = None) -> list:
-    exclude = exclude or []
+    """Atomically reserve NEW numbers for a user.
+
+    Critical rule: once a number has been allocated, it is NEVER released back
+    to the available pool and can NEVER be allocated to anyone again, including
+    the same user.
+    """
+    exclude = {str(x) for x in (exclude or [])}
+    target_qty = max(1, int(target_qty))
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
+        # First read only the requested category.  Global allocation locks are
+        # then created transactionally, so the same number cannot be won by two
+        # concurrent requests.
         ref = db.reference(f"numbers/{service}/{country}")
-        result_holder = {"nums": []}
-
-        def txn(current_data):
-            result_holder["nums"] = []
-            if not current_data or not isinstance(current_data, dict):
-                return current_data
-            picked = 0
-            for key, val in current_data.items():
-                if picked >= target_qty:
-                    break
-                if not isinstance(val, dict):
-                    continue
-                num_val = str(val.get("number", key))
-                if val.get("status") == "available" and num_val not in exclude:
-                    val["status"] = "allocated"
-                    val["user_id"] = user_id
-                    result_holder["nums"].append(num_val)
-                    picked += 1
-            return current_data
-
-        try:
-            ref.transaction(txn)
-        except Exception as e:
-            logging.error(f"Firebase allocation transaction failed: {e}")
+        current_data = ref.get() or {}
+        if not isinstance(current_data, dict):
             return []
 
-        assigned = result_holder["nums"]
+        candidates = []
+        for key, val in current_data.items():
+            if not isinstance(val, dict):
+                continue
+            num = str(val.get("number", key)).strip()
+            if not num or num in exclude or val.get("status") != "available":
+                continue
+            candidates.append(num)
+            if len(candidates) >= target_qty * 3:
+                break
 
-        if len(assigned) < target_qty:
-            for num in assigned:
-                db.reference(f"numbers/{service}/{country}/{num}").update({"status": "available", "user_id": 0})
+        if len(candidates) < target_qty:
             return []
 
-        for num in assigned:
-            db.reference(f"allocations/{num}").set({"user_id": user_id, "service": service, "country": country})
+        assigned = []
+        # allocations/{number} is the permanent global ownership record.
+        for num in candidates:
+            if len(assigned) >= target_qty:
+                break
+            lock_ref = db.reference(f"allocations/{num}")
+            result_holder = {"won": False}
+
+            def lock_txn(current):
+                if current is not None:
+                    return current
+                result_holder["won"] = True
+                return {"user_id": user_id, "service": service, "country": country, "allocated_at": int(time.time())}
+
+            try:
+                lock_ref.transaction(lock_txn)
+            except Exception as e:
+                logging.error(f"Firebase global allocation lock failed for {num}: {e}")
+                continue
+
+            if not result_holder["won"]:
+                # This number was already permanently allocated elsewhere (or by
+                # an earlier request). Keep the inventory mirror from advertising
+                # it as available in this category.
+                try:
+                    existing_lock = lock_ref.get()
+                    if isinstance(existing_lock, dict):
+                        db.reference(f"numbers/{service}/{country}/{num}").update({
+                            "status": "allocated",
+                            "user_id": int(existing_lock.get("user_id", 0) or 0)
+                        })
+                except Exception as e:
+                    logging.error(f"Firebase duplicate-allocation cleanup failed for {num}: {e}")
+                continue
+
+            # Permanently mark the inventory record allocated.  It is NEVER reset
+            # by Change All or any other user flow.
+            try:
+                db.reference(f"numbers/{service}/{country}/{num}").update({
+                    "status": "allocated",
+                    "user_id": user_id,
+                    "allocated_at": int(time.time())
+                })
+                assigned.append(num)
+            except Exception as e:
+                logging.error(f"Firebase number status update failed for {num}: {e}")
+                # If the inventory write failed, remove the lock so the number
+                # does not become permanently unusable without an allocation.
+                try:
+                    lock_ref.delete()
+                except Exception:
+                    pass
 
         refresh_services_cache_sync()
+        # Never roll back successful allocations. If fewer than requested were
+        # available because another request won some candidates concurrently,
+        # return the numbers that were successfully and permanently allocated.
         return assigned
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("BEGIN IMMEDIATE")
+    assigned = []
     try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # Exclude every number that has ever been allocated globally.
         if exclude:
             placeholders = ','.join(['?'] * len(exclude))
-            sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
-            params = [service, country] + exclude + [target_qty]
+            sql = f"""
+                SELECT id, number FROM numbers
+                WHERE service = ? AND country = ? AND status = 'available'
+                  AND number NOT IN ({placeholders})
+                  AND number NOT IN (SELECT number FROM allocations)
+                ORDER BY id ASC LIMIT ?
+            """
+            params = [service, country] + list(exclude) + [target_qty]
         else:
-            sql = "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?"
+            sql = """
+                SELECT id, number FROM numbers
+                WHERE service = ? AND country = ? AND status = 'available'
+                  AND number NOT IN (SELECT number FROM allocations)
+                ORDER BY id ASC LIMIT ?
+            """
             params = [service, country, target_qty]
 
         cursor.execute(sql, params)
         rows = cursor.fetchall()
-
-        if not rows or len(rows) < target_qty:
+        if len(rows) < target_qty:
             conn.rollback()
             return []
 
-        assigned = []
+        now = int(time.time())
         for num_id, num in rows:
             num_str = str(num)
             assigned.append(num_str)
-            cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-            cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (num_str, user_id, service, country))
+            cursor.execute(
+                "UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ? AND status = 'available'",
+                (user_id, num_id)
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Number {num_str} could not be locked")
+            cursor.execute(
+                "INSERT OR IGNORE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)",
+                (num_str, user_id, service, country)
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Number {num_str} was already allocated")
+
+        # Preserve the user's permanent allocations; no release happens later.
         conn.commit()
         refresh_services_cache_sync()
         return assigned
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"SQLite allocation failed: {e}")
+        return []
     finally:
         conn.close()
 
 
 def release_numbers_sync(service: str, country: str, numbers: list):
-    if not numbers:
-        return
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        for num in numbers:
-            db.reference(f"numbers/{service}/{country}/{num}").update({"status": "available", "user_id": 0})
-            db.reference(f"allocations/{num}").delete()
+    """Legacy compatibility function. Allocations are intentionally permanent.
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    for num in numbers:
-        cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (num,))
-        cursor.execute("DELETE FROM allocations WHERE number = ?", (num,))
-    conn.commit()
-    conn.close()
-    refresh_services_cache_sync()
+    Older versions released numbers when the user pressed Change All. That made
+    already-used numbers available again. This function now deliberately does
+    nothing so an allocated number can never re-enter the pool.
+    """
+    logging.info(
+        "release_numbers_sync ignored: allocations are permanent. service=%s country=%s count=%s",
+        service, country, len(numbers or [])
+    )
+    return
 
 
 def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
@@ -708,15 +847,19 @@ def build_number_quantity_view():
 
 def build_extra_settings_view():
     show_msg = get_setting("show_message", "true") == "true"
-    status_str = "ENABLED 🟢" if show_msg else "DISABLED 🔴"
+    show_country_count = get_setting("show_country_count", "false") == "true"
+    msg_status = "ENABLED 🟢" if show_msg else "DISABLED 🔴"
+    count_status = "ENABLED 🟢" if show_country_count else "DISABLED 🔴"
 
     text = (
         "⚙️ **EXTRA SETTINGS**\n\n"
-        f"📩 **Show OTP Message Status:** `{status_str}`\n\n"
-        "Click the button below to toggle message text visibility in Group and Inbox:"
+        f"📩 **Show OTP Message:** `{msg_status}`\n"
+        f"🔢 **Show Country Number Count:** `{count_status}`\n\n"
+        "Use the buttons below to enable/disable each option."
     )
     buttons = [
-        [create_button(f"Show Message: {status_str}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger")]
+        [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger")],
+        [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -1310,6 +1453,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
+    elif data == "adm:toggle:country_count":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        curr_val = get_setting("show_country_count", "false")
+        new_val = "false" if curr_val == "true" else "true"
+        set_setting("show_country_count", new_val)
+        status_text = "enabled" if new_val == "true" else "disabled"
+        await query.answer(f"Country number count is now {status_text}!", show_alert=True)
+        text_msg, kbd = build_extra_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
     elif data == "adm:srv:list":
         await query.answer()
         if user_id != ADMIN_ID:
@@ -1373,10 +1528,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         buttons = []
+        show_country_count = get_setting("show_country_count", "false") == "true"
         for i in range(0, len(countries), 2):
-            row = [create_button(countries[i], callback_data=f"cnt_{service}_{countries[i]}", style="primary")]
+            country_a = countries[i]
+            label_a = f"{country_a} ({SERVICES_CACHE.get(service, {}).get(country_a, 0)})" if show_country_count else country_a
+            row = [create_button(label_a, callback_data=f"cnt_{service}_{country_a}", style="primary")]
             if i + 1 < len(countries):
-                row.append(create_button(countries[i+1], callback_data=f"cnt_{service}_{countries[i+1]}", style="primary"))
+                country_b = countries[i + 1]
+                label_b = f"{country_b} ({SERVICES_CACHE.get(service, {}).get(country_b, 0)})" if show_country_count else country_b
+                row.append(create_button(label_b, callback_data=f"cnt_{service}_{country_b}", style="primary"))
             buttons.append(row)
 
         buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
@@ -1418,8 +1578,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty, old_numbers)
 
         if new_numbers:
-            if old_numbers:
-                await run_db(release_numbers_sync, service, country, old_numbers)
+            # IMPORTANT: old allocations are permanent and must never return to inventory.
+            # Do not release them here.
             await query.answer("Successfully changed all numbers!", show_alert=False)
             alloc_msg = (
                 "━━━━━━━━━━━━━━━\n"
