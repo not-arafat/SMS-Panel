@@ -19,7 +19,7 @@ except ImportError:
     HAS_FIREBASE_LIB = False
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -48,7 +48,7 @@ CURRENT_DB_MODE = "SQLite (Local)"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Back)$")
 
 
 def escape_md(text: str) -> str:
@@ -108,9 +108,15 @@ def init_sqlite():
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY
+            user_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0
         )
     ''')
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS services (
             service_name TEXT,
@@ -151,6 +157,8 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', '1')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
     conn.commit()
     conn.close()
 
@@ -160,18 +168,64 @@ init_sqlite()
 def save_user(user_id: int):
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
-            db.reference(f"users/{user_id}").set(True)
+            user_ref = db.reference(f"users/{user_id}").get()
+            if not user_ref:
+                db.reference(f"users/{user_id}").set({"exists": True, "balance": 0.0})
         except Exception as e:
             logging.error(f"Error saving user to Firebase: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
         conn.commit()
         conn.close()
     except Exception as e:
         logging.error(f"Error saving user to SQLite: {e}")
+
+
+def get_user_balance(user_id: int) -> float:
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            val = db.reference(f"users/{user_id}/balance").get()
+            if val is not None:
+                return float(val)
+        except Exception as e:
+            logging.error(f"Error reading balance from Firebase: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return float(row[0])
+    except Exception as e:
+        logging.error(f"Error reading balance from SQLite: {e}")
+
+    return 0.0
+
+
+def add_user_balance(user_id: int, amount: float) -> float:
+    current = get_user_balance(user_id)
+    new_bal = current + amount
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"users/{user_id}/balance").set(new_bal)
+        except Exception as e:
+            logging.error(f"Error updating balance in Firebase: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error updating balance in SQLite: {e}")
+
+    return new_bal
 
 
 def get_all_users() -> list:
@@ -180,7 +234,7 @@ def get_all_users() -> list:
         try:
             fb_users = db.reference("users").get()
             if fb_users and isinstance(fb_users, dict):
-                users = [int(uid) for uid in fb_users.keys() if uid.isdigit()]
+                users = [int(uid) for uid in fb_users.keys() if str(uid).isdigit()]
         except Exception as e:
             logging.error(f"Error fetching users from Firebase: {e}")
 
@@ -197,17 +251,12 @@ def get_all_users() -> list:
     return list(set(users))
 
 
-def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> dict:
-    btn = {"text": str(text).upper() if text else ""}
-    if callback_data:
-        btn["callback_data"] = callback_data
-    if url:
-        btn["url"] = url
-    if copy_text:
-        btn["copy_text"] = {"text": copy_text}
-    if style:
-        btn["style"] = style
-    return btn
+def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=str(text).upper() if text else "",
+        callback_data=callback_data,
+        url=url
+    )
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -269,8 +318,8 @@ def sync_firebase_to_sqlite():
             conn = get_db_connection()
             cursor = conn.cursor()
             for uid in fb_users.keys():
-                if uid.isdigit():
-                    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (int(uid),))
+                if str(uid).isdigit():
+                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (int(uid),))
             conn.commit()
             conn.close()
     except Exception as e:
@@ -345,7 +394,7 @@ def build_admin_services_view():
     summary = get_admin_services_summary()
     if not summary:
         text = "📱 **SERVICES MANAGEMENT**\n\nNo services added yet."
-        buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
+        buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add")]]
         return text, InlineKeyboardMarkup(buttons)
 
     text = "📱 **SERVICES MANAGEMENT**\n\nBelow is the summary of your added services and available numbers:\n"
@@ -355,9 +404,9 @@ def build_admin_services_view():
         text += f"\n🔹 **{escape_md(srv)}** (Total Available: `{total_avail}`)"
         for cnt, count in cnts.items():
             text += f"\n   └ {escape_md(cnt)}: `{count}`"
-        buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
+        buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}")])
 
-    buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
+    buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -376,12 +425,12 @@ def build_service_manage_view(service: str):
         text += "No countries configured.\n"
 
     buttons = [
-        [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}", style="success")],
-        [create_button("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}", style="danger")],
+        [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}")],
+        [create_button("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}")],
     ]
     if cnts:
-        buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}", style="danger")])
-    buttons.append([create_button("Back to Services", callback_data="adm:srv:list", style="danger")])
+        buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}")])
+    buttons.append([create_button("Back to Services", callback_data="adm:srv:list")])
 
     return text, InlineKeyboardMarkup(buttons)
 
@@ -400,11 +449,11 @@ def build_edit_links_view():
     )
     buttons = [
         [
-            create_button("📢 Edit Channel", callback_data="adm:set:channel", style="primary"),
-            create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")
+            create_button("📢 Edit Channel", callback_data="adm:set:channel"),
+            create_button("🎧 Edit Support", callback_data="adm:set:support")
         ],
         [
-            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary")
+            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -415,15 +464,30 @@ def build_number_quantity_view():
     text = f"🔢 **NUMBER QUANTITY SETTINGS**\n\nSelect how many numbers a user receives per request.\nCurrent setting: `{current_qty}`"
     buttons = [
         [
-            create_button("1", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success"),
-            create_button("2", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success"),
-            create_button("3", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success")
+            create_button("1", callback_data="adm:setqty:1"),
+            create_button("2", callback_data="adm:setqty:2"),
+            create_button("3", callback_data="adm:setqty:3")
         ],
         [
-            create_button("4", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
-            create_button("5", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
-            create_button("6", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")
+            create_button("4", callback_data="adm:setqty:4"),
+            create_button("5", callback_data="adm:setqty:5"),
+            create_button("6", callback_data="adm:setqty:6")
         ]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_extra_settings_view():
+    show_msg = get_setting("show_message", "1")
+    status_text = "ENABLED 🟢" if show_msg == "1" else "DISABLED 🔴"
+    
+    text = (
+        f"⚙️ **EXTRA SETTINGS**\n\n"
+        f"📩 **Show OTP Message:** `{status_text}`\n\n"
+        f"Click below to toggle showing OTP message text in Group & User Inbox."
+    )
+    buttons = [
+        [create_button(f"Show Message: {status_text}", callback_data="adm:set:toggle_msg")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -432,13 +496,13 @@ def build_allocation_keyboard(service: str, country: str, numbers: list):
     otp_group_link = clean_tg_link(get_setting("otp_group_link", "https://t.me/your_otp_group"))
     buttons = []
     for num in numbers:
-        buttons.append([create_button(f"{num}", copy_text=str(num), style="success")])
+        buttons.append([create_button(f"{num}", callback_data="ignore")])
 
     buttons.append([
-        create_button("Change All", callback_data=f"chg:{service}:{country}", style="primary"),
-        create_button("OTP Group", url=otp_group_link, style="primary")
+        create_button("Change All", callback_data=f"chg:{service}:{country}"),
+        create_button("OTP Group", url=otp_group_link)
     ])
-    buttons.append([create_button("Back", callback_data=f"srv_{service}", style="danger")])
+    buttons.append([create_button("Back", callback_data=f"srv_{service}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -461,9 +525,9 @@ def get_services_keyboard():
     buttons = []
     for i in range(0, len(services), 2):
         row = []
-        row.append(create_button(services[i], callback_data=f"srv_{services[i]}", style="primary"))
+        row.append(create_button(services[i], callback_data=f"srv_{services[i]}"))
         if i + 1 < len(services):
-            row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}", style="primary"))
+            row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}"))
         buttons.append(row)
 
     return InlineKeyboardMarkup(buttons), "📍 Please select a service:"
@@ -532,10 +596,10 @@ def migrate_sqlite_to_firebase():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT user_id FROM users")
+    cursor.execute("SELECT user_id, balance FROM users")
     users = cursor.fetchall()
     for u in users:
-        db.reference(f"users/{u[0]}").set(True)
+        db.reference(f"users/{u[0]}").set({"exists": True, "balance": u[1] if u[1] is not None else 0})
 
     cursor.execute("SELECT service, country, number, status, user_id FROM numbers")
     rows = cursor.fetchall()
@@ -592,54 +656,30 @@ def run_flask():
 # ---------------- KEYBOARDS ----------------
 def get_main_keyboard(user_id: int):
     keyboard_layout = [
-        [
-            {"text": "GET NUMBER", "style": "success"}
-        ],
-        [
-            {"text": "PROFILE", "style": "primary"},
-            {"text": "WALLET", "style": "primary"}
-        ],
-        [
-            {"text": "CHANNEL", "style": "danger"},
-            {"text": "SUPPORT", "style": "danger"}
-        ]
+        [KeyboardButton("GET NUMBER")],
+        [KeyboardButton("PROFILE"), KeyboardButton("WALLET")],
+        [KeyboardButton("CHANNEL"), KeyboardButton("SUPPORT")]
     ]
     if user_id == ADMIN_ID:
-        keyboard_layout.append([{"text": "ADMIN PANEL", "style": "danger"}])
+        keyboard_layout.append([KeyboardButton("ADMIN PANEL")])
         
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 def get_admin_keyboard():
     keyboard_layout = [
-        [
-            {"text": "SERVICES", "style": "primary"},
-            {"text": "BROADCAST", "style": "primary"}
-        ],
-        [
-            {"text": "ADMIN CONTROL", "style": "primary"},
-            {"text": "GLOBAL SETTINGS", "style": "primary"}
-        ],
-        [
-            {"text": "BACK", "style": "danger"}
-        ]
+        [KeyboardButton("SERVICES"), KeyboardButton("ADMIN CONTROL")],
+        [KeyboardButton("GLOBAL SETTINGS"), KeyboardButton("BROADCAST")],
+        [KeyboardButton("BACK")]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 def get_global_settings_keyboard():
     keyboard_layout = [
-        [
-            {"text": "EDIT LINKS", "style": "primary"},
-            {"text": "EDIT API", "style": "primary"}
-        ],
-        [
-            {"text": "NUMBER QUANTITY", "style": "primary"},
-            {"text": "CONNECT FIREBASE", "style": "primary"}
-        ],
-        [
-            {"text": "BACK", "style": "danger"}
-        ]
+        [KeyboardButton("EDIT LINKS"), KeyboardButton("EDIT API")],
+        [KeyboardButton("NUMBER QUANTITY"), KeyboardButton("CONNECT FIREBASE")],
+        [KeyboardButton("EXTRA"), KeyboardButton("BACK")]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
@@ -675,30 +715,32 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         first_name = escape_md(update.effective_user.first_name or "User")
         bot_username = context.bot.username or "bot"
         refer_link = f"https://t.me/{bot_username}?start={user_id}"
+        bal = get_user_balance(user_id)
         
         profile_text = (
             f"👤 **USER PROFILE**\n\n"
             f"📝 **Name:** {first_name}\n"
             f"🆔 **ID:** `{user_id}`\n"
-            f"💰 **Balance:** `0.00 ৳`"
+            f"💰 **Balance:** `{bal:.2f} ৳`"
         )
         kbd = InlineKeyboardMarkup([
-            [create_button("Referral Link", copy_text=refer_link, style="success")]
+            [create_button("Referral Link", url=refer_link)]
         ])
         await update.message.reply_text(profile_text, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "WALLET":
+        bal = get_user_balance(user_id)
         wallet_text = (
             f"👛 **YOUR WALLET**\n\n"
             f"🆔 **User ID:** `{user_id}`\n"
-            f"💰 **Balance:** `0.00 ৳`"
+            f"💰 **Balance:** `{bal:.2f} ৳`"
         )
         await update.message.reply_text(wallet_text, parse_mode="Markdown")
 
     elif text_upper == "CHANNEL":
         ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
         kbd = InlineKeyboardMarkup([
-            [create_button("Join Channel", url=ch_link, style="primary")]
+            [create_button("Join Channel", url=ch_link)]
         ])
         await update.message.reply_text("Click below to join our official channel:", reply_markup=kbd)
 
@@ -708,8 +750,8 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         kbd = InlineKeyboardMarkup([
             [
-                create_button("Support", url=sp_link, style="primary"),
-                create_button("Channel", url=ch_link, style="primary")
+                create_button("Support", url=sp_link),
+                create_button("Channel", url=ch_link)
             ]
         ])
         await update.message.reply_text("Click below to contact support or join our channel:", reply_markup=kbd)
@@ -750,6 +792,11 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text_upper == "NUMBER QUANTITY" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_number_quantity_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif text_upper == "EXTRA" and user_id == ADMIN_ID:
+        context.user_data['current_menu'] = 'global_settings'
+        text_msg, kbd = build_extra_settings_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "ADMIN CONTROL" and user_id == ADMIN_ID:
@@ -1011,6 +1058,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     save_user(user_id)
 
+    if data == "ignore":
+        await query.answer()
+        return
+
     if data == "back_to_services":
         await query.answer()
         kbd, msg = get_services_keyboard()
@@ -1020,7 +1071,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=kbd)
         return
 
-    # Admin Settings Quantity Handlers
+    # Admin Settings Handlers
     elif data.startswith("adm:setqty:"):
         await query.answer()
         if user_id != ADMIN_ID:
@@ -1029,6 +1080,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting("number_quantity", qty_val)
         await query.answer(f"Number quantity set to {qty_val}!", show_alert=True)
         text_msg, kbd = build_number_quantity_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:set:toggle_msg":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        curr = get_setting("show_message", "1")
+        new_val = "0" if curr == "1" else "1"
+        set_setting("show_message", new_val)
+        status_lbl = "ENABLED" if new_val == "1" else "DISABLED"
+        await query.answer(f"Show Message setting changed to {status_lbl}!", show_alert=True)
+        text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     # Admin Management Actions
@@ -1066,8 +1129,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cnts = summary.get(service, {})
         buttons = []
         for cnt in cnts.keys():
-            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
-        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
+            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}")])
+        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}")])
         await query.edit_message_text(f"Select country to delete from **{escape_md(service)}**:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
@@ -1106,12 +1169,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = []
         for i in range(0, len(countries), 2):
             row = []
-            row.append(create_button(countries[i], callback_data=f"cnt_{service}_{countries[i]}", style="primary"))
+            row.append(create_button(countries[i], callback_data=f"cnt_{service}_{countries[i]}"))
             if i + 1 < len(countries):
-                row.append(create_button(countries[i+1], callback_data=f"cnt_{service}_{countries[i+1]}", style="primary"))
+                row.append(create_button(countries[i+1], callback_data=f"cnt_{service}_{countries[i+1]}"))
             buttons.append(row)
 
-        buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
+        buttons.append([create_button("Back", callback_data="back_to_services")])
         await query.edit_message_text(f"Select country for {escape_md(service)}:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("cnt_"):
@@ -1310,7 +1373,6 @@ async def otp_poller(application: Application):
                                     if not num or not msg:
                                         continue
 
-                                    # Generating unique MD5 key for deduplication
                                     unique_str = f"{num}_{dt}_{msg}"
                                     msg_id = hashlib.md5(unique_str.encode()).hexdigest()
 
@@ -1330,7 +1392,6 @@ async def otp_poller(application: Application):
                                             conn.commit()
                                             conn.close()
 
-                                        # Lookup allocation info
                                         allocated_user = None
                                         service_name = cli if cli else "Service"
                                         clean_num = re.sub(r'\D', '', num)
@@ -1353,34 +1414,49 @@ async def otp_poller(application: Application):
                                         otp_code = extract_otp(msg)
                                         masked_num = mask_number(num)
                                         ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+                                        show_msg_setting = get_setting("show_message", "1")
 
-                                        # Get Bot URL
+                                        dev_user = html.escape(get_setting("dev_username", "developer"))
+                                        dev_link = f'<a href="https://t.me/{dev_user}">{dev_user}</a>'
+
                                         bot_info = await application.bot.get_me()
                                         bot_username = bot_info.username or ""
                                         bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
 
-                                        # HTML escaping and Telegram Expandable Blockquote Format
                                         safe_msg = html.escape(msg)
                                         safe_service = html.escape(service_name)
                                         safe_masked_num = html.escape(masked_num)
                                         safe_num = html.escape(num)
-                                        quoted_msg = f"<blockquote expandable>{safe_msg}</blockquote>"
+                                        quoted_msg = f"<blockquote>{safe_msg}</blockquote>"
 
                                         # 1. Send to OTP Forwarding Group
                                         if OTP_GROUP_ID:
-                                            group_text = (
-                                                "New OTP Received\n"
-                                                f"{safe_service} ➜ {safe_masked_num}\n"
-                                                "Price: 1 TK\n"
-                                                f"{quoted_msg}"
-                                            )
+                                            if show_msg_setting == "1":
+                                                group_text = (
+                                                    "━━━━━━━━━━━━━━━━━\n"
+                                                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
+                                                    f"🌐 NUM: {safe_num}\n\n"
+                                                    "🗨️ MESSAGE:\n"
+                                                    f"{quoted_msg}\n"
+                                                    "━━━━━━━━━━━━━━━━━\n"
+                                                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇr {dev_link}"
+                                                )
+                                            else:
+                                                group_text = (
+                                                    "━━━━━━━━━━━━━━━━━\n"
+                                                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
+                                                    f"🌐 NUM: {safe_num}\n"
+                                                    "━━━━━━━━━━━━━━━━━\n"
+                                                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇr {dev_link}"
+                                                )
+
                                             group_kbd = InlineKeyboardMarkup([
                                                 [
-                                                    create_button("Channel", url=ch_link, style="primary"),
-                                                    create_button("Get Number", url=bot_link, style="primary")
+                                                    create_button("Channel", url=ch_link),
+                                                    create_button("Get Number", url=bot_link)
                                                 ],
                                                 [
-                                                    create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                                    create_button(f"{otp_code}", callback_data="ignore")
                                                 ]
                                             ])
                                             try:
@@ -1395,15 +1471,32 @@ async def otp_poller(application: Application):
 
                                         # 2. Send to User Inbox
                                         if allocated_user:
-                                            user_text = (
-                                                "New OTP Received\n"
-                                                f"{safe_service} ➜ {safe_num}\n"
-                                                "Added: 1TK\n"
-                                                f"{quoted_msg}"
-                                            )
+                                            new_bal = add_user_balance(allocated_user, 1.0)
+
+                                            if show_msg_setting == "1":
+                                                user_text = (
+                                                    "— — — — — — — — — —\n"
+                                                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
+                                                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
+                                                    "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
+                                                    f"<blockquote>💳 BALANCE ➜ {new_bal:.2f} TK</blockquote>\n"
+                                                    "🗨️ MESSAGE: \n"
+                                                    f"{quoted_msg}\n"
+                                                    "— — — — — — — — — —"
+                                                )
+                                            else:
+                                                user_text = (
+                                                    "— — — — — — — — — —\n"
+                                                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
+                                                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
+                                                    "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
+                                                    f"<blockquote>💳 BALANCE ➜ {new_bal:.2f} TK</blockquote>\n"
+                                                    "— — — — — — — — — —"
+                                                )
+
                                             user_kbd = InlineKeyboardMarkup([
                                                 [
-                                                    create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                                    create_button(f"{otp_code}", callback_data="ignore")
                                                 ]
                                             ])
                                             try:
