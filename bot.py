@@ -53,6 +53,7 @@ CLEANUP_EVERY_N_CYCLES = 720  # ~1 hour
 # ---------------- IN-MEMORY GLOBAL CACHE ----------------
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}  # {service_name: {country_name: available_count}}
+ADMINS_CACHE = set() # {user_id, ...}
 PANEL_TASKS = {}     # Dynamic background tasks for API panels
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -116,6 +117,20 @@ def mask_number_aph(num_str: str) -> str:
     return num_str
 
 
+def mask_api_key(key: str) -> str:
+    if not key:
+        return "N/A"
+    key_str = str(key).strip()
+    length = len(key_str)
+    if length > 12:
+        return f"{key_str[:6]}******{key_str[-6:]}"
+    elif length > 8:
+        return f"{key_str[:4]}******{key_str[-4:]}"
+    elif length > 4:
+        return f"{key_str[:2]}******{key_str[-2:]}"
+    return "******"
+
+
 # ---------------- DATABASE (SYNC / BLOCKING) ----------------
 def get_db_connection():
     conn = sqlite3.connect("bot_database.db", timeout=10)
@@ -131,6 +146,12 @@ def init_sqlite():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             balance REAL DEFAULT 0.0
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT
         )
     ''')
     cursor.execute('''
@@ -205,6 +226,95 @@ def init_sqlite():
     conn.close()
 
 init_sqlite()
+
+
+# ---------------- ADMIN MANAGEMENT DB OPERATIONS ----------------
+def is_admin_sync(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    return user_id in ADMINS_CACHE
+
+
+def get_all_admins_sync() -> list:
+    admins = {}
+    if ADMIN_ID:
+        admins[ADMIN_ID] = {"user_id": ADMIN_ID, "name": "Main Owner", "is_owner": True}
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_admins = db.reference("admins").get()
+            if fb_admins and isinstance(fb_admins, dict):
+                for uid, adata in fb_admins.items():
+                    if str(uid).isdigit():
+                        uid_int = int(uid)
+                        name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
+                        if uid_int == ADMIN_ID:
+                            admins[uid_int]["name"] = f"{name} (Owner)"
+                        else:
+                            admins[uid_int] = {"user_id": uid_int, "name": name, "is_owner": False}
+        except Exception as e:
+            logging.error(f"Firebase get admins error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, name FROM admins")
+        for r in cursor.fetchall():
+            uid_int = int(r[0])
+            name = str(r[1])
+            if uid_int == ADMIN_ID:
+                admins[uid_int]["name"] = f"{name} (Owner)"
+            else:
+                admins[uid_int] = {"user_id": uid_int, "name": name, "is_owner": False}
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite get admins error: {e}")
+
+    return list(admins.values())
+
+
+def add_admin_sync(user_id: int, name: str):
+    ADMINS_CACHE.add(user_id)
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"admins/{user_id}").set({"name": name})
+        except Exception as e:
+            logging.error(f"Firebase add admin error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (user_id, name))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite add admin error: {e}")
+
+
+def delete_admin_sync(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return False
+
+    if user_id in ADMINS_CACHE:
+        ADMINS_CACHE.remove(user_id)
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"admins/{user_id}").delete()
+        except Exception as e:
+            logging.error(f"Firebase delete admin error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite delete admin error: {e}")
+
+    return True
 
 
 # ---------------- API PANELS DB OPERATIONS ----------------
@@ -299,9 +409,13 @@ def delete_api_panel_sync(panel_id: str):
 
 # ---------------- CACHE MANAGEMENT ----------------
 def refresh_all_caches_sync():
-    global SETTINGS_CACHE, SERVICES_CACHE
+    global SETTINGS_CACHE, SERVICES_CACHE, ADMINS_CACHE
     SETTINGS_CACHE.clear()
     SERVICES_CACHE.clear()
+    ADMINS_CACHE.clear()
+
+    if ADMIN_ID:
+        ADMINS_CACHE.add(ADMIN_ID)
 
     try:
         conn = get_db_connection()
@@ -309,9 +423,13 @@ def refresh_all_caches_sync():
         cursor.execute("SELECT key, value FROM settings")
         for k, v in cursor.fetchall():
             SETTINGS_CACHE[str(k)] = str(v)
+
+        cursor.execute("SELECT user_id FROM admins")
+        for r in cursor.fetchall():
+            ADMINS_CACHE.add(int(r[0]))
         conn.close()
     except Exception as e:
-        logging.error(f"Error loading settings into cache: {e}")
+        logging.error(f"Error loading settings/admins into cache: {e}")
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
@@ -320,8 +438,14 @@ def refresh_all_caches_sync():
                 for k, v in fb_settings.items():
                     if v is not None:
                         SETTINGS_CACHE[str(k)] = str(v)
+
+            fb_admins = db.reference("admins").get()
+            if fb_admins and isinstance(fb_admins, dict):
+                for uid in fb_admins.keys():
+                    if str(uid).isdigit():
+                        ADMINS_CACHE.add(int(uid))
         except Exception as e:
-            logging.error(f"Error merging Firebase settings to cache: {e}")
+            logging.error(f"Error merging Firebase settings/admins to cache: {e}")
 
     refresh_services_cache_sync()
 
@@ -527,6 +651,17 @@ def sync_firebase_to_sqlite():
 
                     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (int(uid), bal))
                     cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (bal, int(uid)))
+            conn.commit()
+            conn.close()
+
+        fb_admins = db.reference("admins").get()
+        if fb_admins and isinstance(fb_admins, dict):
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            for uid, adata in fb_admins.items():
+                if str(uid).isdigit():
+                    name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
+                    cursor.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (int(uid), str(name)))
             conn.commit()
             conn.close()
 
@@ -795,6 +930,25 @@ def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
 
 
 # ---------------- VIEW BUILDERS ----------------
+def build_admin_control_view():
+    admins = get_all_admins_sync()
+    text = "🛠 **ADMIN CONTROL MANAGEMENT**\n\nList of System Admins:\n"
+    buttons = []
+
+    for adm in admins:
+        uid = adm["user_id"]
+        name = adm["name"]
+        is_owner = adm.get("is_owner", False) or (uid == ADMIN_ID)
+        role_label = "👑 Main Owner" if is_owner else "🛡️ Admin"
+
+        text += f"\n• **{escape_md(name)}** (`{uid}`) - {role_label}"
+        if not is_owner:
+            buttons.append([create_button(f"🗑️ Remove {name}", callback_data=f"adm:delconf:{uid}", style="danger")])
+
+    buttons.append([create_button("➕ Add New Admin", callback_data="adm:add:start", style="success")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
 def build_admin_services_view():
     summary = get_admin_services_summary()
     if not summary:
@@ -889,11 +1043,13 @@ def build_panel_manage_view(panel_id: str):
     if not p:
         return "⚠️ Panel not found.", InlineKeyboardMarkup([[create_button("Back to Panels", callback_data="adm:api:list", style="danger")]])
 
+    masked_token = mask_api_key(p['token'])
+
     text = (
         f"⚙️ **PANEL DETAILS: {escape_md(p['name'])}**\n\n"
         f"📌 **Panel Name:** {escape_md(p['name'])}\n"
         f"🔗 **Base URL:** `{escape_md(p['url'])}` \n"
-        f"🔑 **API Key/Token:** `{escape_md(p['token'])}` \n"
+        f"🔑 **API Key/Token:** `{escape_md(masked_token)}` \n"
         f"⏱️ **Polling Time:** `{p['polling_interval']}s`\n"
     )
     buttons = [
@@ -1042,6 +1198,11 @@ def migrate_sqlite_to_firebase():
     for u in users:
         db.reference(f"users/{u[0]}").set({"exists": True, "balance": u[1] if len(u) > 1 else 0.0})
 
+    cursor.execute("SELECT user_id, name FROM admins")
+    admins = cursor.fetchall()
+    for a in admins:
+        db.reference(f"admins/{a[0]}").set({"name": a[1]})
+
     cursor.execute("SELECT service, country, number, status, user_id FROM numbers")
     rows = cursor.fetchall()
     for row in rows:
@@ -1104,7 +1265,9 @@ def run_flask():
     WAIT_PANEL_URL,
     WAIT_PANEL_TOKEN,
     WAIT_PANEL_INTERVAL,
-) = range(12)
+    WAIT_ADMIN_ID,
+    WAIT_ADMIN_NAME,
+) = range(14)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -1115,7 +1278,7 @@ def admin_only(func):
         user = update.effective_user
         if query:
             await query.answer()
-        if not user or user.id != ADMIN_ID:
+        if not user or not (await run_db(is_admin_sync, user.id)):
             return ConversationHandler.END
         return await func(update, context, *args, **kwargs)
     return wrapper
@@ -1136,7 +1299,7 @@ def get_main_keyboard(user_id: int):
             {"text": "SUPPORT", "style": "danger"}
         ]
     ]
-    if user_id == ADMIN_ID:
+    if is_admin_sync(user_id):
         keyboard_layout.append([{"text": "ADMIN PANEL", "style": "danger"}])
 
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
@@ -1196,6 +1359,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_db(save_user, user_id)
 
     text_upper = text.strip().upper()
+    user_is_admin = is_admin_sync(user_id)
 
     if text_upper == "GET NUMBER":
         kbd, msg = get_services_keyboard()
@@ -1251,7 +1415,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_text("Click below to contact support or join our channel:", reply_markup=kbd)
 
-    elif text_upper == "ADMIN PANEL" and user_id == ADMIN_ID:
+    elif text_upper == "ADMIN PANEL" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
         total_users = len(await run_db(get_all_users))
         await update.message.reply_text(
@@ -1262,12 +1426,12 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif text_upper == "SERVICES" and user_id == ADMIN_ID:
+    elif text_upper == "SERVICES" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = build_admin_services_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text_upper == "GLOBAL SETTINGS" and user_id == ADMIN_ID:
+    elif text_upper == "GLOBAL SETTINGS" and user_is_admin:
         context.user_data['current_menu'] = 'global_settings'
         await update.message.reply_text(
             "⚙️ **GLOBAL SETTINGS MENU**\n\nSelect an option from below keyboard:",
@@ -1275,33 +1439,34 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif text_upper == "EDIT LINKS" and user_id == ADMIN_ID:
+    elif text_upper == "EDIT LINKS" and user_is_admin:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_edit_links_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text_upper == "EDIT API" and user_id == ADMIN_ID:
+    elif text_upper == "EDIT API" and user_is_admin:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_api_panels_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text_upper == "NUMBER QUANTITY" and user_id == ADMIN_ID:
+    elif text_upper == "NUMBER QUANTITY" and user_is_admin:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_number_quantity_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text_upper == "EXTRA" and user_id == ADMIN_ID:
+    elif text_upper == "EXTRA" and user_is_admin:
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_extra_settings_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text_upper == "ADMIN CONTROL" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'global_settings'
-        await update.message.reply_text("🛠 **ADMIN CONTROL**\n\nSystem control settings panel.", parse_mode="Markdown")
+    elif text_upper == "ADMIN CONTROL" and user_is_admin:
+        context.user_data['current_menu'] = 'admin'
+        text_msg, kbd = build_admin_control_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "BACK":
         curr_menu = context.user_data.get('current_menu', 'main')
-        if curr_menu == 'global_settings' and user_id == ADMIN_ID:
+        if curr_menu == 'global_settings' and user_is_admin:
             context.user_data['current_menu'] = 'admin'
             total_users = len(await run_db(get_all_users))
             await update.message.reply_text(
@@ -1362,6 +1527,44 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'admin'
+    return ConversationHandler.END
+
+
+# ---------------- ADD ADMIN CONVERSATION ----------------
+@admin_only
+async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.message.reply_text("Enter the Telegram User ID of the new Admin (e.g., 123456789):")
+    else:
+        await update.message.reply_text("Enter the Telegram User ID of the new Admin (e.g., 123456789):")
+    return WAIT_ADMIN_ID
+
+
+async def receive_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    input_text = update.message.text.strip()
+    if not input_text.isdigit():
+        await update.message.reply_text("❌ Invalid Telegram User ID! Please enter numbers only.\nType /cancel to abort.")
+        return WAIT_ADMIN_ID
+
+    context.user_data['new_admin_id'] = int(input_text)
+    await update.message.reply_text("Enter Admin Name/Tag (e.g., Co-Admin John):")
+    return WAIT_ADMIN_NAME
+
+
+async def receive_admin_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_name = update.message.text.strip()
+    new_id = context.user_data.get('new_admin_id')
+
+    if new_id and admin_name:
+        await run_db(add_admin_sync, new_id, admin_name)
+        await update.message.reply_text(f"✅ Admin **{escape_md(admin_name)}** (`{new_id}`) added successfully!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Failed to add admin. Incomplete data.")
+
+    context.user_data.pop('new_admin_id', None)
+    text_msg, kbd = build_admin_control_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1567,6 +1770,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('new_api_name', None)
     context.user_data.pop('new_api_url', None)
     context.user_data.pop('new_api_token', None)
+    context.user_data.pop('new_admin_id', None)
 
     if update.message and update.message.text:
         await handle_text_menu(update, context)
@@ -1579,6 +1783,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
+    user_is_admin = is_admin_sync(user_id)
     await run_db(save_user, user_id)
 
     if data == "back_to_services":
@@ -1589,9 +1794,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text(msg, reply_markup=kbd)
 
+    # Admin Control Inline Controls
+    elif data == "adm:ctrl:list":
+        await query.answer()
+        if not user_is_admin:
+            return
+        text_msg, kbd = build_admin_control_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:delconf:"):
+        await query.answer()
+        if not user_is_admin:
+            return
+        target_uid = int(data.split(":", 2)[2])
+        if target_uid == ADMIN_ID:
+            await query.answer("❌ Main Owner cannot be removed!", show_alert=True)
+            return
+
+        admins = get_all_admins_sync()
+        target_adm = next((a for a in admins if a["user_id"] == target_uid), None)
+        target_name = target_adm["name"] if target_adm else "Admin"
+
+        text = (
+            f"⚠️ **CONFIRMATION REQUIRED**\n\n"
+            f"Are you sure you want to remove admin **{escape_md(target_name)}** (`{target_uid}`)?\n"
+            f"This action cannot be undone."
+        )
+        kbd = InlineKeyboardMarkup([
+            [
+                create_button("✅ YES, REMOVE", callback_data=f"adm:del:{target_uid}", style="danger"),
+                create_button("❌ CANCEL", callback_data="adm:ctrl:list", style="primary")
+            ]
+        ])
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:del:"):
+        if not user_is_admin:
+            await query.answer()
+            return
+        target_uid = int(data.split(":", 2)[2])
+        if target_uid == ADMIN_ID:
+            await query.answer("❌ Main Owner cannot be removed!", show_alert=True)
+            return
+
+        success = await run_db(delete_admin_sync, target_uid)
+        if success:
+            await query.answer("Admin removed successfully!", show_alert=True)
+        else:
+            await query.answer("Failed to remove admin.", show_alert=True)
+
+        text_msg, kbd = build_admin_control_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
     elif data.startswith("adm:setqty:"):
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         qty_val = data.split(":", 2)[2]
         set_setting("number_quantity", qty_val)
@@ -1601,7 +1858,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "adm:toggle:show_msg":
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         curr_val = get_setting("show_message", "true")
         new_val = "false" if curr_val == "true" else "true"
@@ -1613,7 +1870,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "adm:toggle:country_count":
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         curr_val = get_setting("show_country_count", "false")
         new_val = "false" if curr_val == "true" else "true"
@@ -1625,21 +1882,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "adm:srv:list":
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         text, kbd = build_admin_services_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:view:"):
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         service = data.split(":", 3)[3]
         text, kbd = build_service_manage_view(service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:del:"):
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             await query.answer()
             return
         service = data.split(":", 3)[3]
@@ -1650,7 +1907,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:cnt:delli:"):
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         service = data.split(":", 3)[3]
         summary = get_admin_services_summary()
@@ -1662,7 +1919,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"Select country to delete from **{escape_md(service)}**:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             await query.answer()
             return
         parts = data.split(":", 4)
@@ -1678,14 +1935,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # API Panel Inline Controls
     elif data == "adm:api:list":
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         text, kbd = build_api_panels_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:api:view:"):
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         panel_id = data.split(":", 3)[3]
         text, kbd = build_panel_manage_view(panel_id)
@@ -1693,7 +1950,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:api:delconf:"):
         await query.answer()
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             return
         panel_id = data.split(":", 3)[3]
         p = await run_db(get_api_panel_sync, panel_id)
@@ -1708,7 +1965,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:api:del:"):
-        if user_id != ADMIN_ID:
+        if not user_is_admin:
             await query.answer()
             return
         panel_id = data.split(":", 3)[3]
@@ -2064,12 +2321,13 @@ def main():
             CallbackQueryHandler(admin_add_service_start, pattern="^adm:srv:add$"),
             CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
             CallbackQueryHandler(admin_add_panel_start, pattern="^adm:api:add$"),
+            CallbackQueryHandler(admin_add_admin_start, pattern="^adm:add:start$"),
             CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
             MessageHandler(filters.Regex("(?i)^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
-            MessageHandler(filters.Regex("(?i)^Broadcast$") & filters.User(user_id=ADMIN_ID), broadcast_start),
+            MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
@@ -2079,6 +2337,8 @@ def main():
             WAIT_PANEL_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_url)],
             WAIT_PANEL_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_token)],
             WAIT_PANEL_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_interval)],
+            WAIT_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_id)],
+            WAIT_ADMIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_name)],
             WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL & ~MENU_FILTER, receive_firebase_file)],
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
             WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_support_link)],
