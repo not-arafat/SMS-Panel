@@ -41,7 +41,7 @@ if not TOKEN:
     raise ValueError("BOT_TOKEN environment variable not found! Check your .env file or environment settings.")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
+OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 FIREBASE_JSON_PATH = "temp_firebase.json"
@@ -217,6 +217,7 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
+    cursor.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_id', '{OTP_GROUP_ID}')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', 'true')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
@@ -998,13 +999,15 @@ def build_edit_links_view():
     ch_val = get_setting("channel", "https://t.me/your_channel")
     sp_val = get_setting("support", "@your_support")
     otp_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
+    otp_grp_id = get_setting("otp_group_id", OTP_GROUP_ID if OTP_GROUP_ID else "Not Set")
 
     text = (
-        f"🔗 **EDIT LINKS SETTINGS**\n\n"
+        f"🔗 **EDIT LINKS & FORWARD SETTINGS**\n\n"
         f"📢 **Channel:** {escape_md(ch_val)}\n"
         f"🎧 **Support:** {escape_md(sp_val)}\n"
-        f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n\n"
-        f"Click below to modify links:"
+        f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n"
+        f"🆔 **OTP Forward Group ID:** `{escape_md(str(otp_grp_id))}`\n\n"
+        f"Click below to modify settings:"
     )
     buttons = [
         [
@@ -1012,7 +1015,8 @@ def build_edit_links_view():
             create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")
         ],
         [
-            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary")
+            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary"),
+            create_button("🆔 Edit Forward Group ID", callback_data="adm:set:otpgroupid", style="primary")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -1260,6 +1264,7 @@ def run_flask():
     WAIT_CHANNEL,
     WAIT_SUPPORT,
     WAIT_OTP_LINK,
+    WAIT_OTP_GROUP_ID,
     WAIT_BROADCAST_MSG,
     WAIT_PANEL_NAME,
     WAIT_PANEL_URL,
@@ -1267,7 +1272,7 @@ def run_flask():
     WAIT_PANEL_INTERVAL,
     WAIT_ADMIN_ID,
     WAIT_ADMIN_NAME,
-) = range(14)
+) = range(15)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -1718,6 +1723,21 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 @admin_only
+async def set_otpgroupid_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.message.reply_text("Enter the OTP Forward Group Chat ID (e.g., -1001234567890):")
+    return WAIT_OTP_GROUP_ID
+
+async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_id = update.message.text.strip()
+    set_setting("otp_group_id", new_id)
+    await update.message.reply_text(f"✅ OTP Forward Group ID updated successfully!\nCurrent Group ID: `{escape_md(new_id)}`", parse_mode="Markdown")
+    text_msg, kbd = build_edit_links_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+@admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_users = await run_db(get_all_users)
     await update.message.reply_text(
@@ -2116,6 +2136,8 @@ async def process_otp_items(items: list, application: Application, processed_ids
     dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
     dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
 
+    target_otp_group = get_setting("otp_group_id", OTP_GROUP_ID)
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -2164,7 +2186,7 @@ async def process_otp_items(items: list, application: Application, processed_ids
         masked_num = mask_number_aph(num)
         safe_masked_num = html.escape(masked_num)
 
-        if OTP_GROUP_ID:
+        if target_otp_group:
             if show_msg_enabled:
                 group_text = (
                     "━━━━━━━━━━━━━━━━━\n"
@@ -2195,7 +2217,7 @@ async def process_otp_items(items: list, application: Application, processed_ids
             ])
             try:
                 await application.bot.send_message(
-                    chat_id=OTP_GROUP_ID,
+                    chat_id=target_otp_group,
                     text=group_text,
                     reply_markup=group_kbd,
                     parse_mode="HTML",
@@ -2326,6 +2348,7 @@ def main():
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
+            CallbackQueryHandler(set_otpgroupid_start, pattern="^adm:set:otpgroupid$"),
             MessageHandler(filters.Regex("(?i)^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
         ],
@@ -2343,6 +2366,7 @@ def main():
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
             WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_support_link)],
             WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_link)],
+            WAIT_OTP_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_group_id)],
             WAIT_BROADCAST_MSG: [MessageHandler(~filters.COMMAND & ~MENU_FILTER, receive_broadcast_msg)],
         },
         fallbacks=[
