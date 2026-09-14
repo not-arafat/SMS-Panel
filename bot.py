@@ -876,12 +876,12 @@ def get_main_keyboard(user_id: int):
 def get_admin_keyboard():
     keyboard_layout = [
         [
-            {"text": "SERVICES", "style": "primary"},
-            {"text": "ADMIN CONTROL", "style": "primary"}
+            {"text": "SERVICES", "style": "success"},
+            {"text": "BROADCAST", "style": "success"}
         ],
         [
-            {"text": "GLOBAL SETTINGS", "style": "primary"},
-            {"text": "BROADCAST", "style": "success"}
+            {"text": "ADMIN CONTROL", "style": "primary"},
+            {"text": "BROADCAST", "style": "primary"}
         ],
         [
             {"text": "BACK", "style": "danger"}
@@ -893,8 +893,8 @@ def get_admin_keyboard():
 def get_global_settings_keyboard():
     keyboard_layout = [
         [
-            {"text": "EDIT LINKS", "style": "primary"},
-            {"text": "EDIT API", "style": "primary"}
+            {"text": "EDIT LINKS", "style": "success"},
+            {"text": "EDIT API", "style": "success"}
         ],
         [
             {"text": "NUMBER QUANTITY", "style": "primary"},
