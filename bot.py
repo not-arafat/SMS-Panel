@@ -44,23 +44,18 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-API_URL = os.environ.get("API_URL", "")
-API_TOKEN = os.environ.get("API_TOKEN", "")
-
 FIREBASE_JSON_PATH = "temp_firebase.json"
 CURRENT_DB_MODE = "SQLite (Local)"
 
 OTP_ID_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
-CLEANUP_EVERY_N_CYCLES = 720  # ~1 hour at 5s interval
+CLEANUP_EVERY_N_CYCLES = 720  # ~1 hour
 
 # ---------------- IN-MEMORY GLOBAL CACHE ----------------
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}  # {service_name: {country_name: available_count}}
+PANEL_TASKS = {}     # Dynamic background tasks for API panels
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-if not API_URL:
-    logging.warning("API_URL is not set — OTP polling will stay idle until it's configured in the environment.")
 
 MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Back)$")
 
@@ -175,6 +170,15 @@ def init_sqlite():
             value TEXT
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS api_panels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            url TEXT,
+            token TEXT,
+            polling_interval REAL DEFAULT 5.0
+        )
+    ''')
 
     try:
         cursor.execute("ALTER TABLE seen_otps ADD COLUMN ts INTEGER DEFAULT 0")
@@ -203,13 +207,102 @@ def init_sqlite():
 init_sqlite()
 
 
+# ---------------- API PANELS DB OPERATIONS ----------------
+def get_all_api_panels_sync() -> list:
+    panels = []
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_panels = db.reference("api_panels").get()
+            if fb_panels and isinstance(fb_panels, dict):
+                for pid, pdata in fb_panels.items():
+                    if isinstance(pdata, dict):
+                        panels.append({
+                            "id": str(pdata.get("id", pid)),
+                            "name": str(pdata.get("name", "")),
+                            "url": str(pdata.get("url", "")),
+                            "token": str(pdata.get("token", "")),
+                            "polling_interval": float(pdata.get("polling_interval", 5.0))
+                        })
+        except Exception as e:
+            logging.error(f"Firebase get API panels error: {e}")
+
+    if not panels:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
+            rows = cursor.fetchall()
+            for r in rows:
+                panels.append({
+                    "id": str(r[0]),
+                    "name": str(r[1]),
+                    "url": str(r[2]),
+                    "token": str(r[3]),
+                    "polling_interval": float(r[4]) if r[4] else 5.0
+                })
+            conn.close()
+        except Exception as e:
+            logging.error(f"SQLite get API panels error: {e}")
+    return panels
+
+
+def get_api_panel_sync(panel_id: str) -> dict:
+    panels = get_all_api_panels_sync()
+    for p in panels:
+        if str(p["id"]) == str(panel_id):
+            return p
+    return None
+
+
+def save_api_panel_sync(name: str, url: str, token: str, polling_interval: float = 5.0) -> str:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO api_panels (name, url, token, polling_interval) VALUES (?, ?, ?, ?)",
+        (name, url, token, polling_interval)
+    )
+    pid = str(cursor.lastrowid)
+    conn.commit()
+    conn.close()
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"api_panels/{pid}").set({
+                "id": pid,
+                "name": name,
+                "url": url,
+                "token": token,
+                "polling_interval": polling_interval
+            })
+        except Exception as e:
+            logging.error(f"Firebase save API panel error: {e}")
+
+    return pid
+
+
+def delete_api_panel_sync(panel_id: str):
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"api_panels/{panel_id}").delete()
+        except Exception as e:
+            logging.error(f"Firebase delete API panel error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM api_panels WHERE id = ?", (panel_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite delete API panel error: {e}")
+
+
 # ---------------- CACHE MANAGEMENT ----------------
 def refresh_all_caches_sync():
     global SETTINGS_CACHE, SERVICES_CACHE
     SETTINGS_CACHE.clear()
     SERVICES_CACHE.clear()
 
-    # 1. Load Settings from SQLite
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -220,7 +313,6 @@ def refresh_all_caches_sync():
     except Exception as e:
         logging.error(f"Error loading settings into cache: {e}")
 
-    # Overlay with Firebase settings if Firebase is active
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             fb_settings = db.reference("settings").get()
@@ -231,7 +323,6 @@ def refresh_all_caches_sync():
         except Exception as e:
             logging.error(f"Error merging Firebase settings to cache: {e}")
 
-    # 2. Load Services Summary into RAM
     refresh_services_cache_sync()
 
 
@@ -270,7 +361,6 @@ def refresh_services_cache_sync():
         except Exception as e:
             logging.error(f"Error populating services cache from Firebase: {e}")
 
-    # Fallback / Local SQLite Cache Loading
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -291,7 +381,6 @@ def refresh_services_cache_sync():
         logging.error(f"Error populating services cache from SQLite: {e}")
 
 
-# ---------------- SETTINGS & CONFIG READ/WRITE (CACHE-FIRST) ----------------
 def get_setting(key: str, default_val: str = "") -> str:
     if key in SETTINGS_CACHE:
         return SETTINGS_CACHE[key]
@@ -300,7 +389,7 @@ def get_setting(key: str, default_val: str = "") -> str:
 
 def set_setting(key: str, value: str):
     str_val = str(value)
-    SETTINGS_CACHE[key] = str_val  # Direct RAM update
+    SETTINGS_CACHE[key] = str_val
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
@@ -318,12 +407,10 @@ def set_setting(key: str, value: str):
         logging.error(f"Error writing setting to SQLite: {e}")
 
 
-# ---------------- ASYNC <-> BLOCKING BRIDGE ----------------
 async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-# ---------------- SENSITIVE REAL-TIME DATA (BALANCE / ALLOCATION) ----------------
 def save_user(user_id: int):
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
@@ -493,12 +580,6 @@ def get_countries_for_service(service: str) -> list:
 
 
 def save_numbers_sync(service: str, country: str, numbers: list) -> int:
-    """Add numbers without creating duplicate inventory entries.
-
-    A number is globally considered used once it has ever been allocated.
-    Uploading it again only refreshes/creates an available inventory entry if
-    it has never been allocated before.
-    """
     cleaned_numbers = []
     seen = set()
     for num in numbers:
@@ -510,7 +591,6 @@ def save_numbers_sync(service: str, country: str, numbers: list) -> int:
     if not cleaned_numbers:
         return 0
 
-    # Build a global set of numbers that have already been allocated.
     globally_used = set()
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
@@ -525,25 +605,20 @@ def save_numbers_sync(service: str, country: str, numbers: list) -> int:
         batch = {}
         for num in cleaned_numbers:
             if num in globally_used:
-                # Never make an already-allocated number available again.
                 continue
             if isinstance(existing, dict) and num in existing:
-                # Keep existing state; importantly, do not reset an allocated number.
                 continue
             batch[num] = {"number": num, "status": "available", "user_id": 0}
 
         if batch:
             ref.update(batch)
         db.reference(f"services/{service}/{country}").set(True)
-
-        # Return the number of newly inserted inventory records.
         inserted = len(batch)
     else:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
 
-        # Existing allocations are permanent and globally block re-use.
         cursor.execute("SELECT number FROM allocations")
         globally_used = {str(row[0]) for row in cursor.fetchall()}
 
@@ -557,7 +632,6 @@ def save_numbers_sync(service: str, country: str, numbers: list) -> int:
             )
             row = cursor.fetchone()
             if row:
-                # Never reset an existing allocated row to available.
                 continue
             cursor.execute(
                 "INSERT INTO numbers (service, country, number, status, user_id) VALUES (?, ?, ?, 'available', 0)",
@@ -573,19 +647,10 @@ def save_numbers_sync(service: str, country: str, numbers: list) -> int:
 
 
 def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: int, exclude: list = None) -> list:
-    """Atomically reserve NEW numbers for a user.
-
-    Critical rule: once a number has been allocated, it is NEVER released back
-    to the available pool and can NEVER be allocated to anyone again, including
-    the same user.
-    """
     exclude = {str(x) for x in (exclude or [])}
     target_qty = max(1, int(target_qty))
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
-        # First read only the requested category.  Global allocation locks are
-        # then created transactionally, so the same number cannot be won by two
-        # concurrent requests.
         ref = db.reference(f"numbers/{service}/{country}")
         current_data = ref.get() or {}
         if not isinstance(current_data, dict):
@@ -606,7 +671,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
             return []
 
         assigned = []
-        # allocations/{number} is the permanent global ownership record.
         for num in candidates:
             if len(assigned) >= target_qty:
                 break
@@ -626,9 +690,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
                 continue
 
             if not result_holder["won"]:
-                # This number was already permanently allocated elsewhere (or by
-                # an earlier request). Keep the inventory mirror from advertising
-                # it as available in this category.
                 try:
                     existing_lock = lock_ref.get()
                     if isinstance(existing_lock, dict):
@@ -640,8 +701,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
                     logging.error(f"Firebase duplicate-allocation cleanup failed for {num}: {e}")
                 continue
 
-            # Permanently mark the inventory record allocated.  It is NEVER reset
-            # by Change All or any other user flow.
             try:
                 db.reference(f"numbers/{service}/{country}/{num}").update({
                     "status": "allocated",
@@ -651,17 +710,12 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
                 assigned.append(num)
             except Exception as e:
                 logging.error(f"Firebase number status update failed for {num}: {e}")
-                # If the inventory write failed, remove the lock so the number
-                # does not become permanently unusable without an allocation.
                 try:
                     lock_ref.delete()
                 except Exception:
                     pass
 
         refresh_services_cache_sync()
-        # Never roll back successful allocations. If fewer than requested were
-        # available because another request won some candidates concurrently,
-        # return the numbers that were successfully and permanently allocated.
         return assigned
 
     conn = get_db_connection()
@@ -670,7 +724,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
     try:
         conn.execute("BEGIN IMMEDIATE")
 
-        # Exclude every number that has ever been allocated globally.
         if exclude:
             placeholders = ','.join(['?'] * len(exclude))
             sql = f"""
@@ -696,7 +749,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
             conn.rollback()
             return []
 
-        now = int(time.time())
         for num_id, num in rows:
             num_str = str(num)
             assigned.append(num_str)
@@ -713,7 +765,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
             if cursor.rowcount != 1:
                 raise RuntimeError(f"Number {num_str} was already allocated")
 
-        # Preserve the user's permanent allocations; no release happens later.
         conn.commit()
         refresh_services_cache_sync()
         return assigned
@@ -723,20 +774,6 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
         return []
     finally:
         conn.close()
-
-
-def release_numbers_sync(service: str, country: str, numbers: list):
-    """Legacy compatibility function. Allocations are intentionally permanent.
-
-    Older versions released numbers when the user pressed Change All. That made
-    already-used numbers available again. This function now deliberately does
-    nothing so an allocated number can never re-enter the pool.
-    """
-    logging.info(
-        "release_numbers_sync ignored: allocations are permanent. service=%s country=%s count=%s",
-        service, country, len(numbers or [])
-    )
-    return
 
 
 def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
@@ -823,6 +860,45 @@ def build_edit_links_view():
         [
             create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary")
         ]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_api_panels_view():
+    panels = get_all_api_panels_sync()
+    if not panels:
+        text = "🌐 **API PANELS MANAGEMENT**\n\nNo API panels connected yet."
+        buttons = [[create_button("➕ Connect New Panel", callback_data="adm:api:add", style="success")]]
+        return text, InlineKeyboardMarkup(buttons)
+
+    text = "🌐 **API PANELS MANAGEMENT**\n\nConnected API Panels List:\n"
+    buttons = []
+    for p in panels:
+        pid = p["id"]
+        pname = p["name"]
+        pinterval = p.get("polling_interval", 5.0)
+        text += f"\n🔹 **{escape_md(pname)}** (Polling: `{pinterval}s`)"
+        buttons.append([create_button(f"⚙️ {pname}", callback_data=f"adm:api:view:{pid}", style="primary")])
+
+    buttons.append([create_button("➕ Connect New Panel", callback_data="adm:api:add", style="success")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_panel_manage_view(panel_id: str):
+    p = get_api_panel_sync(panel_id)
+    if not p:
+        return "⚠️ Panel not found.", InlineKeyboardMarkup([[create_button("Back to Panels", callback_data="adm:api:list", style="danger")]])
+
+    text = (
+        f"⚙️ **PANEL DETAILS: {escape_md(p['name'])}**\n\n"
+        f"📌 **Panel Name:** {escape_md(p['name'])}\n"
+        f"🔗 **Base URL:** `{escape_md(p['url'])}` \n"
+        f"🔑 **API Key/Token:** `{escape_md(p['token'])}` \n"
+        f"⏱️ **Polling Time:** `{p['polling_interval']}s`\n"
+    )
+    buttons = [
+        [create_button("🗑️ Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger")],
+        [create_button("Back to Panels", callback_data="adm:api:list", style="primary")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -979,6 +1055,14 @@ def migrate_sqlite_to_firebase():
         num, uid, srv, cnt = row
         db.reference(f"allocations/{num}").set({"user_id": uid, "service": srv, "country": cnt})
 
+    cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
+    rows = cursor.fetchall()
+    for row in rows:
+        pid, name, url, token, pinterval = row
+        db.reference(f"api_panels/{pid}").set({
+            "id": str(pid), "name": name, "url": url, "token": token, "polling_interval": pinterval
+        })
+
     existing_fb_settings = db.reference("settings").get() or {}
     cursor.execute("SELECT key, value FROM settings")
     rows = cursor.fetchall()
@@ -1016,7 +1100,11 @@ def run_flask():
     WAIT_SUPPORT,
     WAIT_OTP_LINK,
     WAIT_BROADCAST_MSG,
-) = range(8)
+    WAIT_PANEL_NAME,
+    WAIT_PANEL_URL,
+    WAIT_PANEL_TOKEN,
+    WAIT_PANEL_INTERVAL,
+) = range(12)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -1194,7 +1282,8 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "EDIT API" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
-        await update.message.reply_text("⚠️ **Edit API feature is currently unavailable.**", parse_mode="Markdown")
+        text_msg, kbd = build_api_panels_view()
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "NUMBER QUANTITY" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
@@ -1274,6 +1363,72 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'admin'
     return ConversationHandler.END
+
+
+# ---------------- API PANEL CONVERSATION ----------------
+@admin_only
+async def admin_add_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.message.reply_text("Enter the Panel Name (e.g., Main Provider, Panel 1):")
+    else:
+        await update.message.reply_text("Enter the Panel Name (e.g., Main Provider, Panel 1):")
+    return WAIT_PANEL_NAME
+
+
+async def receive_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['new_api_name'] = update.message.text.strip()
+    await update.message.reply_text("Enter Base API URL (e.g., http://domain.com/viewstasx):")
+    return WAIT_PANEL_URL
+
+
+async def receive_panel_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url_val = update.message.text.strip()
+    context.user_data['new_api_url'] = url_val
+    await update.message.reply_text("Enter API Key / Token:")
+    return WAIT_PANEL_TOKEN
+
+
+async def receive_panel_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['new_api_token'] = update.message.text.strip()
+    await update.message.reply_text("Enter Polling Interval in seconds (Default: 5, Min: 3.1, Max: 10):")
+    return WAIT_PANEL_INTERVAL
+
+
+async def receive_panel_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    input_text = update.message.text.strip()
+    try:
+        interval_val = float(input_text)
+        if interval_val < 3.1:
+            interval_val = 3.1
+        elif interval_val > 10.0:
+            interval_val = 10.0
+    except ValueError:
+        interval_val = 5.0
+
+    p_name = context.user_data.get('new_api_name')
+    p_url = context.user_data.get('new_api_url')
+    p_token = context.user_data.get('new_api_token')
+
+    if p_name and p_url and p_token:
+        pid = await run_db(save_api_panel_sync, p_name, p_url, p_token, interval_val)
+        await update.message.reply_text(
+            f"✅ **API Panel Connected Successfully!**\n\n"
+            f"📌 Name: `{escape_md(p_name)}` \n"
+            f"⏱️ Polling: `{interval_val}s`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Incomplete panel data. Please try again.")
+
+    context.user_data.pop('new_api_name', None)
+    context.user_data.pop('new_api_url', None)
+    context.user_data.pop('new_api_token', None)
+
+    text_msg, kbd = build_api_panels_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
 
 @admin_only
 async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1409,6 +1564,9 @@ async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TY
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
+    context.user_data.pop('new_api_name', None)
+    context.user_data.pop('new_api_url', None)
+    context.user_data.pop('new_api_token', None)
 
     if update.message and update.message.text:
         await handle_text_menu(update, context)
@@ -1517,6 +1675,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer()
 
+    # API Panel Inline Controls
+    elif data == "adm:api:list":
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        text, kbd = build_api_panels_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:api:view:"):
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        panel_id = data.split(":", 3)[3]
+        text, kbd = build_panel_manage_view(panel_id)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:api:delconf:"):
+        await query.answer()
+        if user_id != ADMIN_ID:
+            return
+        panel_id = data.split(":", 3)[3]
+        p = await run_db(get_api_panel_sync, panel_id)
+        if p:
+            text = f"⚠️ **ARE YOU SURE?**\n\nDo you really want to delete the panel **'{escape_md(p['name'])}'**?"
+            kbd = InlineKeyboardMarkup([
+                [
+                    create_button("✅ YES, DELETE", callback_data=f"adm:api:del:{panel_id}", style="danger"),
+                    create_button("❌ CANCEL", callback_data=f"adm:api:view:{panel_id}", style="primary")
+                ]
+            ])
+            await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:api:del:"):
+        if user_id != ADMIN_ID:
+            await query.answer()
+            return
+        panel_id = data.split(":", 3)[3]
+        await run_db(delete_api_panel_sync, panel_id)
+        await query.answer("Panel deleted successfully!", show_alert=True)
+        text, kbd = build_api_panels_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
     # User Get Number Flow
     elif data.startswith("srv_"):
         await query.answer()
@@ -1540,7 +1740,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons.append(row)
 
         buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
-        await query.edit_message_text(f"Select country for {escape_md(service)}:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        await query.edit_message_text(f"📍 Select country for {escape_md(service)}:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("cnt_"):
         await query.answer()
@@ -1578,12 +1778,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty, old_numbers)
 
         if new_numbers:
-            # IMPORTANT: old allocations are permanent and must never return to inventory.
-            # Do not release them here.
             await query.answer("Successfully changed all numbers!", show_alert=False)
             alloc_msg = (
                 "━━━━━━━━━━━━━━━\n"
-                f"{escape_md(service)} ➜ {escape_md(country)} {len(new_numbers)} Numbers Allocated:"
+                f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers Allocated:"
             )
             kbd = build_allocation_keyboard(service, country, new_numbers)
             await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -1591,7 +1789,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Sorry, not enough ({target_qty}) new numbers available to change!", show_alert=True)
 
 
-# ---------------- OTP POLLING SERVICE (CR API) ----------------
+# ---------------- OTP POLLING SERVICE & MULTI-API MANAGER ----------------
 def load_seen_otp_ids_sync() -> dict:
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         seen_ref = db.reference("seen_otp_ids").get()
@@ -1650,176 +1848,209 @@ def lookup_allocation_sync(num: str, clean_num: str):
     return None, None
 
 
-async def otp_poller(application: Application):
-    processed_ids = await run_db(load_seen_otp_ids_sync)
-
+async def process_otp_items(items: list, application: Application, processed_ids: dict):
     bot_info = await application.bot.get_me()
     bot_username = bot_info.username or ""
     bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
 
-    cycle_count = 0
+    ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+    show_msg_enabled = get_setting("show_message", "true") == "true"
+    dev_username = get_setting("dev_username", "developer")
+    dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
+    dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
 
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        payout_raw = item.get("payout", "0")
+        try:
+            payout_val = float(payout_raw)
+        except (ValueError, TypeError):
+            payout_val = 0.0
+
+        if payout_val <= 0.0:
+            continue
+
+        num = str(item.get("num", "")).strip()
+        msg = item.get("message", "")
+        dt = item.get("dt", "")
+        cli = item.get("cli", "")
+
+        if not num or not msg:
+            continue
+
+        unique_str = f"{num}_{dt}_{msg}"
+        msg_id = hashlib.md5(unique_str.encode()).hexdigest()
+
+        if msg_id in processed_ids:
+            continue
+
+        processed_ids[msg_id] = True
+        if len(processed_ids) > 2000:
+            for old_id in list(processed_ids.keys())[:1000]:
+                del processed_ids[old_id]
+
+        await run_db(mark_otp_seen_sync, msg_id)
+
+        clean_num = re.sub(r'\D', '', num)
+        allocated_user, service_name = await run_db(lookup_allocation_sync, num, clean_num)
+        if not service_name:
+            service_name = cli if cli else "Service"
+
+        otp_code = extract_otp(msg)
+
+        safe_msg = html.escape(msg)
+        safe_service = html.escape(service_name)
+        safe_num = html.escape(num)
+
+        masked_num = mask_number_aph(num)
+        safe_masked_num = html.escape(masked_num)
+
+        if OTP_GROUP_ID:
+            if show_msg_enabled:
+                group_text = (
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
+                    f"🌐 NUM: {safe_masked_num}\n\n"
+                    "🗨️ MESSAGE:\n"
+                    f"<blockquote expandable>{safe_msg}</blockquote>\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
+                )
+            else:
+                group_text = (
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
+                    f"🌐 NUM: {safe_masked_num}\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
+                )
+
+            group_kbd = InlineKeyboardMarkup([
+                [
+                    create_button("Channel", url=ch_link, style="primary"),
+                    create_button("Get Number", url=bot_link, style="primary")
+                ],
+                [
+                    create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                ]
+            ])
+            try:
+                await application.bot.send_message(
+                    chat_id=OTP_GROUP_ID,
+                    text=group_text,
+                    reply_markup=group_kbd,
+                    parse_mode="HTML",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True)
+                )
+            except Exception as e:
+                logging.error(f"Group Forward Error: {e}")
+
+        if allocated_user:
+            new_bal = await run_db(add_user_balance_sync, allocated_user, 1.0)
+            bal_str = f"{int(new_bal)}" if new_bal.is_integer() else f"{new_bal:.2f}"
+
+            if show_msg_enabled:
+                user_text = (
+                    "— — — — — — — — — —\n"
+                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
+                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
+                    "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
+                    f"<blockquote>💳 BALANCE ➜ {bal_str} TK</blockquote>\n"
+                    "🗨️ MESSAGE: \n"
+                    f"<blockquote expandable>{safe_msg}</blockquote>\n"
+                    "— — — — — — — — — —"
+                )
+            else:
+                user_text = (
+                    "— — — — — — — — — —\n"
+                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
+                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
+                    "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
+                    f"<blockquote>💳 BALANCE ➜ {bal_str} TK</blockquote>\n"
+                    "— — — — — — — — — —"
+                )
+
+            user_kbd = InlineKeyboardMarkup([
+                [
+                    create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                ]
+            ])
+            try:
+                await application.bot.send_message(
+                    chat_id=allocated_user,
+                    text=user_text,
+                    reply_markup=user_kbd,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.error(f"User Forward Error: {e}")
+
+
+async def poll_single_panel(panel_id: str, application: Application, processed_ids: dict):
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
+            panel = await run_db(get_api_panel_sync, panel_id)
+            if not panel:
+                break
+
+            url = panel["url"]
+            token = panel["token"]
+            interval = float(panel.get("polling_interval", 5.0))
+            if interval < 3.1:
+                interval = 3.1
+            elif interval > 10.0:
+                interval = 10.0
+
             try:
-                if API_URL:
-                    params = {}
-                    if API_TOKEN and "token=" not in API_URL:
-                        params["token"] = API_TOKEN
-                        params["records"] = 200
+                params = {"records": 200}
+                if token and "token=" not in url:
+                    params["token"] = token
 
-                    res = await client.get(API_URL, params=params if params else None)
-                    if res.status_code == 200:
-                        res_data = res.json()
-                        if res_data.get("status") == "success":
-                            items = res_data.get("data", [])
-                            if isinstance(items, list) and items:
-                                ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
-                                show_msg_enabled = get_setting("show_message", "true") == "true"
-                                dev_username = get_setting("dev_username", "developer")
-                                dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
-                                dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
-
-                                for item in items:
-                                    if not isinstance(item, dict):
-                                        continue
-
-                                    # 1. PAYOUT ZERO CHECK (Silent Skip)
-                                    payout_raw = item.get("payout", "0")
-                                    try:
-                                        payout_val = float(payout_raw)
-                                    except (ValueError, TypeError):
-                                        payout_val = 0.0
-
-                                    if payout_val <= 0.0:
-                                        continue
-
-                                    num = str(item.get("num", "")).strip()
-                                    msg = item.get("message", "")
-                                    dt = item.get("dt", "")
-                                    cli = item.get("cli", "")
-
-                                    if not num or not msg:
-                                        continue
-
-                                    unique_str = f"{num}_{dt}_{msg}"
-                                    msg_id = hashlib.md5(unique_str.encode()).hexdigest()
-
-                                    if msg_id in processed_ids:
-                                        continue
-
-                                    processed_ids[msg_id] = True
-                                    if len(processed_ids) > 2000:
-                                        for old_id in list(processed_ids.keys())[:1000]:
-                                            del processed_ids[old_id]
-
-                                    await run_db(mark_otp_seen_sync, msg_id)
-
-                                    clean_num = re.sub(r'\D', '', num)
-                                    allocated_user, service_name = await run_db(lookup_allocation_sync, num, clean_num)
-                                    if not service_name:
-                                        service_name = cli if cli else "Service"
-
-                                    otp_code = extract_otp(msg)
-
-                                    safe_msg = html.escape(msg)
-                                    safe_service = html.escape(service_name)
-                                    safe_num = html.escape(num)
-
-                                    # 2. MASKED NUMBER FOR GROUP
-                                    masked_num = mask_number_aph(num)
-                                    safe_masked_num = html.escape(masked_num)
-
-                                    # Send to OTP Forwarding Group (Masked Number)
-                                    if OTP_GROUP_ID:
-                                        if show_msg_enabled:
-                                            group_text = (
-                                                "━━━━━━━━━━━━━━━━━\n"
-                                                f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                                                f"🌐 NUM: {safe_masked_num}\n\n"
-                                                "🗨️ MESSAGE:\n"
-                                                f"<blockquote expandable>{safe_msg}</blockquote>\n"
-                                                "━━━━━━━━━━━━━━━━━\n"
-                                                f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
-                                            )
-                                        else:
-                                            group_text = (
-                                                "━━━━━━━━━━━━━━━━━\n"
-                                                f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                                                f"🌐 NUM: {safe_masked_num}\n"
-                                                "━━━━━━━━━━━━━━━━━\n"
-                                                f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
-                                            )
-
-                                        group_kbd = InlineKeyboardMarkup([
-                                            [
-                                                create_button("Channel", url=ch_link, style="primary"),
-                                                create_button("Get Number", url=bot_link, style="primary")
-                                            ],
-                                            [
-                                                create_button(f"{otp_code}", copy_text=otp_code, style="success")
-                                            ]
-                                        ])
-                                        try:
-                                            await application.bot.send_message(
-                                                chat_id=OTP_GROUP_ID,
-                                                text=group_text,
-                                                reply_markup=group_kbd,
-                                                parse_mode="HTML",
-                                                link_preview_options=LinkPreviewOptions(is_disabled=True)
-                                            )
-                                        except Exception as e:
-                                            logging.error(f"Group Forward Error: {e}")
-
-                                    # Send to User Inbox & Update Balance
-                                    if allocated_user:
-                                        new_bal = await run_db(add_user_balance_sync, allocated_user, 1.0)
-                                        bal_str = f"{int(new_bal)}" if new_bal.is_integer() else f"{new_bal:.2f}"
-
-                                        if show_msg_enabled:
-                                            user_text = (
-                                                "— — — — — — — — — —\n"
-                                                f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
-                                                f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
-                                                "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
-                                                f"<blockquote>💳 BALANCE ➜ {bal_str} TK</blockquote>\n"
-                                                "🗨️ MESSAGE: \n"
-                                                f"<blockquote expandable>{safe_msg}</blockquote>\n"
-                                                "— — — — — — — — — —"
-                                            )
-                                        else:
-                                            user_text = (
-                                                "— — — — — — — — — —\n"
-                                                f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
-                                                f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
-                                                "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
-                                                f"<blockquote>💳 BALANCE ➜ {bal_str} TK</blockquote>\n"
-                                                "— — — — — — — — — —"
-                                            )
-
-                                        user_kbd = InlineKeyboardMarkup([
-                                            [
-                                                create_button(f"{otp_code}", copy_text=otp_code, style="success")
-                                            ]
-                                        ])
-                                        try:
-                                            await application.bot.send_message(
-                                                chat_id=allocated_user,
-                                                text=user_text,
-                                                reply_markup=user_kbd,
-                                                parse_mode="HTML"
-                                            )
-                                        except Exception as e:
-                                            logging.error(f"User Forward Error: {e}")
-
+                res = await client.get(url, params=params if params else None)
+                if res.status_code == 200:
+                    res_data = res.json()
+                    if res_data.get("status") == "success":
+                        items = res_data.get("data", [])
+                        if isinstance(items, list) and items:
+                            await process_otp_items(items, application, processed_ids)
             except Exception as e:
-                logging.error(f"Polling Exception: {e}")
+                logging.error(f"Polling Exception for Panel {panel_id}: {e}")
+
+            await asyncio.sleep(interval)
+
+
+async def otp_poller_manager(application: Application):
+    processed_ids = await run_db(load_seen_otp_ids_sync)
+    cycle_count = 0
+
+    while True:
+        try:
+            panels = await run_db(get_all_api_panels_sync)
+            active_ids = {str(p["id"]) for p in panels}
+
+            for pid in list(PANEL_TASKS.keys()):
+                if pid not in active_ids or PANEL_TASKS[pid].done():
+                    if not PANEL_TASKS[pid].done():
+                        PANEL_TASKS[pid].cancel()
+                    del PANEL_TASKS[pid]
+
+            for p in panels:
+                pid = str(p["id"])
+                if pid not in PANEL_TASKS or PANEL_TASKS[pid].done():
+                    PANEL_TASKS[pid] = asyncio.create_task(
+                        poll_single_panel(pid, application, processed_ids)
+                    )
 
             cycle_count += 1
-            if cycle_count % CLEANUP_EVERY_N_CYCLES == 0:
+            if cycle_count % 120 == 0:
                 await run_db(cleanup_old_otp_ids_sync)
 
-            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"OTP Poller Manager Error: {e}")
+
+        await asyncio.sleep(5)
 
 
 # ---------------- MAIN FUNCTION ----------------
@@ -1832,6 +2063,7 @@ def main():
         entry_points=[
             CallbackQueryHandler(admin_add_service_start, pattern="^adm:srv:add$"),
             CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
+            CallbackQueryHandler(admin_add_panel_start, pattern="^adm:api:add$"),
             CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
@@ -1843,6 +2075,10 @@ def main():
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
             ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_name)],
             ADD_NUMBERS: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & ~MENU_FILTER, receive_numbers)],
+            WAIT_PANEL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_name)],
+            WAIT_PANEL_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_url)],
+            WAIT_PANEL_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_token)],
+            WAIT_PANEL_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_interval)],
             WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL & ~MENU_FILTER, receive_firebase_file)],
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
             WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_support_link)],
@@ -1862,7 +2098,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     async def post_init(app: Application):
-        asyncio.create_task(otp_poller(app))
+        asyncio.create_task(otp_poller_manager(app))
 
     application.post_init = post_init
     application.run_polling()
