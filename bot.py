@@ -8,6 +8,9 @@ import sqlite3
 import threading
 import hashlib
 import html
+import time
+from functools import wraps
+
 import httpx
 from dotenv import load_dotenv
 
@@ -19,7 +22,7 @@ except ImportError:
     HAS_FIREBASE_LIB = False
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,17 +43,27 @@ if not TOKEN:
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-API_URL = os.environ.get("API_URL", "http://147.135.212.197/crapi/had/viewstats")
+
+# FIXED: no more hardcoded IP/URL default — must be set via env now.
+API_URL = os.environ.get("API_URL", "")
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
 FIREBASE_JSON_PATH = "temp_firebase.json"
 CURRENT_DB_MODE = "SQLite (Local)"
 
+# How long a processed OTP id is kept before cleanup is allowed to remove it.
+OTP_ID_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
+CLEANUP_EVERY_N_CYCLES = 720  # ~1 hour at the 5s poll interval
+
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Back)$")
+if not API_URL:
+    logging.warning("API_URL is not set — OTP polling will stay idle until it's configured in the environment.")
+
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Back)$")
 
 
+# ---------------- PURE HELPERS (no I/O — safe to call directly) ----------------
 def escape_md(text: str) -> str:
     """Markdown special characters escape logic"""
     if not text:
@@ -76,16 +89,16 @@ def extract_otp(text: str) -> str:
     """Extracts 4 to 8 digit OTP code from message text after stripping space, /, -"""
     if not text:
         return "N/A"
-    
+
     match = re.search(r'\b\d{4,8}\b', text)
     if match:
         return match.group(0)
-    
+
     cleaned = re.sub(r'[\s/\-]', '', text)
     match = re.search(r'\d{4,8}', cleaned)
     if match:
         return match.group(0)
-    
+
     return "N/A"
 
 
@@ -99,8 +112,29 @@ def mask_number(num: str) -> str:
     return s
 
 
+def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> dict:
+    btn = {"text": str(text).upper() if text else ""}
+    if callback_data:
+        btn["callback_data"] = callback_data
+    if url:
+        btn["url"] = url
+    if copy_text:
+        btn["copy_text"] = {"text": copy_text}
+    if style:
+        btn["style"] = style
+    return btn
+
+
+# ---------------- DATABASE (SYNC / BLOCKING — always call via run_db from async code) ----------------
 def get_db_connection():
-    return sqlite3.connect("bot_database.db", timeout=10)
+    conn = sqlite3.connect("bot_database.db", timeout=10)
+    # WAL mode lets readers and writers work concurrently instead of locking the
+    # whole file on every write — matters once you have many users hitting the
+    # bot at once. busy_timeout makes concurrent writers wait instead of
+    # instantly failing with "database is locked".
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
 
 
 def init_sqlite():
@@ -108,15 +142,9 @@ def init_sqlite():
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance REAL DEFAULT 0
+            user_id INTEGER PRIMARY KEY
         )
     ''')
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS services (
             service_name TEXT,
@@ -144,7 +172,8 @@ def init_sqlite():
     ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS seen_otps (
-            msg_id TEXT PRIMARY KEY
+            msg_id TEXT PRIMARY KEY,
+            ts INTEGER DEFAULT 0
         )
     ''')
     cursor.execute('''
@@ -153,79 +182,51 @@ def init_sqlite():
             value TEXT
         )
     ''')
+
+    # Safe upgrade path if this is an older DB file created before the ts column existed.
+    try:
+        cursor.execute("ALTER TABLE seen_otps ADD COLUMN ts INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_numbers_lookup ON numbers (service, country, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_seen_otps_ts ON seen_otps (ts)")
+
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', '1')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
     conn.commit()
     conn.close()
 
 init_sqlite()
 
 
+# ---------------- ASYNC <-> BLOCKING BRIDGE ----------------
+async def run_db(func, *args, **kwargs):
+    """
+    Runs a blocking sqlite3 / firebase_admin call on a worker thread so it never
+    freezes the bot's event loop. Use this for EVERY DB/Firebase call made from
+    inside an `async def` handler.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 def save_user(user_id: int):
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
-            user_ref = db.reference(f"users/{user_id}").get()
-            if not user_ref:
-                db.reference(f"users/{user_id}").set({"exists": True, "balance": 0.0})
+            db.reference(f"users/{user_id}").set(True)
         except Exception as e:
             logging.error(f"Error saving user to Firebase: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
         conn.close()
     except Exception as e:
         logging.error(f"Error saving user to SQLite: {e}")
-
-
-def get_user_balance(user_id: int) -> float:
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            val = db.reference(f"users/{user_id}/balance").get()
-            if val is not None:
-                return float(val)
-        except Exception as e:
-            logging.error(f"Error reading balance from Firebase: {e}")
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0] is not None:
-            return float(row[0])
-    except Exception as e:
-        logging.error(f"Error reading balance from SQLite: {e}")
-
-    return 0.0
-
-
-def add_user_balance(user_id: int, amount: float) -> float:
-    current = get_user_balance(user_id)
-    new_bal = current + amount
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"users/{user_id}/balance").set(new_bal)
-        except Exception as e:
-            logging.error(f"Error updating balance in Firebase: {e}")
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Error updating balance in SQLite: {e}")
-
-    return new_bal
 
 
 def get_all_users() -> list:
@@ -234,7 +235,7 @@ def get_all_users() -> list:
         try:
             fb_users = db.reference("users").get()
             if fb_users and isinstance(fb_users, dict):
-                users = [int(uid) for uid in fb_users.keys() if str(uid).isdigit()]
+                users = [int(uid) for uid in fb_users.keys() if uid.isdigit()]
         except Exception as e:
             logging.error(f"Error fetching users from Firebase: {e}")
 
@@ -249,14 +250,6 @@ def get_all_users() -> list:
             logging.error(f"Error fetching users from SQLite: {e}")
 
     return list(set(users))
-
-
-def create_button(text: str, callback_data: str = None, url: str = None, copy_text: str = None, style: str = None) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text=str(text).upper() if text else "",
-        callback_data=callback_data,
-        url=url
-    )
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -318,8 +311,8 @@ def sync_firebase_to_sqlite():
             conn = get_db_connection()
             cursor = conn.cursor()
             for uid in fb_users.keys():
-                if str(uid).isdigit():
-                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (int(uid),))
+                if uid.isdigit():
+                    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (int(uid),))
             conn.commit()
             conn.close()
     except Exception as e:
@@ -390,11 +383,189 @@ def delete_country_db(service: str, country: str):
     conn.close()
 
 
+def get_countries_for_service(service: str) -> list:
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        countries_ref = db.reference(f"services/{service}").get()
+        if countries_ref and isinstance(countries_ref, dict):
+            return list(countries_ref.keys())
+        return []
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT country_name FROM services WHERE service_name = ?", (service,))
+    countries = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return countries
+
+
+def save_numbers_sync(service: str, country: str, numbers: list) -> int:
+    """
+    Adds a batch of numbers. FIXED: Firebase used to do one network round-trip
+    PER NUMBER in a loop — for a batch of hundreds of numbers this alone could
+    take minutes and (before the run_db fix) froze the whole bot the entire
+    time. Now the whole batch is built locally and pushed in ONE `.update()`
+    call.
+    """
+    valid_count = 0
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        ref = db.reference(f"numbers/{service}/{country}")
+        batch = {}
+        for num in numbers:
+            clean_num = re.sub(r'\D', '', num)
+            if clean_num:
+                batch[clean_num] = {"number": clean_num, "status": "available", "user_id": 0}
+                valid_count += 1
+        if batch:
+            ref.update(batch)
+            db.reference(f"services/{service}/{country}").set(True)
+        return valid_count
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
+    for num in numbers:
+        clean_num = re.sub(r'\D', '', num)
+        if clean_num:
+            cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
+            valid_count += 1
+    conn.commit()
+    conn.close()
+    return valid_count
+
+
+def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: int, exclude: list = None) -> list:
+    """
+    Atomically grabs up to `target_qty` available numbers and marks them
+    allocated to user_id. Returns the assigned numbers, or [] if not enough
+    were available (nothing is left half-allocated either way).
+
+    FIXED (race condition): the Firebase path used to read available numbers
+    then write them back in separate steps — with two users clicking at the
+    same moment, both could read the SAME "available" number before either
+    write landed, and both would get it. Now wrapped in a Firebase transaction,
+    which retries automatically if another request modified the data in
+    between, guaranteeing each number goes to exactly one user.
+    The SQLite path was already safe (BEGIN IMMEDIATE gives an exclusive lock).
+
+    `exclude` lets "Change All" avoid re-picking numbers the user already has.
+    """
+    exclude = exclude or []
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        ref = db.reference(f"numbers/{service}/{country}")
+        result_holder = {"nums": []}
+
+        def txn(current_data):
+            result_holder["nums"] = []
+            if not current_data or not isinstance(current_data, dict):
+                return current_data
+            picked = 0
+            for key, val in current_data.items():
+                if picked >= target_qty:
+                    break
+                if not isinstance(val, dict):
+                    continue
+                num_val = str(val.get("number", key))
+                if val.get("status") == "available" and num_val not in exclude:
+                    val["status"] = "allocated"
+                    val["user_id"] = user_id
+                    result_holder["nums"].append(num_val)
+                    picked += 1
+            return current_data
+
+        try:
+            ref.transaction(txn)
+        except Exception as e:
+            logging.error(f"Firebase allocation transaction failed: {e}")
+            return []
+
+        assigned = result_holder["nums"]
+
+        if len(assigned) < target_qty:
+            # Not enough numbers were available — release whatever we grabbed.
+            for num in assigned:
+                db.reference(f"numbers/{service}/{country}/{num}").update({"status": "available", "user_id": 0})
+            return []
+
+        for num in assigned:
+            db.reference(f"allocations/{num}").set({"user_id": user_id, "service": service, "country": country})
+        return assigned
+
+    # SQLite path
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("BEGIN IMMEDIATE")
+    try:
+        if exclude:
+            placeholders = ','.join(['?'] * len(exclude))
+            sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
+            params = [service, country] + exclude + [target_qty]
+        else:
+            sql = "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?"
+            params = [service, country, target_qty]
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+
+        if not rows or len(rows) < target_qty:
+            conn.rollback()
+            return []
+
+        assigned = []
+        for num_id, num in rows:
+            num_str = str(num)
+            assigned.append(num_str)
+            cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
+            cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (num_str, user_id, service, country))
+        conn.commit()
+        return assigned
+    finally:
+        conn.close()
+
+
+def release_numbers_sync(service: str, country: str, numbers: list):
+    """Frees numbers back to the pool and removes their allocation record."""
+    if not numbers:
+        return
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        for num in numbers:
+            db.reference(f"numbers/{service}/{country}/{num}").update({"status": "available", "user_id": 0})
+            db.reference(f"allocations/{num}").delete()
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for num in numbers:
+        cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (num,))
+        cursor.execute("DELETE FROM allocations WHERE number = ?", (num,))
+    conn.commit()
+    conn.close()
+
+
+def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        alloc_ref = db.reference("allocations").get()
+        result = []
+        if alloc_ref and isinstance(alloc_ref, dict):
+            for num_k, num_v in alloc_ref.items():
+                if isinstance(num_v, dict) and num_v.get("user_id") == user_id and num_v.get("service") == service and num_v.get("country") == country:
+                    result.append(str(num_k))
+        return result
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT number FROM allocations WHERE user_id = ? AND service = ? AND country = ?", (user_id, service, country))
+    result = [str(r[0]) for r in cursor.fetchall()]
+    conn.close()
+    return result
+
+
+# ---------------- VIEW BUILDERS (sync — call via run_db from async code) ----------------
 def build_admin_services_view():
     summary = get_admin_services_summary()
     if not summary:
         text = "📱 **SERVICES MANAGEMENT**\n\nNo services added yet."
-        buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add")]]
+        buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
         return text, InlineKeyboardMarkup(buttons)
 
     text = "📱 **SERVICES MANAGEMENT**\n\nBelow is the summary of your added services and available numbers:\n"
@@ -404,9 +575,9 @@ def build_admin_services_view():
         text += f"\n🔹 **{escape_md(srv)}** (Total Available: `{total_avail}`)"
         for cnt, count in cnts.items():
             text += f"\n   └ {escape_md(cnt)}: `{count}`"
-        buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}")])
+        buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
 
-    buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add")])
+    buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -425,12 +596,12 @@ def build_service_manage_view(service: str):
         text += "No countries configured.\n"
 
     buttons = [
-        [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}")],
-        [create_button("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}")],
+        [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}", style="success")],
+        [create_button("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}", style="danger")],
     ]
     if cnts:
-        buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}")])
-    buttons.append([create_button("Back to Services", callback_data="adm:srv:list")])
+        buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}", style="danger")])
+    buttons.append([create_button("Back to Services", callback_data="adm:srv:list", style="danger")])
 
     return text, InlineKeyboardMarkup(buttons)
 
@@ -449,11 +620,11 @@ def build_edit_links_view():
     )
     buttons = [
         [
-            create_button("📢 Edit Channel", callback_data="adm:set:channel"),
-            create_button("🎧 Edit Support", callback_data="adm:set:support")
+            create_button("📢 Edit Channel", callback_data="adm:set:channel", style="primary"),
+            create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")
         ],
         [
-            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink")
+            create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -464,30 +635,15 @@ def build_number_quantity_view():
     text = f"🔢 **NUMBER QUANTITY SETTINGS**\n\nSelect how many numbers a user receives per request.\nCurrent setting: `{current_qty}`"
     buttons = [
         [
-            create_button("1", callback_data="adm:setqty:1"),
-            create_button("2", callback_data="adm:setqty:2"),
-            create_button("3", callback_data="adm:setqty:3")
+            create_button("1", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success"),
+            create_button("2", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success"),
+            create_button("3", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success")
         ],
         [
-            create_button("4", callback_data="adm:setqty:4"),
-            create_button("5", callback_data="adm:setqty:5"),
-            create_button("6", callback_data="adm:setqty:6")
+            create_button("4", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
+            create_button("5", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
+            create_button("6", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")
         ]
-    ]
-    return text, InlineKeyboardMarkup(buttons)
-
-
-def build_extra_settings_view():
-    show_msg = get_setting("show_message", "1")
-    status_text = "ENABLED 🟢" if show_msg == "1" else "DISABLED 🔴"
-    
-    text = (
-        f"⚙️ **EXTRA SETTINGS**\n\n"
-        f"📩 **Show OTP Message:** `{status_text}`\n\n"
-        f"Click below to toggle showing OTP message text in Group & User Inbox."
-    )
-    buttons = [
-        [create_button(f"Show Message: {status_text}", callback_data="adm:set:toggle_msg")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -496,13 +652,13 @@ def build_allocation_keyboard(service: str, country: str, numbers: list):
     otp_group_link = clean_tg_link(get_setting("otp_group_link", "https://t.me/your_otp_group"))
     buttons = []
     for num in numbers:
-        buttons.append([create_button(f"{num}", callback_data="ignore")])
+        buttons.append([create_button(f"{num}", copy_text=str(num), style="success")])
 
     buttons.append([
-        create_button("Change All", callback_data=f"chg:{service}:{country}"),
-        create_button("OTP Group", url=otp_group_link)
+        create_button("Change All", callback_data=f"chg:{service}:{country}", style="primary"),
+        create_button("OTP Group", url=otp_group_link, style="primary")
     ])
-    buttons.append([create_button("Back", callback_data=f"srv_{service}")])
+    buttons.append([create_button("Back", callback_data=f"srv_{service}", style="danger")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -525,14 +681,15 @@ def get_services_keyboard():
     buttons = []
     for i in range(0, len(services), 2):
         row = []
-        row.append(create_button(services[i], callback_data=f"srv_{services[i]}"))
+        row.append(create_button(services[i], callback_data=f"srv_{services[i]}", style="primary"))
         if i + 1 < len(services):
-            row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}"))
+            row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}", style="primary"))
         buttons.append(row)
 
     return InlineKeyboardMarkup(buttons), "📍 Please select a service:"
 
 
+# ---------------- FIREBASE CONNECTION MANAGEMENT ----------------
 def init_firebase_system(run_migration=False, force_reinit=False):
     global CURRENT_DB_MODE
     if not HAS_FIREBASE_LIB:
@@ -576,7 +733,7 @@ def init_firebase_system(run_migration=False, force_reinit=False):
                 options['databaseURL'] = DATABASE_URL
             firebase_admin.initialize_app(cred, options if options else None)
             CURRENT_DB_MODE = "Firebase (Cloud)"
-            
+
             sync_firebase_to_sqlite()
             if run_migration:
                 migrate_sqlite_to_firebase()
@@ -596,10 +753,10 @@ def migrate_sqlite_to_firebase():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT user_id, balance FROM users")
+    cursor.execute("SELECT user_id FROM users")
     users = cursor.fetchall()
     for u in users:
-        db.reference(f"users/{u[0]}").set({"exists": True, "balance": u[1] if u[1] is not None else 0})
+        db.reference(f"users/{u[0]}").set(True)
 
     cursor.execute("SELECT service, country, number, status, user_id FROM numbers")
     rows = cursor.fetchall()
@@ -653,33 +810,76 @@ def run_flask():
 ) = range(8)
 
 
+# ---------------- AUTH DECORATOR ----------------
+def admin_only(func):
+    """
+    Guards a conversation entry-point handler so only ADMIN_ID can trigger it.
+    Answers the callback query (if any) exactly once, up front, so the
+    individual handlers below no longer need to repeat that boilerplate.
+    """
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        query = update.callback_query
+        user = update.effective_user
+        if query:
+            await query.answer()
+        if not user or user.id != ADMIN_ID:
+            return ConversationHandler.END
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
 # ---------------- KEYBOARDS ----------------
 def get_main_keyboard(user_id: int):
     keyboard_layout = [
-        [KeyboardButton("GET NUMBER")],
-        [KeyboardButton("PROFILE"), KeyboardButton("WALLET")],
-        [KeyboardButton("CHANNEL"), KeyboardButton("SUPPORT")]
+        [
+            {"text": "GET NUMBER", "style": "success"}
+        ],
+        [
+            {"text": "PROFILE", "style": "primary"},
+            {"text": "WALLET", "style": "primary"}
+        ],
+        [
+            {"text": "CHANNEL", "style": "danger"},
+            {"text": "SUPPORT", "style": "danger"}
+        ]
     ]
     if user_id == ADMIN_ID:
-        keyboard_layout.append([KeyboardButton("ADMIN PANEL")])
-        
+        keyboard_layout.append([{"text": "ADMIN PANEL", "style": "danger"}])
+
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 def get_admin_keyboard():
     keyboard_layout = [
-        [KeyboardButton("SERVICES"), KeyboardButton("ADMIN CONTROL")],
-        [KeyboardButton("GLOBAL SETTINGS"), KeyboardButton("BROADCAST")],
-        [KeyboardButton("BACK")]
+        [
+            {"text": "SERVICES", "style": "primary"},
+            {"text": "ADMIN CONTROL", "style": "primary"}
+        ],
+        [
+            {"text": "GLOBAL SETTINGS", "style": "primary"},
+            {"text": "BROADCAST", "style": "success"}
+        ],
+        [
+            {"text": "BACK", "style": "danger"}
+        ]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
 def get_global_settings_keyboard():
     keyboard_layout = [
-        [KeyboardButton("EDIT LINKS"), KeyboardButton("EDIT API")],
-        [KeyboardButton("NUMBER QUANTITY"), KeyboardButton("CONNECT FIREBASE")],
-        [KeyboardButton("EXTRA"), KeyboardButton("BACK")]
+        [
+            {"text": "EDIT LINKS", "style": "primary"},
+            {"text": "EDIT API", "style": "primary"}
+        ],
+        [
+            {"text": "NUMBER QUANTITY", "style": "primary"},
+            {"text": "CONNECT FIREBASE", "style": "primary"}
+        ],
+        [
+            {"text": "BACK", "style": "danger"}
+        ]
     ]
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
@@ -687,7 +887,7 @@ def get_global_settings_keyboard():
 # ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    save_user(user_id)
+    await run_db(save_user, user_id)
 
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
@@ -700,12 +900,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
-    save_user(user_id)
+    await run_db(save_user, user_id)
 
     text_upper = text.strip().upper()
 
     if text_upper == "GET NUMBER":
-        kbd, msg = get_services_keyboard()
+        kbd, msg = await run_db(get_services_keyboard)
         if not kbd:
             await update.message.reply_text(msg)
         else:
@@ -715,50 +915,48 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         first_name = escape_md(update.effective_user.first_name or "User")
         bot_username = context.bot.username or "bot"
         refer_link = f"https://t.me/{bot_username}?start={user_id}"
-        bal = get_user_balance(user_id)
-        
+
         profile_text = (
             f"👤 **USER PROFILE**\n\n"
             f"📝 **Name:** {first_name}\n"
             f"🆔 **ID:** `{user_id}`\n"
-            f"💰 **Balance:** `{bal:.2f} ৳`"
+            f"💰 **Balance:** `0.00 ৳`"
         )
         kbd = InlineKeyboardMarkup([
-            [create_button("Referral Link", url=refer_link)]
+            [create_button("Referral Link", copy_text=refer_link, style="success")]
         ])
         await update.message.reply_text(profile_text, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "WALLET":
-        bal = get_user_balance(user_id)
         wallet_text = (
             f"👛 **YOUR WALLET**\n\n"
             f"🆔 **User ID:** `{user_id}`\n"
-            f"💰 **Balance:** `{bal:.2f} ৳`"
+            f"💰 **Balance:** `0.00 ৳`"
         )
         await update.message.reply_text(wallet_text, parse_mode="Markdown")
 
     elif text_upper == "CHANNEL":
-        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
+        ch_link = clean_tg_link(await run_db(get_setting, "channel", "https://t.me/your_channel"))
         kbd = InlineKeyboardMarkup([
-            [create_button("Join Channel", url=ch_link)]
+            [create_button("Join Channel", url=ch_link, style="primary")]
         ])
         await update.message.reply_text("Click below to join our official channel:", reply_markup=kbd)
 
     elif text_upper == "SUPPORT":
-        sp_link = clean_tg_link(get_setting("support", "@your_support"))
-        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
-        
+        sp_link = clean_tg_link(await run_db(get_setting, "support", "@your_support"))
+        ch_link = clean_tg_link(await run_db(get_setting, "channel", "https://t.me/your_channel"))
+
         kbd = InlineKeyboardMarkup([
             [
-                create_button("Support", url=sp_link),
-                create_button("Channel", url=ch_link)
+                create_button("Support", url=sp_link, style="primary"),
+                create_button("Channel", url=ch_link, style="primary")
             ]
         ])
         await update.message.reply_text("Click below to contact support or join our channel:", reply_markup=kbd)
 
     elif text_upper == "ADMIN PANEL" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
-        total_users = len(get_all_users())
+        total_users = len(await run_db(get_all_users))
         await update.message.reply_text(
             f"**ADMIN PANEL**\n\n"
             f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
@@ -769,7 +967,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "SERVICES" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = build_admin_services_view()
+        text_msg, kbd = await run_db(build_admin_services_view)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "GLOBAL SETTINGS" and user_id == ADMIN_ID:
@@ -782,7 +980,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "EDIT LINKS" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = build_edit_links_view()
+        text_msg, kbd = await run_db(build_edit_links_view)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "EDIT API" and user_id == ADMIN_ID:
@@ -791,12 +989,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "NUMBER QUANTITY" and user_id == ADMIN_ID:
         context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = build_number_quantity_view()
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
-    elif text_upper == "EXTRA" and user_id == ADMIN_ID:
-        context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = build_extra_settings_view()
+        text_msg, kbd = await run_db(build_number_quantity_view)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "ADMIN CONTROL" and user_id == ADMIN_ID:
@@ -807,7 +1000,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         curr_menu = context.user_data.get('current_menu', 'main')
         if curr_menu == 'global_settings' and user_id == ADMIN_ID:
             context.user_data['current_menu'] = 'admin'
-            total_users = len(get_all_users())
+            total_users = len(await run_db(get_all_users))
             await update.message.reply_text(
                 f"**ADMIN PANEL**\n\n"
                 f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
@@ -821,19 +1014,15 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
+@admin_only
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
-        return ConversationHandler.END
     await query.message.reply_text("Enter the service name (e.g., TikTok, Facebook):")
     return ADD_SERVICE
 
+@admin_only
 async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
-        return ConversationHandler.END
     service = query.data.split(":", 3)[3]
     context.user_data['service_name'] = service
     await query.message.reply_text(f"Service **{escape_md(service)}** selected.\n\nEnter country name (e.g., Bangladesh, Nepal):", parse_mode="Markdown")
@@ -862,27 +1051,10 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = context.user_data.get('country_name')
 
     if service and country and numbers:
-        valid_count = 0
-        if CURRENT_DB_MODE == "Firebase (Cloud)":
-            ref = db.reference(f"numbers/{service}/{country}")
-            for num in numbers:
-                clean_num = re.sub(r'\D', '', num)
-                if clean_num:
-                    ref.child(clean_num).set({"number": clean_num, "status": "available", "user_id": 0})
-                    valid_count += 1
-            db.reference(f"services/{service}/{country}").set(True)
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
-            for num in numbers:
-                clean_num = re.sub(r'\D', '', num)
-                if clean_num:
-                    cursor.execute("INSERT INTO numbers (service, country, number, status) VALUES (?, ?, ?, 'available')", (service, country, clean_num))
-                    valid_count += 1
-            conn.commit()
-            conn.close()
-
+        # FIXED: this used to loop and do one blocking DB/Firebase call per
+        # number directly on the event loop — freezing the whole bot for large
+        # batches. Now the whole batch is built + pushed off-thread in one go.
+        valid_count = await run_db(save_numbers_sync, service, country, numbers)
         await update.message.reply_text(f"Successfully added {valid_count} numbers!", reply_markup=get_admin_keyboard())
     else:
         await update.message.reply_text("Incomplete data provided. Please try again.", reply_markup=get_admin_keyboard())
@@ -892,13 +1064,9 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['current_menu'] = 'admin'
     return ConversationHandler.END
 
+@admin_only
 async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return ConversationHandler.END
-
     if update.callback_query:
-        await update.callback_query.answer()
         await update.callback_query.message.reply_text("Please send the Firebase `.json` service account file:")
     else:
         await update.message.reply_text("Please send the Firebase `.json` service account file:")
@@ -912,7 +1080,7 @@ async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TY
     file = await context.bot.get_file(update.message.document.file_id)
     await file.download_to_drive(FIREBASE_JSON_PATH)
 
-    success = init_firebase_system(run_migration=True, force_reinit=True)
+    success = await run_db(init_firebase_system, run_migration=True, force_reinit=True)
     if success:
         await update.message.reply_text("Firebase file received! Database successfully connected and migrated to Firebase. 🚀", reply_markup=get_admin_keyboard())
     else:
@@ -924,12 +1092,10 @@ async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 # Global Settings Handlers
+@admin_only
 async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
-        await query.answer()
-        if query.from_user.id != ADMIN_ID:
-            return ConversationHandler.END
         await query.message.reply_text("Enter the new channel link (e.g., https://t.me/your_channel or @your_channel):")
     return WAIT_CHANNEL
 
@@ -939,18 +1105,16 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
 
-    set_setting("channel", new_link)
+    await run_db(set_setting, "channel", new_link)
     await update.message.reply_text(f"✅ Channel link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = build_edit_links_view()
+    text_msg, kbd = await run_db(build_edit_links_view)
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
+@admin_only
 async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
-        await query.answer()
-        if query.from_user.id != ADMIN_ID:
-            return ConversationHandler.END
         await query.message.reply_text("Enter the new support username/link (e.g., @your_support or https://t.me/your_support):")
     return WAIT_SUPPORT
 
@@ -960,18 +1124,16 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid username/link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_SUPPORT
 
-    set_setting("support", new_link)
+    await run_db(set_setting, "support", new_link)
     await update.message.reply_text(f"✅ Support username/link updated successfully!\nCurrent support: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = build_edit_links_view()
+    text_msg, kbd = await run_db(build_edit_links_view)
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
+@admin_only
 async def set_otplink_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
-        await query.answer()
-        if query.from_user.id != ADMIN_ID:
-            return ConversationHandler.END
         await query.message.reply_text("Enter the new OTP Group link (e.g., https://t.me/your_otp_group):")
     return WAIT_OTP_LINK
 
@@ -981,19 +1143,16 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid link! Please enter a valid group link.\nType /cancel to abort.")
         return WAIT_OTP_LINK
 
-    set_setting("otp_group_link", new_link)
+    await run_db(set_setting, "otp_group_link", new_link)
     await update.message.reply_text(f"✅ OTP Group link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
-    text_msg, kbd = build_edit_links_view()
+    text_msg, kbd = await run_db(build_edit_links_view)
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 # Broadcast Handlers
+@admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return ConversationHandler.END
-
-    all_users = get_all_users()
+    all_users = await run_db(get_all_users)
     await update.message.reply_text(
         f"📢 **BROADCAST SYSTEM**\n\n"
         f"Target Audience: `{len(all_users)}` users\n\n"
@@ -1003,12 +1162,9 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return WAIT_BROADCAST_MSG
 
+@admin_only
 async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return ConversationHandler.END
-
-    all_users = get_all_users()
+    all_users = await run_db(get_all_users)
     if not all_users:
         await update.message.reply_text("No users found in database to broadcast.", reply_markup=get_admin_keyboard())
         return ConversationHandler.END
@@ -1056,50 +1212,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
-    save_user(user_id)
+    await run_db(save_user, user_id)
 
-    if data == "ignore":
-        await query.answer()
-        return
-
+    # FIXED: this used to be `if ... elif ... elif ...` followed by a SEPARATE
+    # `if data == "adm:srv:list":` chain further down — meaning a match in the
+    # first chain would still fall through and get (harmlessly, but
+    # confusingly) re-checked against the second chain. It's now one single
+    # elif chain, dispatched once.
     if data == "back_to_services":
         await query.answer()
-        kbd, msg = get_services_keyboard()
+        kbd, msg = await run_db(get_services_keyboard)
         if not kbd:
             await query.edit_message_text(msg)
         else:
             await query.edit_message_text(msg, reply_markup=kbd)
-        return
 
-    # Admin Settings Handlers
     elif data.startswith("adm:setqty:"):
         await query.answer()
         if user_id != ADMIN_ID:
             return
         qty_val = data.split(":", 2)[2]
-        set_setting("number_quantity", qty_val)
+        await run_db(set_setting, "number_quantity", qty_val)
         await query.answer(f"Number quantity set to {qty_val}!", show_alert=True)
-        text_msg, kbd = build_number_quantity_view()
+        text_msg, kbd = await run_db(build_number_quantity_view)
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    elif data == "adm:set:toggle_msg":
+    elif data == "adm:srv:list":
         await query.answer()
         if user_id != ADMIN_ID:
             return
-        curr = get_setting("show_message", "1")
-        new_val = "0" if curr == "1" else "1"
-        set_setting("show_message", new_val)
-        status_lbl = "ENABLED" if new_val == "1" else "DISABLED"
-        await query.answer(f"Show Message setting changed to {status_lbl}!", show_alert=True)
-        text_msg, kbd = build_extra_settings_view()
-        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-
-    # Admin Management Actions
-    if data == "adm:srv:list":
-        await query.answer()
-        if user_id != ADMIN_ID:
-            return
-        text, kbd = build_admin_services_view()
+        text, kbd = await run_db(build_admin_services_view)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:view:"):
@@ -1107,7 +1249,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             return
         service = data.split(":", 3)[3]
-        text, kbd = build_service_manage_view(service)
+        text, kbd = await run_db(build_service_manage_view, service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:srv:del:"):
@@ -1115,9 +1257,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             return
         service = data.split(":", 3)[3]
-        delete_service_db(service)
+        await run_db(delete_service_db, service)
         await query.answer(f"Service {service} deleted successfully!", show_alert=True)
-        text, kbd = build_admin_services_view()
+        text, kbd = await run_db(build_admin_services_view)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:delli:"):
@@ -1125,12 +1267,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID:
             return
         service = data.split(":", 3)[3]
-        summary = get_admin_services_summary()
+        summary = await run_db(get_admin_services_summary)
         cnts = summary.get(service, {})
         buttons = []
         for cnt in cnts.keys():
-            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}")])
-        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}")])
+            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
+        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
         await query.edit_message_text(f"Select country to delete from **{escape_md(service)}**:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("adm:cnt:del:"):
@@ -1140,27 +1282,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":", 4)
         if len(parts) >= 5:
             service, country = parts[3], parts[4]
-            delete_country_db(service, country)
+            await run_db(delete_country_db, service, country)
             await query.answer(f"Deleted {country} from {service}!", show_alert=True)
-            text, kbd = build_service_manage_view(service)
+            text, kbd = await run_db(build_service_manage_view, service)
             await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        else:
+            await query.answer()
 
     # User Get Number Flow
     elif data.startswith("srv_"):
         await query.answer()
         service = data.split("_", 1)[1]
-        countries = []
-
-        if CURRENT_DB_MODE == "Firebase (Cloud)":
-            countries_ref = db.reference(f"services/{service}").get()
-            if countries_ref and isinstance(countries_ref, dict):
-                countries = list(countries_ref.keys())
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT country_name FROM services WHERE service_name = ?", (service,))
-            countries = [row[0] for row in cursor.fetchall()]
-            conn.close()
+        countries = await run_db(get_countries_for_service, service)
 
         if not countries:
             await query.edit_message_text("No countries available for this service.")
@@ -1168,13 +1301,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = []
         for i in range(0, len(countries), 2):
-            row = []
-            row.append(create_button(countries[i], callback_data=f"cnt_{service}_{countries[i]}"))
+            row = [create_button(countries[i], callback_data=f"cnt_{service}_{countries[i]}", style="primary")]
             if i + 1 < len(countries):
-                row.append(create_button(countries[i+1], callback_data=f"cnt_{service}_{countries[i+1]}"))
+                row.append(create_button(countries[i+1], callback_data=f"cnt_{service}_{countries[i+1]}", style="primary"))
             buttons.append(row)
 
-        buttons.append([create_button("Back", callback_data="back_to_services")])
+        buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
         await query.edit_message_text(f"Select country for {escape_md(service)}:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("cnt_"):
@@ -1183,47 +1315,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) < 3:
             await query.edit_message_text("Invalid command.")
             return
-        
+
         service, country = parts[1], parts[2]
-        target_qty = int(get_setting("number_quantity", "2"))
-        assigned_numbers = []
+        target_qty = int(await run_db(get_setting, "number_quantity", "2"))
 
-        if CURRENT_DB_MODE == "Firebase (Cloud)":
-            numbers_ref = db.reference(f"numbers/{service}/{country}").get()
-            if numbers_ref and isinstance(numbers_ref, dict):
-                for key, val in numbers_ref.items():
-                    if len(assigned_numbers) >= target_qty:
-                        break
-                    if isinstance(val, dict) and val.get("status") == "available":
-                        num_val = str(val.get("number"))
-                        assigned_numbers.append(num_val)
-                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
-                        db.reference(f"allocations/{num_val}").set({"user_id": user_id, "service": service, "country": country})
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute(
-                "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?",
-                (service, country, target_qty)
-            )
-            rows = cursor.fetchall()
-            if rows and len(rows) == target_qty:
-                for num_id, assigned_num in rows:
-                    num_str = str(assigned_num)
-                    assigned_numbers.append(num_str)
-                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (num_str, user_id, service, country))
-                conn.commit()
-            else:
-                conn.rollback()
-            conn.close()
+        assigned_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty)
 
-        if len(assigned_numbers) < target_qty:
-            if CURRENT_DB_MODE == "Firebase (Cloud)":
-                for num_val in assigned_numbers:
-                    db.reference(f"numbers/{service}/{country}/{num_val}").update({"status": "available", "user_id": 0})
-                    db.reference(f"allocations/{num_val}").delete()
+        if not assigned_numbers:
             await query.edit_message_text(f"Sorry, not enough ({target_qty}) numbers available in this category.")
             return
 
@@ -1231,7 +1329,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━\n"
             f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers Allocated:"
         )
-        kbd = build_allocation_keyboard(service, country, assigned_numbers)
+        kbd = await run_db(build_allocation_keyboard, service, country, assigned_numbers)
         await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("chg:"):
@@ -1241,110 +1339,108 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         service, country = parts[1], parts[2]
-        target_qty = int(get_setting("number_quantity", "2"))
-        old_numbers = []
+        target_qty = int(await run_db(get_setting, "number_quantity", "2"))
 
-        if CURRENT_DB_MODE == "Firebase (Cloud)":
-            alloc_ref = db.reference("allocations").get()
-            if alloc_ref and isinstance(alloc_ref, dict):
-                for num_k, num_v in alloc_ref.items():
-                    if isinstance(num_v, dict) and num_v.get("user_id") == user_id and num_v.get("service") == service and num_v.get("country") == country:
-                        old_numbers.append(str(num_k))
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT number FROM allocations WHERE user_id = ? AND service = ? AND country = ?", (user_id, service, country))
-            old_numbers = [str(r[0]) for r in cursor.fetchall()]
-            conn.close()
+        old_numbers = await run_db(get_user_allocations_sync, user_id, service, country)
+        # FIXED: previously old numbers were freed FIRST and only re-allocated
+        # back if the new pick failed — a brief window where a concurrent
+        # request could steal one. Now we secure the NEW numbers first
+        # (excluding the old ones) and only release the old ones once the new
+        # set is confirmed, so the user is never left with fewer numbers than
+        # they started with.
+        new_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty, old_numbers)
 
-        new_numbers = []
-
-        if CURRENT_DB_MODE == "Firebase (Cloud)":
-            for old_num in old_numbers:
-                db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "available", "user_id": 0})
-                db.reference(f"allocations/{old_num}").delete()
-
-            numbers_ref = db.reference(f"numbers/{service}/{country}").get()
-            if numbers_ref and isinstance(numbers_ref, dict):
-                for key, val in numbers_ref.items():
-                    if len(new_numbers) >= target_qty:
-                        break
-                    if isinstance(val, dict) and val.get("status") == "available" and str(val.get("number")) not in old_numbers:
-                        new_num = str(val.get("number"))
-                        new_numbers.append(new_num)
-                        db.reference(f"numbers/{service}/{country}/{key}").update({"status": "allocated", "user_id": user_id})
-                        db.reference(f"allocations/{new_num}").set({"user_id": user_id, "service": service, "country": country})
-
-            if len(new_numbers) < target_qty:
-                for n in new_numbers:
-                    db.reference(f"numbers/{service}/{country}/{n}").update({"status": "available", "user_id": 0})
-                    db.reference(f"allocations/{n}").delete()
-
-                for old_num in old_numbers:
-                    db.reference(f"numbers/{service}/{country}/{old_num}").update({"status": "allocated", "user_id": user_id})
-                    db.reference(f"allocations/{old_num}").set({"user_id": user_id, "service": service, "country": country})
-                new_numbers = []
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
-            
-            for old_num in old_numbers:
-                cursor.execute("UPDATE numbers SET status = 'available', user_id = 0 WHERE number = ?", (old_num,))
-                cursor.execute("DELETE FROM allocations WHERE number = ?", (old_num,))
-
+        if new_numbers:
             if old_numbers:
-                placeholders = ','.join(['?'] * len(old_numbers))
-                query_sql = f"SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' AND number NOT IN ({placeholders}) LIMIT ?"
-                params = [service, country] + old_numbers + [target_qty]
-            else:
-                query_sql = "SELECT id, number FROM numbers WHERE service = ? AND country = ? AND status = 'available' LIMIT ?"
-                params = [service, country, target_qty]
-
-            cursor.execute(query_sql, params)
-            rows = cursor.fetchall()
-
-            if rows and len(rows) == target_qty:
-                for num_id, new_num in rows:
-                    new_num_str = str(new_num)
-                    new_numbers.append(new_num_str)
-                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ?", (user_id, num_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (new_num_str, user_id, service, country))
-                conn.commit()
-            else:
-                conn.rollback()
-                for old_num in old_numbers:
-                    cursor.execute("UPDATE numbers SET status = 'allocated', user_id = ? WHERE number = ?", (old_num, user_id))
-                    cursor.execute("INSERT OR REPLACE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)", (old_num, user_id, service, country))
-                conn.commit()
-            conn.close()
-
-        if len(new_numbers) == target_qty:
+                await run_db(release_numbers_sync, service, country, old_numbers)
             await query.answer("Successfully changed all numbers!", show_alert=False)
             alloc_msg = (
                 "━━━━━━━━━━━━━━━\n"
                 f"{escape_md(service)} ➜ {escape_md(country)} {len(new_numbers)} Numbers Allocated:"
             )
-            kbd = build_allocation_keyboard(service, country, new_numbers)
+            kbd = await run_db(build_allocation_keyboard, service, country, new_numbers)
             await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
         else:
             await query.answer(f"Sorry, not enough ({target_qty}) new numbers available to change!", show_alert=True)
 
 
 # ---------------- OTP POLLING SERVICE (CR API) ----------------
-async def otp_poller(application: Application):
-    processed_ids = {}
-
+def load_seen_otp_ids_sync() -> dict:
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         seen_ref = db.reference("seen_otp_ids").get()
         if seen_ref and isinstance(seen_ref, dict):
-            processed_ids = {k: True for k in seen_ref.keys()}
-    else:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT msg_id FROM seen_otps")
-        processed_ids = {row[0]: True for row in cursor.fetchall()}
-        conn.close()
+            return {k: True for k in seen_ref.keys()}
+        return {}
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT msg_id FROM seen_otps")
+    result = {row[0]: True for row in cursor.fetchall()}
+    conn.close()
+    return result
+
+
+def mark_otp_seen_sync(msg_id: str):
+    ts = int(time.time())
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        db.reference(f"seen_otp_ids/{msg_id}").set(ts)
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO seen_otps (msg_id, ts) VALUES (?, ?)", (msg_id, ts))
+    conn.commit()
+    conn.close()
+
+
+def cleanup_old_otp_ids_sync():
+    """
+    FIXED: `seen_otp_ids` used to grow forever in Firebase with no cleanup —
+    at 1000+ daily users receiving OTPs, that node would balloon indefinitely.
+    This prunes anything older than OTP_ID_RETENTION_SECONDS, run periodically
+    from the poller (not every cycle — cheap for SQLite, but a Firebase full
+    scan, so only every ~1 hour).
+    """
+    cutoff = int(time.time()) - OTP_ID_RETENTION_SECONDS
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        seen_ref = db.reference("seen_otp_ids").get()
+        if seen_ref and isinstance(seen_ref, dict):
+            for msg_id, ts in seen_ref.items():
+                if isinstance(ts, (int, float)) and ts < cutoff:
+                    db.reference(f"seen_otp_ids/{msg_id}").delete()
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM seen_otps WHERE ts > 0 AND ts < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+def lookup_allocation_sync(num: str, clean_num: str):
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        alloc_ref = db.reference(f"allocations/{num}").get() or db.reference(f"allocations/{clean_num}").get()
+        if alloc_ref and isinstance(alloc_ref, dict):
+            return alloc_ref.get("user_id"), alloc_ref.get("service")
+        return None, None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, service FROM allocations WHERE number = ? OR number = ?", (num, clean_num))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return row[0], row[1]
+    return None, None
+
+
+async def otp_poller(application: Application):
+    processed_ids = await run_db(load_seen_otp_ids_sync)
+
+    # FIXED: get_me() used to be called once per incoming OTP message inside
+    # the loop below — an unnecessary Telegram API round-trip every time.
+    # It never changes at runtime, so it's fetched once, here.
+    bot_info = await application.bot.get_me()
+    bot_username = bot_info.username or ""
+    bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+
+    cycle_count = 0
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
@@ -1360,7 +1456,10 @@ async def otp_poller(application: Application):
                         res_data = res.json()
                         if res_data.get("status") == "success":
                             items = res_data.get("data", [])
-                            if isinstance(items, list):
+                            if isinstance(items, list) and items:
+                                # Fetched once per poll cycle instead of once per message.
+                                ch_link = clean_tg_link(await run_db(get_setting, "channel", "https://t.me/your_channel"))
+
                                 for item in items:
                                     if not isinstance(item, dict):
                                         continue
@@ -1376,141 +1475,86 @@ async def otp_poller(application: Application):
                                     unique_str = f"{num}_{dt}_{msg}"
                                     msg_id = hashlib.md5(unique_str.encode()).hexdigest()
 
-                                    if msg_id not in processed_ids:
-                                        processed_ids[msg_id] = True
+                                    if msg_id in processed_ids:
+                                        continue
 
-                                        if len(processed_ids) > 2000:
-                                            for old_id in list(processed_ids.keys())[:1000]:
-                                                del processed_ids[old_id]
+                                    processed_ids[msg_id] = True
+                                    if len(processed_ids) > 2000:
+                                        for old_id in list(processed_ids.keys())[:1000]:
+                                            del processed_ids[old_id]
 
-                                        if CURRENT_DB_MODE == "Firebase (Cloud)":
-                                            db.reference(f"seen_otp_ids/{msg_id}").set(True)
-                                        else:
-                                            conn = get_db_connection()
-                                            cursor = conn.cursor()
-                                            cursor.execute("INSERT OR IGNORE INTO seen_otps (msg_id) VALUES (?)", (msg_id,))
-                                            conn.commit()
-                                            conn.close()
+                                    await run_db(mark_otp_seen_sync, msg_id)
 
-                                        allocated_user = None
+                                    clean_num = re.sub(r'\D', '', num)
+                                    allocated_user, service_name = await run_db(lookup_allocation_sync, num, clean_num)
+                                    if not service_name:
                                         service_name = cli if cli else "Service"
-                                        clean_num = re.sub(r'\D', '', num)
 
-                                        if CURRENT_DB_MODE == "Firebase (Cloud)":
-                                            alloc_ref = db.reference(f"allocations/{num}").get() or db.reference(f"allocations/{clean_num}").get()
-                                            if alloc_ref and isinstance(alloc_ref, dict):
-                                                allocated_user = alloc_ref.get("user_id")
-                                                service_name = alloc_ref.get("service", service_name)
-                                        else:
-                                            conn = get_db_connection()
-                                            cursor = conn.cursor()
-                                            cursor.execute("SELECT user_id, service FROM allocations WHERE number = ? OR number = ?", (num, clean_num))
-                                            row = cursor.fetchone()
-                                            if row:
-                                                allocated_user = row[0]
-                                                service_name = row[1]
-                                            conn.close()
+                                    otp_code = extract_otp(msg)
+                                    masked_num = mask_number(num)
 
-                                        otp_code = extract_otp(msg)
-                                        masked_num = mask_number(num)
-                                        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
-                                        show_msg_setting = get_setting("show_message", "1")
+                                    safe_msg = html.escape(msg)
+                                    safe_service = html.escape(service_name)
+                                    safe_masked_num = html.escape(masked_num)
+                                    safe_num = html.escape(num)
+                                    quoted_msg = f"<blockquote expandable>{safe_msg}</blockquote>"
 
-                                        dev_user = html.escape(get_setting("dev_username", "developer"))
-                                        dev_link = f'<a href="https://t.me/{dev_user}">{dev_user}</a>'
+                                    # 1. Send to OTP Forwarding Group
+                                    if OTP_GROUP_ID:
+                                        group_text = (
+                                            "New OTP Received\n"
+                                            f"{safe_service} ➜ {safe_masked_num}\n"
+                                            "Price: 1 TK\n"
+                                            f"{quoted_msg}"
+                                        )
+                                        group_kbd = InlineKeyboardMarkup([
+                                            [
+                                                create_button("Channel", url=ch_link, style="primary"),
+                                                create_button("Get Number", url=bot_link, style="primary")
+                                            ],
+                                            [
+                                                create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                            ]
+                                        ])
+                                        try:
+                                            await application.bot.send_message(
+                                                chat_id=OTP_GROUP_ID,
+                                                text=group_text,
+                                                reply_markup=group_kbd,
+                                                parse_mode="HTML"
+                                            )
+                                        except Exception as e:
+                                            logging.error(f"Group Forward Error: {e}")
 
-                                        bot_info = await application.bot.get_me()
-                                        bot_username = bot_info.username or ""
-                                        bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
-
-                                        safe_msg = html.escape(msg)
-                                        safe_service = html.escape(service_name)
-                                        safe_masked_num = html.escape(masked_num)
-                                        safe_num = html.escape(num)
-                                        quoted_msg = f"<blockquote>{safe_msg}</blockquote>"
-
-                                        # 1. Send to OTP Forwarding Group
-                                        if OTP_GROUP_ID:
-                                            if show_msg_setting == "1":
-                                                group_text = (
-                                                    "━━━━━━━━━━━━━━━━━\n"
-                                                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                                                    f"🌐 NUM: {safe_num}\n\n"
-                                                    "🗨️ MESSAGE:\n"
-                                                    f"{quoted_msg}\n"
-                                                    "━━━━━━━━━━━━━━━━━\n"
-                                                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇr {dev_link}"
-                                                )
-                                            else:
-                                                group_text = (
-                                                    "━━━━━━━━━━━━━━━━━\n"
-                                                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                                                    f"🌐 NUM: {safe_num}\n"
-                                                    "━━━━━━━━━━━━━━━━━\n"
-                                                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇr {dev_link}"
-                                                )
-
-                                            group_kbd = InlineKeyboardMarkup([
-                                                [
-                                                    create_button("Channel", url=ch_link),
-                                                    create_button("Get Number", url=bot_link)
-                                                ],
-                                                [
-                                                    create_button(f"{otp_code}", callback_data="ignore")
-                                                ]
-                                            ])
-                                            try:
-                                                await application.bot.send_message(
-                                                    chat_id=OTP_GROUP_ID,
-                                                    text=group_text,
-                                                    reply_markup=group_kbd,
-                                                    parse_mode="HTML"
-                                                )
-                                            except Exception as e:
-                                                logging.error(f"Group Forward Error: {e}")
-
-                                        # 2. Send to User Inbox
-                                        if allocated_user:
-                                            new_bal = add_user_balance(allocated_user, 1.0)
-
-                                            if show_msg_setting == "1":
-                                                user_text = (
-                                                    "— — — — — — — — — —\n"
-                                                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
-                                                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
-                                                    "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
-                                                    f"<blockquote>💳 BALANCE ➜ {new_bal:.2f} TK</blockquote>\n"
-                                                    "🗨️ MESSAGE: \n"
-                                                    f"{quoted_msg}\n"
-                                                    "— — — — — — — — — —"
-                                                )
-                                            else:
-                                                user_text = (
-                                                    "— — — — — — — — — —\n"
-                                                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
-                                                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
-                                                    "<blockquote>➕ ADDED  ➜ 1 TK</blockquote>\n"
-                                                    f"<blockquote>💳 BALANCE ➜ {new_bal:.2f} TK</blockquote>\n"
-                                                    "— — — — — — — — — —"
-                                                )
-
-                                            user_kbd = InlineKeyboardMarkup([
-                                                [
-                                                    create_button(f"{otp_code}", callback_data="ignore")
-                                                ]
-                                            ])
-                                            try:
-                                                await application.bot.send_message(
-                                                    chat_id=allocated_user,
-                                                    text=user_text,
-                                                    reply_markup=user_kbd,
-                                                    parse_mode="HTML"
-                                                )
-                                            except Exception as e:
-                                                logging.error(f"User Forward Error: {e}")
+                                    # 2. Send to User Inbox
+                                    if allocated_user:
+                                        user_text = (
+                                            "New OTP Received\n"
+                                            f"{safe_service} ➜ {safe_num}\n"
+                                            "Added: 1TK\n"
+                                            f"{quoted_msg}"
+                                        )
+                                        user_kbd = InlineKeyboardMarkup([
+                                            [
+                                                create_button(f"{otp_code}", copy_text=otp_code, style="success")
+                                            ]
+                                        ])
+                                        try:
+                                            await application.bot.send_message(
+                                                chat_id=allocated_user,
+                                                text=user_text,
+                                                reply_markup=user_kbd,
+                                                parse_mode="HTML"
+                                            )
+                                        except Exception as e:
+                                            logging.error(f"User Forward Error: {e}")
 
             except Exception as e:
                 logging.error(f"Polling Exception: {e}")
+
+            cycle_count += 1
+            if cycle_count % CLEANUP_EVERY_N_CYCLES == 0:
+                await run_db(cleanup_old_otp_ids_sync)
 
             await asyncio.sleep(5)
 
