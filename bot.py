@@ -881,7 +881,7 @@ def get_admin_keyboard():
         ],
         [
             {"text": "ADMIN CONTROL", "style": "primary"},
-            {"text": "BROADCAST", "style": "primary"}
+            {"text": "GLOBAL SETTINGS", "style": "primary"}
         ],
         [
             {"text": "BACK", "style": "danger"}
