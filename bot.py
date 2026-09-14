@@ -114,6 +114,13 @@ def create_button(text: str, callback_data: str = None, url: str = None, copy_te
     return btn
 
 
+def mask_number_aph(num_str: str) -> str:
+    num_str = str(num_str).strip()
+    if len(num_str) >= 6:
+        return num_str[:-6] + "APH" + num_str[-3:]
+    return num_str
+
+
 # ---------------- DATABASE (SYNC / BLOCKING) ----------------
 def get_db_connection():
     conn = sqlite3.connect("bot_database.db", timeout=10)
@@ -321,7 +328,6 @@ def save_user(user_id: int):
 
 
 def get_user_balance_sync(user_id: int) -> float:
-    # Sensitive data: Always fetch realtime from DB
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             bal = db.reference(f"users/{user_id}/balance").get()
@@ -344,7 +350,6 @@ def get_user_balance_sync(user_id: int) -> float:
 
 
 def add_user_balance_sync(user_id: int, amount: float = 1.0) -> float:
-    # Sensitive data: Realtime update
     curr_bal = get_user_balance_sync(user_id)
     new_bal = curr_bal + amount
 
@@ -395,7 +400,6 @@ def sync_firebase_to_sqlite():
     if not HAS_FIREBASE_LIB or not firebase_admin._apps:
         return
     try:
-        # Sync Settings
         fb_settings = db.reference("settings").get()
         if fb_settings and isinstance(fb_settings, dict):
             conn = get_db_connection()
@@ -406,7 +410,6 @@ def sync_firebase_to_sqlite():
             conn.commit()
             conn.close()
 
-        # Sync Users & Balances
         fb_users = db.reference("users").get()
         if fb_users and isinstance(fb_users, dict):
             conn = get_db_connection()
@@ -1521,6 +1524,16 @@ async def otp_poller(application: Application):
                                     if not isinstance(item, dict):
                                         continue
 
+                                    # 1. PAYOUT ZERO CHECK (Silent Skip)
+                                    payout_raw = item.get("payout", "0")
+                                    try:
+                                        payout_val = float(payout_raw)
+                                    except (ValueError, TypeError):
+                                        payout_val = 0.0
+
+                                    if payout_val <= 0.0:
+                                        continue
+
                                     num = str(item.get("num", "")).strip()
                                     msg = item.get("message", "")
                                     dt = item.get("dt", "")
@@ -1553,13 +1566,17 @@ async def otp_poller(application: Application):
                                     safe_service = html.escape(service_name)
                                     safe_num = html.escape(num)
 
-                                    # 1. Send to OTP Forwarding Group (Web Page Preview Disabled)
+                                    # 2. MASKED NUMBER FOR GROUP
+                                    masked_num = mask_number_aph(num)
+                                    safe_masked_num = html.escape(masked_num)
+
+                                    # Send to OTP Forwarding Group (Masked Number)
                                     if OTP_GROUP_ID:
                                         if show_msg_enabled:
                                             group_text = (
                                                 "━━━━━━━━━━━━━━━━━\n"
                                                 f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                                                f"🌐 NUM: {safe_num}\n\n"
+                                                f"🌐 NUM: {safe_masked_num}\n\n"
                                                 "🗨️ MESSAGE:\n"
                                                 f"<blockquote expandable>{safe_msg}</blockquote>\n"
                                                 "━━━━━━━━━━━━━━━━━\n"
@@ -1569,7 +1586,7 @@ async def otp_poller(application: Application):
                                             group_text = (
                                                 "━━━━━━━━━━━━━━━━━\n"
                                                 f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                                                f"🌐 NUM: {safe_num}\n"
+                                                f"🌐 NUM: {safe_masked_num}\n"
                                                 "━━━━━━━━━━━━━━━━━\n"
                                                 f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
                                             )
@@ -1594,7 +1611,7 @@ async def otp_poller(application: Application):
                                         except Exception as e:
                                             logging.error(f"Group Forward Error: {e}")
 
-                                    # 2. Send to User Inbox & Update Balance (Realtime Sync)
+                                    # Send to User Inbox & Update Balance
                                     if allocated_user:
                                         new_bal = await run_db(add_user_balance_sync, allocated_user, 1.0)
                                         bal_str = f"{int(new_bal)}" if new_bal.is_integer() else f"{new_bal:.2f}"
