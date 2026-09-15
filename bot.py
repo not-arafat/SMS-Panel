@@ -45,7 +45,6 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-FIREBASE_JSON_PATH = "temp_firebase.json"
 CURRENT_DB_MODE = "SQLite (Local)"
 
 OTP_ID_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
@@ -59,7 +58,7 @@ PANEL_TASKS = {}     # Dynamic background tasks for API panels
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
 
 
 # ---------------- PURE HELPERS ----------------
@@ -134,7 +133,7 @@ def create_button(text: str, callback_data: str = None, url: str = None, copy_te
 
 def mask_number_aph(num_str: str) -> str:
     num_str = str(num_str).strip()
-    if len(num_str) >= 6:
+    if len(num_str) > 6:
         return num_str[:-6] + "APH" + num_str[-3:]
     return num_str
 
@@ -263,7 +262,7 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
-    cursor.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_id', '{OTP_GROUP_ID}')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_id', ?)", (OTP_GROUP_ID,))
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', 'true')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
@@ -348,47 +347,104 @@ def delete_withdraw_method_sync(name: str):
         logging.error(f"SQLite delete withdraw method error: {e}")
 
 
-def deduct_user_balance_sync(user_id: int, amount: float) -> bool:
-    curr_bal = get_user_balance_sync(user_id)
-    if curr_bal < amount:
-        return False
-    new_bal = curr_bal - amount
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"users/{user_id}/balance").set(new_bal)
-        except Exception as e:
-            logging.error(f"Firebase deduct balance error: {e}")
-
+def _mirror_balance_to_sqlite(user_id: int, new_bal: float):
+    """Best-effort mirror of an already-decided balance into the local SQLite cache."""
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
         conn.commit()
-        conn.close()
     except Exception as e:
+        logging.error(f"SQLite mirror balance error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def deduct_user_balance_sync(user_id: int, amount: float) -> bool:
+    """Atomically checks-and-deducts balance so concurrent requests (e.g. a double withdraw
+    tap, or a withdraw racing an OTP credit) can never both succeed on stale data."""
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        bal_ref = db.reference(f"users/{user_id}/balance")
+        result = {"ok": False, "new_bal": None}
+
+        def txn(current):
+            cur_bal = float(current or 0.0)
+            if cur_bal < amount:
+                result["ok"] = False
+                return current  # no-op, abort the deduction
+            result["ok"] = True
+            result["new_bal"] = cur_bal - amount
+            return result["new_bal"]
+
+        try:
+            bal_ref.transaction(txn)
+        except Exception as e:
+            logging.error(f"Firebase deduct balance error: {e}")
+            return False
+
+        if result["ok"]:
+            _mirror_balance_to_sqlite(user_id, result["new_bal"])
+        return result["ok"]
+
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        curr_bal = float(row[0]) if row and row[0] is not None else 0.0
+        if curr_bal < amount:
+            conn.rollback()
+            return False
+        new_bal = curr_bal - amount
+        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
         logging.error(f"SQLite deduct balance error: {e}")
-    return True
+        return False
+    finally:
+        conn.close()
 
 
 def refund_user_balance_sync(user_id: int, amount: float):
-    curr_bal = get_user_balance_sync(user_id)
-    new_bal = curr_bal + amount
-
+    """Atomically adds to balance (used for refunds / rank bonuses)."""
     if CURRENT_DB_MODE == "Firebase (Cloud)":
+        bal_ref = db.reference(f"users/{user_id}/balance")
+        result = {"new_bal": None}
+
+        def txn(current):
+            new_val = float(current or 0.0) + amount
+            result["new_bal"] = new_val
+            return new_val
+
         try:
-            db.reference(f"users/{user_id}/balance").set(new_bal)
+            bal_ref.transaction(txn)
         except Exception as e:
             logging.error(f"Firebase refund balance error: {e}")
 
+        if result["new_bal"] is not None:
+            _mirror_balance_to_sqlite(user_id, result["new_bal"])
+        return
+
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        curr_bal = float(row[0]) if row and row[0] is not None else 0.0
+        new_bal = curr_bal + amount
         cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
         conn.commit()
-        conn.close()
     except Exception as e:
+        conn.rollback()
         logging.error(f"SQLite refund balance error: {e}")
+    finally:
+        conn.close()
 
 
 def create_withdraw_request_sync(user_id: int, method: str, wallet_number: str, amount: float) -> int:
@@ -1059,66 +1115,110 @@ def get_user_profile_sync(user_id: int) -> dict:
 
 
 def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0) -> dict:
+    """Credits one OTP's worth of balance atomically. Two OTPs landing for the same
+    user at the same instant (different panels, same poll cycle) can no longer clobber
+    each other's update."""
     current_date = get_bd_date_str()
-    prof = get_user_profile_sync(user_id)
 
-    new_bal = prof["balance"] + amount
-    new_total_earned = prof["total_earned"] + amount
-    new_total_otps = prof["total_otps"] + 1
-    new_today_earned = prof["today_earned"] + amount
-
-    weekly_otps = 0
     if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            u_data = db.reference(f"users/{user_id}").get() or {}
-            if isinstance(u_data, dict):
-                weekly_otps = int(u_data.get("weekly_otps", 0)) + 1
+        user_ref = db.reference(f"users/{user_id}")
+        result = {"data": None}
 
-            db.reference(f"users/{user_id}").update({
-                "balance": new_bal,
-                "total_earned": new_total_earned,
-                "today_earned": new_today_earned,
-                "total_otps": new_total_otps,
-                "weekly_otps": weekly_otps,
-                "last_earn_date": current_date,
-                "exists": True
-            })
+        def txn(current):
+            data = dict(current) if isinstance(current, dict) else {}
+            bal = float(data.get("balance", 0.0))
+            total_earned = float(data.get("total_earned", 0.0))
+            total_otps = int(data.get("total_otps", 0))
+            weekly_otps = int(data.get("weekly_otps", 0))
+            last_date = str(data.get("last_earn_date", ""))
+            today_earned = float(data.get("today_earned", 0.0)) if last_date == current_date else 0.0
+
+            data["balance"] = bal + amount
+            data["total_earned"] = total_earned + amount
+            data["today_earned"] = today_earned + amount
+            data["total_otps"] = total_otps + 1
+            data["weekly_otps"] = weekly_otps + 1
+            data["last_earn_date"] = current_date
+            data["exists"] = True
+            data.setdefault("refer_earned", 0.0)
+            data.setdefault("first_name", "")
+            result["data"] = data
+            return data
+
+        try:
+            user_ref.transaction(txn)
         except Exception as e:
             logging.error(f"Firebase update user earnings error: {e}")
 
+        data = result["data"]
+        if data:
+            conn = None
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, ?)", (user_id, current_date))
+                cursor.execute("""
+                    UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, total_otps = ?, weekly_otps = ?, last_earn_date = ?
+                    WHERE user_id = ?
+                """, (data["balance"], data["today_earned"], data["total_earned"], data["total_otps"], data["weekly_otps"], current_date, user_id))
+                conn.commit()
+            except Exception as e:
+                logging.error(f"SQLite mirror update user earnings error: {e}")
+            finally:
+                if conn:
+                    conn.close()
+            return {
+                "balance": data["balance"],
+                "today_earned": data["today_earned"],
+                "total_earned": data["total_earned"],
+                "refer_earned": float(data.get("refer_earned", 0.0)),
+                "total_otps": data["total_otps"]
+            }
+        return get_user_profile_sync(user_id)
+
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
-        cursor.execute("SELECT weekly_otps FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, '', ?)",
+            (user_id, current_date)
+        )
+        cursor.execute("SELECT balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, last_earn_date FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
-        if row and row[0]:
-            weekly_otps = row[0] + 1
-        else:
-            weekly_otps = 1
+        bal, today_e, total_e, refer_e, otps, w_otps, last_date = row
+        bal = float(bal or 0.0)
+        today_e = float(today_e or 0.0) if str(last_date or "") == current_date else 0.0
+        total_e = float(total_e or 0.0)
+        refer_e = float(refer_e or 0.0)
+        otps = int(otps or 0)
+        w_otps = int(w_otps or 0)
 
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, ?)", (user_id, current_date))
+        new_bal = bal + amount
+        new_today = today_e + amount
+        new_total = total_e + amount
+        new_otps = otps + 1
+        new_weekly = w_otps + 1
+
         cursor.execute("""
-            UPDATE users SET 
-                balance = ?,
-                today_earned = ?,
-                total_earned = ?,
-                total_otps = ?,
-                weekly_otps = ?,
-                last_earn_date = ?
+            UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, total_otps = ?, weekly_otps = ?, last_earn_date = ?
             WHERE user_id = ?
-        """, (new_bal, new_today_earned, new_total_earned, new_total_otps, weekly_otps, current_date, user_id))
+        """, (new_bal, new_today, new_total, new_otps, new_weekly, current_date, user_id))
         conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"SQLite update user earnings error: {e}")
 
-    return {
-        "balance": new_bal,
-        "today_earned": new_today_earned,
-        "total_earned": new_total_earned,
-        "refer_earned": prof["refer_earned"],
-        "total_otps": new_total_otps
-    }
+        return {
+            "balance": new_bal,
+            "today_earned": new_today,
+            "total_earned": new_total,
+            "refer_earned": refer_e,
+            "total_otps": new_otps
+        }
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"SQLite update user earnings error: {e}")
+        return get_user_profile_sync(user_id)
+    finally:
+        conn.close()
 
 
 def get_user_balance_sync(user_id: int) -> float:
@@ -1512,7 +1612,7 @@ def build_admin_services_view():
         buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
         return text, InlineKeyboardMarkup(buttons)
 
-    text = "📱 **SERVICES MANAGEMENT**\n\nSummary:\n"
+    text = "📱 **SERVICES MANAGEMENT**\n\nSummary:"
     buttons = []
     for srv, cnts in summary.items():
         total_avail = sum(cnts.values())
@@ -1833,19 +1933,19 @@ def get_services_keyboard():
 
 
 # ---------------- FIREBASE CONNECTION MANAGEMENT ----------------
-def init_firebase_system(run_migration=False, force_reinit=False):
+def init_firebase_system(run_migration=True):
+    """Connects to Firebase using credentials from environment variables only
+    (FIREBASE_BASE64 or FIREBASE_CONFIG_JSON in .env / host env vars).
+
+    Because these are real environment variables rather than a file written to local
+    disk, they survive restarts/redeploys on hosts with an ephemeral filesystem
+    (Render, Railway, etc.) — so the bot reconnects to Firebase automatically on every
+    boot, before it starts polling for OTPs. No manual "upload firebase.json" step needed."""
     global CURRENT_DB_MODE
     if not HAS_FIREBASE_LIB:
         CURRENT_DB_MODE = "SQLite (Local)"
         refresh_all_caches_sync()
         return False
-
-    if force_reinit and firebase_admin._apps:
-        try:
-            for app_name in list(firebase_admin._apps.keys()):
-                firebase_admin.delete_app(firebase_admin._apps[app_name])
-        except Exception as e:
-            logging.error(f"Error deleting previous firebase instance: {e}")
 
     if firebase_admin._apps:
         CURRENT_DB_MODE = "Firebase (Cloud)"
@@ -1859,10 +1959,7 @@ def init_firebase_system(run_migration=False, force_reinit=False):
     firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
 
     try:
-        if os.path.exists(FIREBASE_JSON_PATH):
-            with open(FIREBASE_JSON_PATH, "r") as f:
-                cred_dict = json.load(f)
-        elif firebase_b64:
+        if firebase_b64:
             decoded_json = base64.b64decode(firebase_b64).decode('utf-8')
             cred_dict = json.loads(decoded_json)
         elif firebase_json_env:
@@ -1881,8 +1978,10 @@ def init_firebase_system(run_migration=False, force_reinit=False):
             sync_firebase_to_sqlite()
             if run_migration:
                 migrate_sqlite_to_firebase()
-            logging.info("Firebase connected successfully!")
+            logging.info("Firebase connected successfully from environment variables!")
             return True
+        else:
+            logging.info("No FIREBASE_BASE64 / FIREBASE_CONFIG_JSON set — running in SQLite (Local) mode.")
     except Exception as e:
         logging.error(f"Firebase Init Error: {e}")
 
@@ -1974,7 +2073,7 @@ def migrate_sqlite_to_firebase():
     refresh_all_caches_sync()
 
 
-init_firebase_system(run_migration=False)
+init_firebase_system(run_migration=True)
 
 app = Flask(__name__)
 
@@ -1991,7 +2090,6 @@ def run_flask():
     ADD_SERVICE,
     ADD_COUNTRY,
     ADD_NUMBERS,
-    WAIT_FIREBASE_FILE,
     WAIT_CHANNEL,
     WAIT_SUPPORT,
     WAIT_OTP_LINK,
@@ -2013,7 +2111,7 @@ def run_flask():
     WAIT_RANK1_BONUS,
     WAIT_RANK2_BONUS,
     WAIT_RANK3_BONUS,
-) = range(25)
+) = range(24)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -2076,8 +2174,7 @@ def get_global_settings_keyboard():
             {"text": "EDIT API", "style": "success"}
         ],
         [
-            {"text": "NUMBER QUANTITY", "style": "primary"},
-            {"text": "CONNECT FIREBASE", "style": "primary"}
+            {"text": "NUMBER QUANTITY", "style": "primary"}
         ],
         [
             {"text": "EXTRA", "style": "primary"},
@@ -2378,7 +2475,7 @@ async def receive_rank1_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         val = 50.0
 
-    set_setting("rank_bonus_1", str(val))
+    await run_db(set_setting, "rank_bonus_1", str(val))
     await update.message.reply_text(f"✅ Top 1 bonus set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
     text_msg, kbd = build_ranking_bonus_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2398,7 +2495,7 @@ async def receive_rank2_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         val = 30.0
 
-    set_setting("rank_bonus_2", str(val))
+    await run_db(set_setting, "rank_bonus_2", str(val))
     await update.message.reply_text(f"✅ Top 2 bonus set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
     text_msg, kbd = build_ranking_bonus_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2418,7 +2515,7 @@ async def receive_rank3_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         val = 20.0
 
-    set_setting("rank_bonus_3", str(val))
+    await run_db(set_setting, "rank_bonus_3", str(val))
     await update.message.reply_text(f"✅ Top 3 bonus set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
     text_msg, kbd = build_ranking_bonus_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2436,7 +2533,7 @@ async def set_dev_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def receive_dev_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_name = update.message.text.strip()
-    set_setting("dev_username", new_name)
+    await run_db(set_setting, "dev_username", new_name)
     await update.message.reply_text(f"✅ Developer Name updated successfully!\nCurrent Name: `{escape_md(new_name)}`", parse_mode="Markdown")
     text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2453,7 +2550,7 @@ async def set_dev_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def receive_dev_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
-    set_setting("dev_link", new_link)
+    await run_db(set_setting, "dev_link", new_link)
     await update.message.reply_text(f"✅ Developer Link updated successfully!\nCurrent Link: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2493,7 +2590,7 @@ async def receive_min_withdraw_amount(update: Update, context: ContextTypes.DEFA
     except ValueError:
         val = 50.0
 
-    set_setting("min_withdraw_amount", str(val))
+    await run_db(set_setting, "min_withdraw_amount", str(val))
     await update.message.reply_text(f"✅ Minimum withdraw amount set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
     text_msg, kbd = build_withdraw_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2694,32 +2791,6 @@ async def receive_panel_interval(update: Update, context: ContextTypes.DEFAULT_T
 
 
 @admin_only
-async def admin_upload_firebase_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.message.reply_text("Please send the Firebase `.json` service account file:")
-    else:
-        await update.message.reply_text("Please send the Firebase `.json` service account file:")
-    return WAIT_FIREBASE_FILE
-
-async def receive_firebase_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.document or not update.message.document.file_name.endswith('.json'):
-        await update.message.reply_text("Invalid file! Please upload only `.json` service account files.", reply_markup=get_admin_keyboard())
-        return ConversationHandler.END
-
-    file = await context.bot.get_file(update.message.document.file_id)
-    await file.download_to_drive(FIREBASE_JSON_PATH)
-
-    success = await run_db(init_firebase_system, run_migration=True, force_reinit=True)
-    if success:
-        await update.message.reply_text("Firebase file received! Database successfully connected and migrated to Firebase. 🚀", reply_markup=get_admin_keyboard())
-    else:
-        await update.message.reply_text("File saved, but failed to connect to Firebase. Please check the JSON content.", reply_markup=get_admin_keyboard())
-
-    context.user_data.pop('service_name', None)
-    context.user_data.pop('country_name', None)
-    context.user_data['current_menu'] = 'admin'
-    return ConversationHandler.END
-
 @admin_only
 async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2733,7 +2804,7 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
 
-    set_setting("channel", new_link)
+    await run_db(set_setting, "channel", new_link)
     await update.message.reply_text(f"✅ Channel link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2752,7 +2823,7 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Invalid username/link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_SUPPORT
 
-    set_setting("support", new_link)
+    await run_db(set_setting, "support", new_link)
     await update.message.reply_text(f"✅ Support username/link updated successfully!\nCurrent support: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2771,7 +2842,7 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid link! Please enter a valid group link.\nType /cancel to abort.")
         return WAIT_OTP_LINK
 
-    set_setting("otp_group_link", new_link)
+    await run_db(set_setting, "otp_group_link", new_link)
     await update.message.reply_text(f"✅ OTP Group link updated successfully!\nCurrent link: {escape_md(new_link)}", parse_mode="Markdown")
     text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2786,7 +2857,7 @@ async def set_otpgroupid_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_id = update.message.text.strip()
-    set_setting("otp_group_id", new_id)
+    await run_db(set_setting, "otp_group_id", new_id)
     await update.message.reply_text(f"✅ OTP Forward Group ID updated successfully!\nCurrent Group ID: `{escape_md(new_id)}`", parse_mode="Markdown")
     text_msg, kbd = build_edit_links_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -3055,7 +3126,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_is_admin:
             return
         qty_val = data.split(":", 2)[2]
-        set_setting("number_quantity", qty_val)
+        await run_db(set_setting, "number_quantity", qty_val)
         await query.answer(f"Number quantity set to {qty_val}!", show_alert=True)
         text_msg, kbd = build_number_quantity_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -3066,7 +3137,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         curr_val = get_setting("show_message", "true")
         new_val = "false" if curr_val == "true" else "true"
-        set_setting("show_message", new_val)
+        await run_db(set_setting, "show_message", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Show Message option is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
@@ -3078,7 +3149,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         curr_val = get_setting("show_country_count", "false")
         new_val = "false" if curr_val == "true" else "true"
-        set_setting("show_country_count", new_val)
+        await run_db(set_setting, "show_country_count", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Country number count is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
@@ -3090,7 +3161,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         curr_val = get_setting("show_developer", "true")
         new_val = "false" if curr_val == "true" else "true"
-        set_setting("show_developer", new_val)
+        await run_db(set_setting, "show_developer", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Developer Info is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
@@ -3102,7 +3173,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         curr_val = get_setting("withdraw_enabled", "true")
         new_val = "false" if curr_val == "true" else "true"
-        set_setting("withdraw_enabled", new_val)
+        await run_db(set_setting, "withdraw_enabled", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Withdraw system is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
@@ -3114,7 +3185,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         curr_val = get_setting("ranking_bonus_enabled", "true")
         new_val = "false" if curr_val == "true" else "true"
-        set_setting("ranking_bonus_enabled", new_val)
+        await run_db(set_setting, "ranking_bonus_enabled", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Ranking Bonus System is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
@@ -3288,45 +3359,76 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- OTP POLLING SERVICE & MULTI-API MANAGER ----------------
 def load_seen_otp_ids_sync() -> dict:
+    """Loads the union of seen-OTP ids from both stores. Reading both (instead of only
+    whichever CURRENT_DB_MODE happens to be at boot) means a restart can never make an
+    already-forwarded OTP look 'new' just because Firebase hadn't reconnected yet."""
+    result = {}
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT msg_id FROM seen_otps")
+        result = {row[0]: True for row in cursor.fetchall()}
+    except Exception as e:
+        logging.error(f"SQLite load seen otps error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     if CURRENT_DB_MODE == "Firebase (Cloud)":
-        seen_ref = db.reference("seen_otp_ids").get()
-        if seen_ref and isinstance(seen_ref, dict):
-            return {k: True for k in seen_ref.keys()}
-        return {}
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT msg_id FROM seen_otps")
-    result = {row[0]: True for row in cursor.fetchall()}
-    conn.close()
+        try:
+            seen_ref = db.reference("seen_otp_ids").get()
+            if seen_ref and isinstance(seen_ref, dict):
+                result.update({k: True for k in seen_ref.keys()})
+        except Exception as e:
+            logging.error(f"Firebase load seen otps error: {e}")
     return result
 
 
 def mark_otp_seen_sync(msg_id: str):
     ts = int(time.time())
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO seen_otps (msg_id, ts) VALUES (?, ?)", (msg_id, ts))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"SQLite mark otp seen error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     if CURRENT_DB_MODE == "Firebase (Cloud)":
-        db.reference(f"seen_otp_ids/{msg_id}").set(ts)
-        return
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO seen_otps (msg_id, ts) VALUES (?, ?)", (msg_id, ts))
-    conn.commit()
-    conn.close()
+        try:
+            db.reference(f"seen_otp_ids/{msg_id}").set(ts)
+        except Exception as e:
+            logging.error(f"Firebase mark otp seen error: {e}")
 
 
 def cleanup_old_otp_ids_sync():
     cutoff = int(time.time()) - OTP_ID_RETENTION_SECONDS
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM seen_otps WHERE ts > 0 AND ts < ?", (cutoff,))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"SQLite cleanup seen otps error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     if CURRENT_DB_MODE == "Firebase (Cloud)":
-        seen_ref = db.reference("seen_otp_ids").get()
-        if seen_ref and isinstance(seen_ref, dict):
-            for msg_id, ts in seen_ref.items():
-                if isinstance(ts, (int, float)) and ts < cutoff:
-                    db.reference(f"seen_otp_ids/{msg_id}").delete()
-        return
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM seen_otps WHERE ts > 0 AND ts < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+        try:
+            seen_ref = db.reference("seen_otp_ids").get()
+            if seen_ref and isinstance(seen_ref, dict):
+                for msg_id, ts in seen_ref.items():
+                    if isinstance(ts, (int, float)) and ts < cutoff:
+                        db.reference(f"seen_otp_ids/{msg_id}").delete()
+        except Exception as e:
+            logging.error(f"Firebase cleanup seen otps error: {e}")
 
 
 def lookup_allocation_sync(num: str, clean_num: str):
@@ -3569,7 +3671,6 @@ def main():
             CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
             CallbackQueryHandler(admin_add_panel_start, pattern="^adm:api:add$"),
             CallbackQueryHandler(admin_add_admin_start, pattern="^adm:add:start$"),
-            CallbackQueryHandler(admin_upload_firebase_start, pattern="^admin_upload_firebase$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
@@ -3583,7 +3684,6 @@ def main():
             CallbackQueryHandler(set_rank1_bonus_start, pattern="^adm:r_set_b1$"),
             CallbackQueryHandler(set_rank2_bonus_start, pattern="^adm:r_set_b2$"),
             CallbackQueryHandler(set_rank3_bonus_start, pattern="^adm:r_set_b3$"),
-            MessageHandler(filters.Regex("(?i)^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
         ],
         states={
@@ -3596,7 +3696,6 @@ def main():
             WAIT_PANEL_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_interval)],
             WAIT_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_id)],
             WAIT_ADMIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_name)],
-            WAIT_FIREBASE_FILE: [MessageHandler(filters.Document.ALL & ~MENU_FILTER, receive_firebase_file)],
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
             WAIT_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_support_link)],
             WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_link)],
