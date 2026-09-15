@@ -59,13 +59,21 @@ PANEL_TASKS = {}     # Dynamic background tasks for API panels
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
 
 
 # ---------------- PURE HELPERS ----------------
 def get_bd_date_str() -> str:
     tz_bd = datetime.timezone(datetime.timedelta(hours=6))
     return datetime.datetime.now(tz_bd).strftime('%Y-%m-%d')
+
+
+def get_current_friday_str() -> str:
+    tz_bd = datetime.timezone(datetime.timedelta(hours=6))
+    now_bd = datetime.datetime.now(tz_bd)
+    days_since_friday = (now_bd.weekday() - 4) % 7
+    last_friday = now_bd - datetime.timedelta(days=days_since_friday)
+    return last_friday.strftime('%Y-%m-%d')
 
 
 def fmt_num(val: float) -> str:
@@ -164,6 +172,8 @@ def init_sqlite():
             total_earned REAL DEFAULT 0.0,
             refer_earned REAL DEFAULT 0.0,
             total_otps INTEGER DEFAULT 0,
+            weekly_otps INTEGER DEFAULT 0,
+            first_name TEXT DEFAULT '',
             last_earn_date TEXT DEFAULT ''
         )
     ''')
@@ -238,7 +248,12 @@ def init_sqlite():
     ''')
 
     try:
-        cursor.execute("ALTER TABLE seen_otps ADD COLUMN ts INTEGER DEFAULT 0")
+        cursor.execute("ALTER TABLE users ADD COLUMN weekly_otps INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
 
@@ -254,6 +269,11 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_developer', 'true')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('withdraw_enabled', 'true')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ranking_bonus_enabled', 'true')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rank_bonus_1', '50')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rank_bonus_2', '30')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rank_bonus_3', '20')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_weekly_reset_friday', '')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_link', 'https://t.me/developer')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdraw_amount', '50')")
@@ -779,12 +799,15 @@ async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def save_user(user_id: int):
+def save_user(user_id: int, first_name: str = ""):
     cur_date = get_bd_date_str()
+    first_name = first_name.strip() if first_name else ""
+
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             user_ref = db.reference(f"users/{user_id}")
-            if not user_ref.get():
+            u_data = user_ref.get()
+            if not u_data:
                 user_ref.set({
                     "exists": True, 
                     "balance": 0.0,
@@ -792,19 +815,179 @@ def save_user(user_id: int):
                     "total_earned": 0.0,
                     "refer_earned": 0.0,
                     "total_otps": 0,
+                    "weekly_otps": 0,
+                    "first_name": first_name,
                     "last_earn_date": cur_date
                 })
+            elif first_name:
+                db.reference(f"users/{user_id}/first_name").set(first_name)
         except Exception as e:
             logging.error(f"Error saving user to Firebase: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, ?)", (user_id, cur_date))
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, ?, ?)", (user_id, first_name, cur_date))
+        if first_name:
+            cursor.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (first_name, user_id))
         conn.commit()
         conn.close()
     except Exception as e:
         logging.error(f"Error saving user to SQLite: {e}")
+
+
+def check_and_process_weekly_reset_sync(bot_app=None):
+    current_friday = get_current_friday_str()
+    last_reset = get_setting("last_weekly_reset_friday", "")
+
+    if not last_reset:
+        set_setting("last_weekly_reset_friday", current_friday)
+        return
+
+    if last_reset != current_friday:
+        is_bonus_enabled = get_setting("ranking_bonus_enabled", "true") == "true"
+        top_users = []
+
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            try:
+                fb_users = db.reference("users").get() or {}
+                u_list = []
+                if isinstance(fb_users, dict):
+                    for uid, udata in fb_users.items():
+                        if isinstance(udata, dict) and str(uid).isdigit():
+                            w_otps = int(udata.get("weekly_otps", 0))
+                            t_otps = int(udata.get("total_otps", 0))
+                            if w_otps > 0:
+                                u_list.append((int(uid), w_otps, t_otps))
+                u_list.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                top_users = u_list[:3]
+            except Exception as e:
+                logging.error(f"Firebase fetch top ranking error: {e}")
+        else:
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, weekly_otps, total_otps FROM users WHERE weekly_otps > 0 ORDER BY weekly_otps DESC, total_otps DESC LIMIT 3")
+                top_users = cursor.fetchall()
+                conn.close()
+            except Exception as e:
+                logging.error(f"SQLite fetch top ranking error: {e}")
+
+        if is_bonus_enabled and top_users:
+            for rank_idx, u_info in enumerate(top_users, start=1):
+                uid = u_info[0]
+                b_str = get_setting(f"rank_bonus_{rank_idx}", "0")
+                try:
+                    b_amt = float(b_str)
+                except ValueError:
+                    b_amt = 0.0
+
+                if b_amt > 0:
+                    refund_user_balance_sync(uid, b_amt)
+                    if bot_app:
+                        msg = (
+                            "🎉 <b>CONGRATULATIONS! WEEKLY RANKING BONUS!</b>\n\n"
+                            f"আপনি সাপ্তাহিক র‍্যাংকিংয়ে <b>Top {rank_idx}</b> স্থান অর্জনের জন্য <b>{fmt_num(b_amt)} ৳</b> বোনাস পেয়েছেন! 🏆\n"
+                            "আপনার ওয়ালেটে বোনাস টাকা যুক্ত করা হয়েছে।"
+                        )
+                        try:
+                            asyncio.create_task(bot_app.bot.send_message(chat_id=uid, text=msg, parse_mode="HTML"))
+                        except Exception as e:
+                            logging.error(f"Failed sending rank bonus notification to {uid}: {e}")
+
+        if CURRENT_DB_MODE == "Firebase (Cloud)":
+            try:
+                fb_users = db.reference("users").get() or {}
+                if isinstance(fb_users, dict):
+                    for uid in fb_users.keys():
+                        if str(uid).isdigit():
+                            db.reference(f"users/{uid}/weekly_otps").set(0)
+            except Exception as e:
+                logging.error(f"Firebase reset weekly otps error: {e}")
+
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET weekly_otps = 0")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logging.error(f"SQLite reset weekly otps error: {e}")
+
+        set_setting("last_weekly_reset_friday", current_friday)
+
+
+def get_ranking_leaderboard_sync(user_id: int, bot_app=None) -> str:
+    check_and_process_weekly_reset_sync(bot_app=bot_app)
+
+    top_5 = []
+    user_rank = "N/A"
+    user_weekly_otps = 0
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_users = db.reference("users").get() or {}
+            all_list = []
+            if isinstance(fb_users, dict):
+                for uid, udata in fb_users.items():
+                    if isinstance(udata, dict) and str(uid).isdigit():
+                        uid_int = int(uid)
+                        w_otps = int(udata.get("weekly_otps", 0))
+                        t_otps = int(udata.get("total_otps", 0))
+                        fname = str(udata.get("first_name", f"User {uid_int}")) or f"User {uid_int}"
+                        if uid_int == user_id:
+                            user_weekly_otps = w_otps
+                        if w_otps > 0:
+                            all_list.append((uid_int, fname, w_otps, t_otps))
+
+            all_list.sort(key=lambda x: (x[2], x[3]), reverse=True)
+            top_5 = all_list[:5]
+
+            for idx, item in enumerate(all_list, start=1):
+                if item[0] == user_id:
+                    user_rank = f"#{idx}"
+                    break
+        except Exception as e:
+            logging.error(f"Firebase leaderboard fetch error: {e}")
+    else:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, first_name, weekly_otps, total_otps FROM users WHERE weekly_otps > 0 ORDER BY weekly_otps DESC, total_otps DESC LIMIT 5")
+            top_5 = cursor.fetchall()
+
+            cursor.execute("SELECT weekly_otps FROM users WHERE user_id = ?", (user_id,))
+            u_row = cursor.fetchone()
+            if u_row:
+                user_weekly_otps = u_row[0] or 0
+
+            if user_weekly_otps > 0:
+                cursor.execute("SELECT COUNT(*) FROM users WHERE weekly_otps > ?", (user_weekly_otps,))
+                higher_cnt = cursor.fetchone()[0]
+                user_rank = f"#{higher_cnt + 1}"
+
+            conn.close()
+        except Exception as e:
+            logging.error(f"SQLite leaderboard fetch error: {e}")
+
+    medals = ["🥇 1.", "🥈 2.", "🥉 3.", "4️⃣ 4.", "5️⃣ 5."]
+    leaderboard_text = "🏆 <b>WEEKLY TOP OTP RECEIVERS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+
+    if top_5:
+        for idx, row in enumerate(top_5):
+            uid = row[0]
+            fname = row[1] if row[1] else f"User {uid}"
+            w_otps = row[2]
+            medal = medals[idx] if idx < len(medals) else f"{idx+1}."
+            safe_fname = html.escape(fname)
+            user_link = f'<a href="tg://user?id={uid}">{safe_fname}</a>'
+            leaderboard_text += f"{medal} {user_link} — <b>{w_otps}</b> OTPs\n"
+    else:
+        leaderboard_text += "<i>No OTP receivers this week yet. Be the first!</i>\n"
+
+    leaderboard_text += "━━━━━━━━━━━━━━━━━━━━\n"
+    leaderboard_text += f"👤 <b>Your Rank:</b> {user_rank} ({user_weekly_otps} OTPs)"
+    return leaderboard_text
 
 
 def get_user_profile_sync(user_id: int) -> dict:
@@ -884,13 +1067,19 @@ def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0) -> dict:
     new_total_otps = prof["total_otps"] + 1
     new_today_earned = prof["today_earned"] + amount
 
+    weekly_otps = 0
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
+            u_data = db.reference(f"users/{user_id}").get() or {}
+            if isinstance(u_data, dict):
+                weekly_otps = int(u_data.get("weekly_otps", 0)) + 1
+
             db.reference(f"users/{user_id}").update({
                 "balance": new_bal,
                 "total_earned": new_total_earned,
                 "today_earned": new_today_earned,
                 "total_otps": new_total_otps,
+                "weekly_otps": weekly_otps,
                 "last_earn_date": current_date,
                 "exists": True
             })
@@ -900,16 +1089,24 @@ def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0) -> dict:
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, ?)", (user_id, current_date))
+        cursor.execute("SELECT weekly_otps FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            weekly_otps = row[0] + 1
+        else:
+            weekly_otps = 1
+
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, ?)", (user_id, current_date))
         cursor.execute("""
             UPDATE users SET 
                 balance = ?,
                 today_earned = ?,
                 total_earned = ?,
                 total_otps = ?,
+                weekly_otps = ?,
                 last_earn_date = ?
             WHERE user_id = ?
-        """, (new_bal, new_today_earned, new_total_earned, new_total_otps, current_date, user_id))
+        """, (new_bal, new_today_earned, new_total_earned, new_total_otps, weekly_otps, current_date, user_id))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -969,19 +1166,21 @@ def sync_firebase_to_sqlite():
         if fb_users and isinstance(fb_users, dict):
             for uid, udata in fb_users.items():
                 if str(uid).isdigit():
-                    bal, t_e, tot_e, ref_e, otps, l_date = 0.0, 0.0, 0.0, 0.0, 0, ""
+                    bal, t_e, tot_e, ref_e, otps, w_otps, fname, l_date = 0.0, 0.0, 0.0, 0.0, 0, 0, "", ""
                     if isinstance(udata, dict):
                         bal = float(udata.get("balance", 0.0))
                         t_e = float(udata.get("today_earned", 0.0))
                         tot_e = float(udata.get("total_earned", 0.0))
                         ref_e = float(udata.get("refer_earned", 0.0))
                         otps = int(udata.get("total_otps", 0))
+                        w_otps = int(udata.get("weekly_otps", 0))
+                        fname = str(udata.get("first_name", ""))
                         l_date = str(udata.get("last_earn_date", ""))
                     elif isinstance(udata, (int, float)):
                         bal = float(udata)
 
-                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, ?, ?, ?, ?, ?, ?)", (int(uid), bal, t_e, tot_e, ref_e, otps, l_date))
-                    cursor.execute("UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, refer_earned = ?, total_otps = ?, last_earn_date = ? WHERE user_id = ?", (bal, t_e, tot_e, ref_e, otps, l_date, int(uid)))
+                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (int(uid), bal, t_e, tot_e, ref_e, otps, w_otps, fname, l_date))
+                    cursor.execute("UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, refer_earned = ?, total_otps = ?, weekly_otps = ?, first_name = ?, last_earn_date = ? WHERE user_id = ?", (bal, t_e, tot_e, ref_e, otps, w_otps, fname, l_date, int(uid)))
 
         fb_admins = db.reference("admins").get()
         if fb_admins and isinstance(fb_admins, dict):
@@ -990,7 +1189,6 @@ def sync_firebase_to_sqlite():
                     name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
                     cursor.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (int(uid), str(name)))
 
-        # Sync API Panels from Firebase to SQLite
         fb_panels = db.reference("api_panels").get()
         if fb_panels and isinstance(fb_panels, dict):
             for pid, pdata in fb_panels.items():
@@ -1002,13 +1200,11 @@ def sync_firebase_to_sqlite():
                     pinterval = float(pdata.get("polling_interval", 5.0))
                     cursor.execute("INSERT OR REPLACE INTO api_panels (id, name, url, token, polling_interval) VALUES (?, ?, ?, ?, ?)", (p_id, name, url, token, pinterval))
 
-        # Sync Withdraw Methods
         fb_methods = db.reference("withdraw_methods").get()
         if fb_methods and isinstance(fb_methods, dict):
             for m_name in fb_methods.keys():
                 cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES (?)", (str(m_name),))
 
-        # Sync Withdraw Requests
         fb_wreqs = db.reference("withdraw_requests").get()
         if fb_wreqs and isinstance(fb_wreqs, dict):
             for rid, rdata in fb_wreqs.items():
@@ -1453,26 +1649,57 @@ def build_extra_settings_view():
     show_country_count = get_setting("show_country_count", "false") == "true"
     show_dev = get_setting("show_developer", "true") == "true"
     withdraw_on = get_setting("withdraw_enabled", "true") == "true"
+    ranking_bonus_on = get_setting("ranking_bonus_enabled", "true") == "true"
 
     msg_status = "ENABLED 🟢" if show_msg else "DISABLED 🔴"
     count_status = "ENABLED 🟢" if show_country_count else "DISABLED 🔴"
     dev_status = "ENABLED 🟢" if show_dev else "DISABLED 🔴"
     withdraw_status = "ENABLED 🟢" if withdraw_on else "DISABLED 🔴"
+    ranking_status = "ENABLED 🟢" if ranking_bonus_on else "DISABLED 🔴"
 
     text = (
         "⚙️ **EXTRA SETTINGS**\n\n"
         f"📩 **Show OTP Message:** `{msg_status}`\n"
         f"🔢 **Show Country Number Count:** `{count_status}`\n"
         f"👨‍💻 **Show Developer Info:** `{dev_status}`\n"
-        f"💸 **Withdraw System:** `{withdraw_status}`\n\n"
-        "Use the buttons below to enable/disable each option."
+        f"💸 **Withdraw System:** `{withdraw_status}`\n"
+        f"🏆 **Ranking Bonus System:** `{ranking_status}`\n\n"
+        "Use the buttons below to enable/disable or configure options."
     )
     buttons = [
         [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger")],
         [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger")],
         [create_button(f"Show Developer: {dev_status}", callback_data="adm:toggle:show_dev", style="success" if show_dev else "danger")],
         [create_button(f"Withdraw System: {withdraw_status}", callback_data="adm:toggle:withdraw", style="success" if withdraw_on else "danger")],
-        [create_button("💳 Withdraw Settings", callback_data="adm:w_settings", style="primary")]
+        [create_button(f"Ranking Bonus: {ranking_status}", callback_data="adm:toggle:ranking_bonus", style="success" if ranking_bonus_on else "danger")],
+        [
+            create_button("💳 Withdraw Settings", callback_data="adm:w_settings", style="primary"),
+            create_button("🏆 Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_ranking_bonus_settings_view():
+    bonus_enabled = get_setting("ranking_bonus_enabled", "true") == "true"
+    status_str = "ENABLED 🟢" if bonus_enabled else "DISABLED 🔴"
+
+    b1 = get_setting("rank_bonus_1", "50")
+    b2 = get_setting("rank_bonus_2", "30")
+    b3 = get_setting("rank_bonus_3", "20")
+
+    text = (
+        "🏆 **RANKING BONUS SETTINGS**\n\n"
+        f"📌 **Status:** `{status_str}`\n\n"
+        f"🥇 **Top 1 Bonus:** `{b1} ৳`\n"
+        f"🥈 **Top 2 Bonus:** `{b2} ৳`\n"
+        f"🥉 **Top 3 Bonus:** `{b3} ৳`\n"
+    )
+    buttons = [
+        [create_button("✏️ Edit Top 1 Bonus", callback_data="adm:r_set_b1", style="primary")],
+        [create_button("✏️ Edit Top 2 Bonus", callback_data="adm:r_set_b2", style="primary")],
+        [create_button("✏️ Edit Top 3 Bonus", callback_data="adm:r_set_b3", style="primary")],
+        [create_button("Back", callback_data="adm:extra_back", style="danger")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -1671,7 +1898,7 @@ def migrate_sqlite_to_firebase():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date FROM users")
+    cursor.execute("SELECT user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date FROM users")
     users = cursor.fetchall()
     for u in users:
         db.reference(f"users/{u[0]}").set({
@@ -1681,7 +1908,9 @@ def migrate_sqlite_to_firebase():
             "total_earned": u[3] if len(u) > 3 else 0.0,
             "refer_earned": u[4] if len(u) > 4 else 0.0,
             "total_otps": u[5] if len(u) > 5 else 0,
-            "last_earn_date": u[6] if len(u) > 6 else ""
+            "weekly_otps": u[6] if len(u) > 6 else 0,
+            "first_name": u[7] if len(u) > 7 else "",
+            "last_earn_date": u[8] if len(u) > 8 else ""
         })
 
     cursor.execute("SELECT user_id, name FROM admins")
@@ -1781,7 +2010,10 @@ def run_flask():
     WAIT_REJECT_REASON,
     WAIT_DEV_NAME,
     WAIT_DEV_LINK,
-) = range(22)
+    WAIT_RANK1_BONUS,
+    WAIT_RANK2_BONUS,
+    WAIT_RANK3_BONUS,
+) = range(25)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -1809,7 +2041,7 @@ def get_main_keyboard(user_id: int):
             {"text": "WALLET", "style": "primary"}
         ],
         [
-            {"text": "CHANNEL", "style": "danger"},
+            {"text": "RANKING", "style": "primary"},
             {"text": "SUPPORT", "style": "danger"}
         ]
     ]
@@ -1858,20 +2090,22 @@ def get_global_settings_keyboard():
 # ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await run_db(save_user, user_id)
+    first_name = update.effective_user.first_name or ""
+    await run_db(save_user, user_id, first_name)
 
     context.user_data.pop('service_name', None)
     context.user_data.pop('country_name', None)
     context.user_data['current_menu'] = 'main'
-    first_name = escape_md(update.effective_user.first_name or "User")
-    msg = f"Welcome, {first_name}!\nPlease select an option from the menu:"
+    first_name_esc = escape_md(first_name or "User")
+    msg = f"Welcome, {first_name_esc}!\nPlease select an option from the menu:"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
 
 
 async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
-    await run_db(save_user, user_id)
+    first_name = update.effective_user.first_name or ""
+    await run_db(save_user, user_id, first_name)
 
     text_upper = text.strip().upper()
     user_is_admin = is_admin_sync(user_id)
@@ -1884,7 +2118,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=kbd)
 
     elif text_upper == "PROFILE":
-        first_name = escape_md(update.effective_user.first_name or "User")
+        first_name_esc = escape_md(first_name or "User")
         bot_username = context.bot.username or "bot"
         refer_link = f"https://t.me/{bot_username}?start={user_id}"
         
@@ -1898,7 +2132,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         profile_text = (
             "👤 **USER PROFILE**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"📝 Name: {first_name}\n"
+            f"📝 Name: {first_name_esc}\n"
             f"🆔 ID: `{user_id}`\n"
             f"💰 Balance: {bal_str} ৳\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1926,12 +2160,9 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_text(wallet_text, reply_markup=kbd, parse_mode="Markdown")
 
-    elif text_upper == "CHANNEL":
-        ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
-        kbd = InlineKeyboardMarkup([
-            [create_button("Join Channel", url=ch_link, style="primary")]
-        ])
-        await update.message.reply_text("Click below to join our official channel:", reply_markup=kbd)
+    elif text_upper in ["RANKING", "LEADERBOARD"]:
+        leaderboard_msg = await run_db(get_ranking_leaderboard_sync, user_id, context.application)
+        await update.message.reply_text(leaderboard_msg, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
     elif text_upper == "SUPPORT":
         sp_link = clean_tg_link(get_setting("support", "@your_support"))
@@ -2129,6 +2360,68 @@ async def receive_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_
 
     context.user_data.pop('w_method', None)
     context.user_data.pop('w_wallet', None)
+    return ConversationHandler.END
+
+
+# ---------------- RANKING BONUS CONVERSATION HANDLERS ----------------
+@admin_only
+async def set_rank1_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Enter bonus amount for **Top 1** user (e.g., 50):", parse_mode="Markdown")
+    return WAIT_RANK1_BONUS
+
+async def receive_rank1_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_str = update.message.text.strip()
+    try:
+        val = float(val_str)
+        if val < 0: val = 0.0
+    except ValueError:
+        val = 50.0
+
+    set_setting("rank_bonus_1", str(val))
+    await update.message.reply_text(f"✅ Top 1 bonus set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
+    text_msg, kbd = build_ranking_bonus_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+@admin_only
+async def set_rank2_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Enter bonus amount for **Top 2** user (e.g., 30):", parse_mode="Markdown")
+    return WAIT_RANK2_BONUS
+
+async def receive_rank2_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_str = update.message.text.strip()
+    try:
+        val = float(val_str)
+        if val < 0: val = 0.0
+    except ValueError:
+        val = 30.0
+
+    set_setting("rank_bonus_2", str(val))
+    await update.message.reply_text(f"✅ Top 2 bonus set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
+    text_msg, kbd = build_ranking_bonus_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+@admin_only
+async def set_rank3_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Enter bonus amount for **Top 3** user (e.g., 20):", parse_mode="Markdown")
+    return WAIT_RANK3_BONUS
+
+async def receive_rank3_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_str = update.message.text.strip()
+    try:
+        val = float(val_str)
+        if val < 0: val = 0.0
+    except ValueError:
+        val = 20.0
+
+    set_setting("rank_bonus_3", str(val))
+    await update.message.reply_text(f"✅ Top 3 bonus set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
+    text_msg, kbd = build_ranking_bonus_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -2568,8 +2861,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
+    first_name = query.from_user.first_name or ""
     user_is_admin = is_admin_sync(user_id)
-    await run_db(save_user, user_id)
+    await run_db(save_user, user_id, first_name)
 
     if data == "noop":
         await query.answer()
@@ -2613,6 +2907,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_is_admin:
             return
         text_msg, kbd = build_withdraw_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:r_bonus_settings":
+        await query.answer()
+        if not user_is_admin:
+            return
+        text_msg, kbd = build_ranking_bonus_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:extra_back":
@@ -2804,6 +3105,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting("withdraw_enabled", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Withdraw system is now {status_text}!", show_alert=True)
+        text_msg, kbd = build_extra_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:toggle:ranking_bonus":
+        await query.answer()
+        if not user_is_admin:
+            return
+        curr_val = get_setting("ranking_bonus_enabled", "true")
+        new_val = "false" if curr_val == "true" else "true"
+        set_setting("ranking_bonus_enabled", new_val)
+        status_text = "enabled" if new_val == "true" else "disabled"
+        await query.answer(f"Ranking Bonus System is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
@@ -3084,7 +3397,6 @@ async def process_otp_items(items: list, application: Application, processed_ids
         clean_num = re.sub(r'\D', '', num)
         allocated_user, service_name = await run_db(lookup_allocation_sync, num, clean_num)
 
-        # JSON response er cli theke service name show korbe
         display_service = cli if cli else (service_name if service_name else "Service")
 
         otp_code = extract_otp(msg)
@@ -3237,6 +3549,8 @@ async def otp_poller_manager(application: Application):
             if cycle_count % 120 == 0:
                 await run_db(cleanup_old_otp_ids_sync)
 
+            await run_db(check_and_process_weekly_reset_sync, bot_app=application)
+
         except Exception as e:
             logging.error(f"OTP Poller Manager Error: {e}")
 
@@ -3266,6 +3580,9 @@ def main():
             CallbackQueryHandler(admin_add_w_method_start, pattern="^adm:w_add_m$"),
             CallbackQueryHandler(admin_set_min_w_start, pattern="^adm:w_set_min$"),
             CallbackQueryHandler(admin_reject_w_start, pattern="^adm:w_rej_start:"),
+            CallbackQueryHandler(set_rank1_bonus_start, pattern="^adm:r_set_b1$"),
+            CallbackQueryHandler(set_rank2_bonus_start, pattern="^adm:r_set_b2$"),
+            CallbackQueryHandler(set_rank3_bonus_start, pattern="^adm:r_set_b3$"),
             MessageHandler(filters.Regex("(?i)^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
         ],
@@ -3292,6 +3609,9 @@ def main():
             WAIT_REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_reject_reason)],
             WAIT_DEV_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_dev_name)],
             WAIT_DEV_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_dev_link)],
+            WAIT_RANK1_BONUS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_rank1_bonus)],
+            WAIT_RANK2_BONUS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_rank2_bonus)],
+            WAIT_RANK3_BONUS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_rank3_bonus)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
