@@ -605,26 +605,26 @@ def get_all_api_panels_sync() -> list:
                             "token": str(pdata.get("token", "")),
                             "polling_interval": float(pdata.get("polling_interval", 5.0))
                         })
+                return panels
         except Exception as e:
             logging.error(f"Firebase get API panels error: {e}")
 
-    if not panels:
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
-            rows = cursor.fetchall()
-            for r in rows:
-                panels.append({
-                    "id": str(r[0]),
-                    "name": str(r[1]),
-                    "url": str(r[2]),
-                    "token": str(r[3]),
-                    "polling_interval": float(r[4]) if r[4] else 5.0
-                })
-            conn.close()
-        except Exception as e:
-            logging.error(f"SQLite get API panels error: {e}")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
+        rows = cursor.fetchall()
+        for r in rows:
+            panels.append({
+                "id": str(r[0]),
+                "name": str(r[1]),
+                "url": str(r[2]),
+                "token": str(r[3]),
+                "polling_interval": float(r[4]) if r[4] else 5.0
+            })
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite get API panels error: {e}")
     return panels
 
 
@@ -984,20 +984,17 @@ def sync_firebase_to_sqlite():
     if not HAS_FIREBASE_LIB or not firebase_admin._apps:
         return
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
         fb_settings = db.reference("settings").get()
         if fb_settings and isinstance(fb_settings, dict):
-            conn = get_db_connection()
-            cursor = conn.cursor()
             for k, v in fb_settings.items():
                 if v is not None:
                     cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (str(k), str(v)))
-            conn.commit()
-            conn.close()
 
         fb_users = db.reference("users").get()
         if fb_users and isinstance(fb_users, dict):
-            conn = get_db_connection()
-            cursor = conn.cursor()
             for uid, udata in fb_users.items():
                 if str(uid).isdigit():
                     bal, t_e, tot_e, ref_e, otps, l_date = 0.0, 0.0, 0.0, 0.0, 0, ""
@@ -1013,20 +1010,49 @@ def sync_firebase_to_sqlite():
 
                     cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, ?, ?, ?, ?, ?, ?)", (int(uid), bal, t_e, tot_e, ref_e, otps, l_date))
                     cursor.execute("UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, refer_earned = ?, total_otps = ?, last_earn_date = ? WHERE user_id = ?", (bal, t_e, tot_e, ref_e, otps, l_date, int(uid)))
-            conn.commit()
-            conn.close()
 
         fb_admins = db.reference("admins").get()
         if fb_admins and isinstance(fb_admins, dict):
-            conn = get_db_connection()
-            cursor = conn.cursor()
             for uid, adata in fb_admins.items():
                 if str(uid).isdigit():
                     name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
                     cursor.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (int(uid), str(name)))
-            conn.commit()
-            conn.close()
 
+        # Sync API Panels from Firebase to SQLite
+        fb_panels = db.reference("api_panels").get()
+        if fb_panels and isinstance(fb_panels, dict):
+            for pid, pdata in fb_panels.items():
+                if isinstance(pdata, dict):
+                    p_id = str(pdata.get("id", pid))
+                    name = str(pdata.get("name", ""))
+                    url = str(pdata.get("url", ""))
+                    token = str(pdata.get("token", ""))
+                    pinterval = float(pdata.get("polling_interval", 5.0))
+                    cursor.execute("INSERT OR REPLACE INTO api_panels (id, name, url, token, polling_interval) VALUES (?, ?, ?, ?, ?)", (p_id, name, url, token, pinterval))
+
+        # Sync Withdraw Methods
+        fb_methods = db.reference("withdraw_methods").get()
+        if fb_methods and isinstance(fb_methods, dict):
+            for m_name in fb_methods.keys():
+                cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES (?)", (str(m_name),))
+
+        # Sync Withdraw Requests
+        fb_wreqs = db.reference("withdraw_requests").get()
+        if fb_wreqs and isinstance(fb_wreqs, dict):
+            for rid, rdata in fb_wreqs.items():
+                if isinstance(rdata, dict):
+                    r_id = int(rdata.get("id", rid))
+                    u_id = int(rdata.get("user_id", 0))
+                    meth = str(rdata.get("method", ""))
+                    wnum = str(rdata.get("wallet_number", ""))
+                    amt = float(rdata.get("amount", 0.0))
+                    st = str(rdata.get("status", "pending"))
+                    rr = str(rdata.get("reject_reason", ""))
+                    ca = int(rdata.get("created_at", 0))
+                    cursor.execute("INSERT OR REPLACE INTO withdraw_requests (id, user_id, method, wallet_number, amount, status, reject_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (r_id, u_id, meth, wnum, amt, st, rr, ca))
+
+        conn.commit()
+        conn.close()
         refresh_all_caches_sync()
     except Exception as e:
         logging.error(f"Error syncing Firebase data to SQLite: {e}")
@@ -1510,13 +1536,14 @@ def build_admin_withdraw_requests_view(page: int = 1):
     buttons = []
     for r in page_reqs:
         st_icon = "⏳" if r["status"] == "pending" else ("✅" if r["status"] == "approved" else "❌")
-        btn_text = f"#{r['id']} | {r['method']} | {fmt_num(r['amount'])} ৳ | {st_icon}"
+        btn_text = f"{r['wallet_number']} • {fmt_num(r['amount'])}৳ {st_icon}"
         buttons.append([create_button(btn_text, callback_data=f"adm:w_view:{r['id']}", style="primary")])
 
     nav_row = []
     if page > 1:
         nav_row.append(create_button("⬅️ Prev", callback_data=f"adm:w_page:{page-1}", style="primary"))
-    nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="secondary"))
+    if total_pages > 1:
+        nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="secondary"))
     if page < total_pages:
         nav_row.append(create_button("Next ➡️", callback_data=f"adm:w_page:{page+1}", style="primary"))
 
@@ -1686,6 +1713,7 @@ def migrate_sqlite_to_firebase():
         num, uid, srv, cnt = row
         db.reference(f"allocations/{num}").set({"user_id": uid, "service": srv, "country": cnt})
 
+    existing_fb_panels = db.reference("api_panels").get() or {}
     cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
     rows = cursor.fetchall()
     for row in rows:
@@ -1693,6 +1721,12 @@ def migrate_sqlite_to_firebase():
         db.reference(f"api_panels/{pid}").set({
             "id": str(pid), "name": name, "url": url, "token": token, "polling_interval": pinterval
         })
+    if not rows and existing_fb_panels and isinstance(existing_fb_panels, dict):
+        for pid, pdata in existing_fb_panels.items():
+            if isinstance(pdata, dict):
+                p_id = str(pdata.get("id", pid))
+                cursor.execute("INSERT OR REPLACE INTO api_panels (id, name, url, token, polling_interval) VALUES (?, ?, ?, ?, ?)",
+                    (p_id, str(pdata.get("name","")), str(pdata.get("url","")), str(pdata.get("token","")), float(pdata.get("polling_interval", 5.0))))
 
     cursor.execute("SELECT name FROM withdraw_methods")
     methods = cursor.fetchall()
@@ -2496,14 +2530,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=kbd)
 
     elif data == "usr:withdraw":
-        await query.answer()
         bal = await run_db(get_user_balance_sync, user_id)
         min_w = float(get_setting("min_withdraw_amount", "50"))
 
         if bal < min_w:
-            await query.answer(f"❌ Min withdraw is {fmt_num(min_w)} ৳. Your balance: {fmt_num(bal)} ৳", show_alert=True)
+            await query.answer(f"❌ আপনার ব্যালেন্স পর্যাপ্ত নয়! মিনিমাম উইথড্র: {fmt_num(min_w)} ৳। আপনার ব্যালেন্স: {fmt_num(bal)} ৳।", show_alert=True)
             return
 
+        await query.answer()
         methods = await run_db(get_withdraw_methods_sync)
         if not methods:
             await query.message.reply_text("❌ No withdraw methods are currently available. Please try again later.")
