@@ -59,7 +59,7 @@ PANEL_TASKS = {}     # Dynamic background tasks for API panels
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Withdraw|Back)$")
 
 
 # ---------------- PURE HELPERS ----------------
@@ -219,6 +219,23 @@ def init_sqlite():
             polling_interval REAL DEFAULT 5.0
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS withdraw_methods (
+            name TEXT PRIMARY KEY
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS withdraw_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            method TEXT,
+            wallet_number TEXT,
+            amount REAL,
+            status TEXT DEFAULT 'pending',
+            reject_reason TEXT DEFAULT '',
+            created_at INTEGER
+        )
+    ''')
 
     try:
         cursor.execute("ALTER TABLE seen_otps ADD COLUMN ts INTEGER DEFAULT 0")
@@ -267,10 +284,220 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_link', 'https://t.me/developer')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdraw_amount', '50')")
+
+    cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES ('Bkash')")
+    cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES ('Nagad')")
+    cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES ('TRC20')")
+
     conn.commit()
     conn.close()
 
 init_sqlite()
+
+
+# ---------------- WITHDRAW DB OPERATIONS ----------------
+def get_withdraw_methods_sync() -> list:
+    methods = []
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_m = db.reference("withdraw_methods").get()
+            if fb_m and isinstance(fb_m, dict):
+                methods = list(fb_m.keys())
+        except Exception as e:
+            logging.error(f"Firebase get withdraw methods error: {e}")
+
+    if not methods:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM withdraw_methods")
+            methods = [r[0] for r in cursor.fetchall()]
+            conn.close()
+        except Exception as e:
+            logging.error(f"SQLite get withdraw methods error: {e}")
+    return methods
+
+
+def add_withdraw_method_sync(name: str):
+    name = name.strip()
+    if not name:
+        return
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"withdraw_methods/{name}").set(True)
+        except Exception as e:
+            logging.error(f"Firebase add withdraw method error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES (?)", (name,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite add withdraw method error: {e}")
+
+
+def delete_withdraw_method_sync(name: str):
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"withdraw_methods/{name}").delete()
+        except Exception as e:
+            logging.error(f"Firebase delete withdraw method error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM withdraw_methods WHERE name = ?", (name,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite delete withdraw method error: {e}")
+
+
+def deduct_user_balance_sync(user_id: int, amount: float) -> bool:
+    curr_bal = get_user_balance_sync(user_id)
+    if curr_bal < amount:
+        return False
+    new_bal = curr_bal - amount
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"users/{user_id}/balance").set(new_bal)
+        except Exception as e:
+            logging.error(f"Firebase deduct balance error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite deduct balance error: {e}")
+    return True
+
+
+def refund_user_balance_sync(user_id: int, amount: float):
+    curr_bal = get_user_balance_sync(user_id)
+    new_bal = curr_bal + amount
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"users/{user_id}/balance").set(new_bal)
+        except Exception as e:
+            logging.error(f"Firebase refund balance error: {e}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite refund balance error: {e}")
+
+
+def create_withdraw_request_sync(user_id: int, method: str, wallet_number: str, amount: float) -> int:
+    ts = int(time.time())
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO withdraw_requests (user_id, method, wallet_number, amount, status, reject_reason, created_at)
+        VALUES (?, ?, ?, ?, 'pending', '', ?)
+    """, (user_id, method, wallet_number, amount, ts))
+    req_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"withdraw_requests/{req_id}").set({
+                "id": req_id,
+                "user_id": user_id,
+                "method": method,
+                "wallet_number": wallet_number,
+                "amount": amount,
+                "status": "pending",
+                "reject_reason": "",
+                "created_at": ts
+            })
+        except Exception as e:
+            logging.error(f"Firebase create withdraw req error: {e}")
+    return req_id
+
+
+def get_all_withdraw_requests_sync() -> list:
+    requests = []
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            fb_reqs = db.reference("withdraw_requests").get()
+            if fb_reqs and isinstance(fb_reqs, dict):
+                for rid, rdata in fb_reqs.items():
+                    if isinstance(rdata, dict):
+                        requests.append({
+                            "id": int(rdata.get("id", rid)),
+                            "user_id": int(rdata.get("user_id", 0)),
+                            "method": str(rdata.get("method", "")),
+                            "wallet_number": str(rdata.get("wallet_number", "")),
+                            "amount": float(rdata.get("amount", 0.0)),
+                            "status": str(rdata.get("status", "pending")),
+                            "reject_reason": str(rdata.get("reject_reason", "")),
+                            "created_at": int(rdata.get("created_at", 0))
+                        })
+        except Exception as e:
+            logging.error(f"Firebase fetch withdraw reqs error: {e}")
+
+    if not requests:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, user_id, method, wallet_number, amount, status, reject_reason, created_at FROM withdraw_requests ORDER BY id ASC")
+            for r in cursor.fetchall():
+                requests.append({
+                    "id": r[0],
+                    "user_id": r[1],
+                    "method": r[2],
+                    "wallet_number": r[3],
+                    "amount": r[4],
+                    "status": r[5],
+                    "reject_reason": r[6],
+                    "created_at": r[7]
+                })
+            conn.close()
+        except Exception as e:
+            logging.error(f"SQLite fetch withdraw reqs error: {e}")
+    else:
+        requests.sort(key=lambda x: x["id"])
+    return requests
+
+
+def get_withdraw_request_by_id_sync(req_id: int) -> dict:
+    reqs = get_all_withdraw_requests_sync()
+    for r in reqs:
+        if r["id"] == req_id:
+            return r
+    return None
+
+
+def update_withdraw_status_sync(req_id: int, status: str, reject_reason: str = ""):
+    if CURRENT_DB_MODE == "Firebase (Cloud)":
+        try:
+            db.reference(f"withdraw_requests/{req_id}").update({
+                "status": status,
+                "reject_reason": reject_reason
+            })
+        except Exception as e:
+            logging.error(f"Firebase update withdraw status error: {e}")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE withdraw_requests SET status = ?, reject_reason = ? WHERE id = ?", (status, reject_reason, req_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite update withdraw status error: {e}")
 
 
 # ---------------- ADMIN MANAGEMENT DB OPERATIONS ----------------
@@ -1229,8 +1456,105 @@ def build_extra_settings_view():
     )
     buttons = [
         [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger")],
-        [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger")]
+        [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger")],
+        [create_button("💳 Withdraw Settings", callback_data="adm:w_settings", style="primary")]
     ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_withdraw_settings_view():
+    min_w = get_setting("min_withdraw_amount", "50")
+    methods = get_withdraw_methods_sync()
+
+    text = (
+        "💳 **WITHDRAW SETTINGS**\n\n"
+        f"💰 **Minimum Withdraw Amount:** `{min_w} ৳`\n\n"
+        "📌 **Active Payment Methods:**\n"
+    )
+    if methods:
+        for m in methods:
+            text += f"• **{escape_md(m)}**\n"
+    else:
+        text += "No active payment methods.\n"
+
+    buttons = [
+        [
+            create_button("➕ Add Method", callback_data="adm:w_add_m", style="success"),
+            create_button("❌ Remove Method", callback_data="adm:w_del_m_list", style="danger")
+        ],
+        [
+            create_button("✏️ Edit Min Amount", callback_data="adm:w_set_min", style="primary")
+        ],
+        [
+            create_button("Back", callback_data="adm:extra_back", style="danger")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_admin_withdraw_requests_view(page: int = 1):
+    reqs = get_all_withdraw_requests_sync()
+    per_page = 25
+    total_items = len(reqs)
+    total_pages = max(1, (total_items + per_page - 1) // per_page)
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+
+    start_idx = (page - 1) * per_page
+    page_reqs = reqs[start_idx:start_idx + per_page]
+
+    text = f"📋 **WITHDRAW REQUESTS (Page {page}/{total_pages})**\nTotal Requests: `{total_items}`\n\nClick on any request to view & manage:"
+
+    buttons = []
+    for r in page_reqs:
+        st_icon = "⏳" if r["status"] == "pending" else ("✅" if r["status"] == "approved" else "❌")
+        btn_text = f"#{r['id']} | {r['method']} | {fmt_num(r['amount'])} ৳ | {st_icon}"
+        buttons.append([create_button(btn_text, callback_data=f"adm:w_view:{r['id']}", style="primary")])
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(create_button("⬅️ Prev", callback_data=f"adm:w_page:{page-1}", style="primary"))
+    nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="secondary"))
+    if page < total_pages:
+        nav_row.append(create_button("Next ➡️", callback_data=f"adm:w_page:{page+1}", style="primary"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_withdraw_detail_view(req_id: int):
+    r = get_withdraw_request_by_id_sync(req_id)
+    if not r:
+        return "⚠️ Request not found.", InlineKeyboardMarkup([[create_button("Back", callback_data="adm:w_page:1", style="danger")]])
+
+    dt_str = datetime.datetime.fromtimestamp(r["created_at"]).strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else "N/A"
+    st_text = r["status"].upper()
+
+    text = (
+        f"💳 **WITHDRAW REQUEST #{r['id']}**\n\n"
+        f"👤 **User ID:** `{r['user_id']}`\n"
+        f"📱 **Method:** `{escape_md(r['method'])}` \n"
+        f"💳 **Account / Wallet:** `{escape_md(r['wallet_number'])}` \n"
+        f"💰 **Amount:** `{fmt_num(r['amount'])} ৳`\n"
+        f"📌 **Status:** `{st_text}`\n"
+        f"📅 **Requested At:** `{dt_str}`\n"
+    )
+    if r["status"] == "rejected" and r["reject_reason"]:
+        text += f"\n❌ **Reason:**\n> {escape_md(r['reject_reason'])}\n"
+
+    buttons = []
+    if r["status"] == "pending":
+        buttons.append([
+            create_button("✅ APPROVE", callback_data=f"adm:w_app:{r['id']}", style="success"),
+            create_button("❌ REJECT", callback_data=f"adm:w_rej_start:{r['id']}", style="danger")
+        ])
+    buttons.append([create_button("Back to Requests", callback_data="adm:w_page:1", style="primary")])
+
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -1370,6 +1694,19 @@ def migrate_sqlite_to_firebase():
             "id": str(pid), "name": name, "url": url, "token": token, "polling_interval": pinterval
         })
 
+    cursor.execute("SELECT name FROM withdraw_methods")
+    methods = cursor.fetchall()
+    for m in methods:
+        db.reference(f"withdraw_methods/{m[0]}").set(True)
+
+    cursor.execute("SELECT id, user_id, method, wallet_number, amount, status, reject_reason, created_at FROM withdraw_requests")
+    reqs = cursor.fetchall()
+    for r in reqs:
+        db.reference(f"withdraw_requests/{r[0]}").set({
+            "id": r[0], "user_id": r[1], "method": r[2], "wallet_number": r[3],
+            "amount": r[4], "status": r[5], "reject_reason": r[6], "created_at": r[7]
+        })
+
     existing_fb_settings = db.reference("settings").get() or {}
     cursor.execute("SELECT key, value FROM settings")
     rows = cursor.fetchall()
@@ -1414,7 +1751,12 @@ def run_flask():
     WAIT_PANEL_INTERVAL,
     WAIT_ADMIN_ID,
     WAIT_ADMIN_NAME,
-) = range(15)
+    WAIT_WITHDRAW_WALLET,
+    WAIT_WITHDRAW_AMOUNT,
+    WAIT_NEW_WITHDRAW_METHOD,
+    WAIT_MIN_WITHDRAW_AMOUNT,
+    WAIT_REJECT_REASON,
+) = range(20)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -1463,6 +1805,7 @@ def get_admin_keyboard():
             {"text": "GLOBAL SETTINGS", "style": "primary"}
         ],
         [
+            {"text": "WITHDRAW", "style": "primary"},
             {"text": "BACK", "style": "danger"}
         ]
     ]
@@ -1553,7 +1896,10 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 **User ID:** `{user_id}`\n"
             f"💰 **Balance:** `{bal_str} ৳`"
         )
-        await update.message.reply_text(wallet_text, parse_mode="Markdown")
+        kbd = InlineKeyboardMarkup([
+            [create_button("💸 Withdraw", callback_data="usr:withdraw", style="success")]
+        ])
+        await update.message.reply_text(wallet_text, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "CHANNEL":
         ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
@@ -1584,6 +1930,11 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_admin_keyboard(),
             parse_mode="Markdown"
         )
+
+    elif text_upper == "WITHDRAW" and user_is_admin:
+        context.user_data['current_menu'] = 'admin'
+        text_msg, kbd = build_admin_withdraw_requests_view(1)
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "SERVICES" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
@@ -1640,7 +1991,176 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Main Menu", reply_markup=get_main_keyboard(user_id))
 
 
-# ---------------- CONVERSATION HANDLERS (ADMIN) ----------------
+# ---------------- USER WITHDRAW CONVERSATION ----------------
+async def user_start_withdraw_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    method = query.data.split(":", 2)[2]
+    user_id = query.from_user.id
+    
+    bal = await run_db(get_user_balance_sync, user_id)
+    min_w = float(get_setting("min_withdraw_amount", "50"))
+
+    if bal < min_w:
+        await query.message.reply_text(f"❌ Minimum withdraw amount is `{fmt_num(min_w)} ৳`.\nYour current balance is `{fmt_num(bal)} ৳`.", parse_mode="Markdown")
+        return ConversationHandler.END
+
+    context.user_data['w_method'] = method
+    await query.message.reply_text(f"Please enter your **{escape_md(method)}** account number / wallet address:", parse_mode="Markdown")
+    return WAIT_WITHDRAW_WALLET
+
+
+async def receive_withdraw_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wallet_no = update.message.text.strip()
+    user_id = update.effective_user.id
+    context.user_data['w_wallet'] = wallet_no
+
+    bal = await run_db(get_user_balance_sync, user_id)
+    min_w = float(get_setting("min_withdraw_amount", "50"))
+    method = context.user_data.get('w_method', 'Payment Method')
+
+    await update.message.reply_text(
+        f"Selected Method: **{escape_md(method)}**\n"
+        f"Wallet/Account: `{escape_md(wallet_no)}` \n\n"
+        f"Enter withdraw amount:\n"
+        f"📌 Minimum Amount: `{fmt_num(min_w)} ৳`\n"
+        f"💰 Available Balance: `{fmt_num(bal)} ৳`",
+        parse_mode="Markdown"
+    )
+    return WAIT_WITHDRAW_AMOUNT
+
+
+async def receive_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    input_text = update.message.text.strip()
+
+    try:
+        amount = float(input_text)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount! Please enter numbers only.\nType /cancel to abort.")
+        return WAIT_WITHDRAW_AMOUNT
+
+    bal = await run_db(get_user_balance_sync, user_id)
+    min_w = float(get_setting("min_withdraw_amount", "50"))
+
+    if amount < min_w:
+        await update.message.reply_text(f"❌ Amount cannot be less than minimum withdraw limit (`{fmt_num(min_w)} ৳`).\nPlease enter again:")
+        return WAIT_WITHDRAW_AMOUNT
+
+    if amount > bal:
+        await update.message.reply_text(f"❌ Insufficient balance! Your available balance is `{fmt_num(bal)} ৳`.\nPlease enter again:")
+        return WAIT_WITHDRAW_AMOUNT
+
+    method = context.user_data.get('w_method')
+    wallet_no = context.user_data.get('w_wallet')
+
+    success = await run_db(deduct_user_balance_sync, user_id, amount)
+    if not success:
+        await update.message.reply_text("❌ Failed to process withdraw. Insufficient balance.")
+        context.user_data.pop('w_method', None)
+        context.user_data.pop('w_wallet', None)
+        return ConversationHandler.END
+
+    req_id = await run_db(create_withdraw_request_sync, user_id, method, wallet_no, amount)
+
+    success_msg = (
+        "✅ **WITHDRAWAL REQUEST SUBMITTED**\n\n"
+        f"📌 **Request ID:** `#{req_id}`\n"
+        f"📱 **Method:** `{escape_md(method)}` \n"
+        f"💳 **Account:** `{escape_md(wallet_no)}` \n"
+        f"💰 **Amount:** `{fmt_num(amount)} ৳`\n\n"
+        "Your request has been submitted to Admin for approval."
+    )
+    await update.message.reply_text(success_msg, parse_mode="Markdown")
+
+    context.user_data.pop('w_method', None)
+    context.user_data.pop('w_wallet', None)
+    return ConversationHandler.END
+
+
+# ---------------- ADMIN WITHDRAW SETTINGS & REJECT CONVERSATIONS ----------------
+@admin_only
+async def admin_add_w_method_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Enter new payment method name (e.g., PayTM, Rocket):")
+    return WAIT_NEW_WITHDRAW_METHOD
+
+
+async def receive_new_withdraw_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    method_name = update.message.text.strip()
+    if method_name:
+        await run_db(add_withdraw_method_sync, method_name)
+        await update.message.reply_text(f"✅ Payment method **{escape_md(method_name)}** added successfully!", parse_mode="Markdown")
+    text_msg, kbd = build_withdraw_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only
+async def admin_set_min_w_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Enter new minimum withdraw amount (e.g., 50):")
+    return WAIT_MIN_WITHDRAW_AMOUNT
+
+
+async def receive_min_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    input_text = update.message.text.strip()
+    try:
+        val = float(input_text)
+        if val < 0:
+            val = 0.0
+    except ValueError:
+        val = 50.0
+
+    set_setting("min_withdraw_amount", str(val))
+    await update.message.reply_text(f"✅ Minimum withdraw amount set to `{fmt_num(val)} ৳`!", parse_mode="Markdown")
+    text_msg, kbd = build_withdraw_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only
+async def admin_reject_w_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    req_id = int(query.data.split(":", 2)[2])
+    context.user_data['reject_req_id'] = req_id
+    await query.message.reply_text(f"Please enter the rejection reason for Withdraw Request `#{req_id}`:", parse_mode="Markdown")
+    return WAIT_REJECT_REASON
+
+
+async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reason_text = update.message.text.strip()
+    req_id = context.user_data.get('reject_req_id')
+
+    if req_id:
+        req = await run_db(get_withdraw_request_by_id_sync, req_id)
+        if req and req["status"] == "pending":
+            await run_db(refund_user_balance_sync, req["user_id"], req["amount"])
+            await run_db(update_withdraw_status_sync, req_id, "rejected", reason_text)
+
+            user_msg = (
+                "❌ <b>WITHDRAWAL REJECTED</b>\n\n"
+                f"Your withdrawal request of <b>{fmt_num(req['amount'])} ৳</b> via <b>{html.escape(req['method'])}</b> has been rejected.\n"
+                f"<b>{fmt_num(req['amount'])} ৳</b> has been refunded to your wallet.\n\n"
+                "<b>Reason:</b>\n"
+                f"<blockquote expandable>{html.escape(reason_text)}</blockquote>"
+            )
+            try:
+                await context.bot.send_message(chat_id=req["user_id"], text=user_msg, parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Failed to send rejection notification: {e}")
+
+            await update.message.reply_text(f"✅ Request `#{req_id}` rejected and user notified.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Request was already processed or not found.")
+
+    context.user_data.pop('reject_req_id', None)
+    text_msg, kbd = build_admin_withdraw_requests_view(1)
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+# ---------------- CONVERSATION HANDLERS (ADMIN SETUP) ----------------
 @admin_only
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1945,6 +2465,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('new_api_url', None)
     context.user_data.pop('new_api_token', None)
     context.user_data.pop('new_admin_id', None)
+    context.user_data.pop('w_method', None)
+    context.user_data.pop('w_wallet', None)
+    context.user_data.pop('reject_req_id', None)
 
     if update.message and update.message.text:
         await handle_text_menu(update, context)
@@ -1960,6 +2483,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_is_admin = is_admin_sync(user_id)
     await run_db(save_user, user_id)
 
+    if data == "noop":
+        await query.answer()
+        return
+
     if data == "back_to_services":
         await query.answer()
         kbd, msg = get_services_keyboard()
@@ -1967,6 +2494,115 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg)
         else:
             await query.edit_message_text(msg, reply_markup=kbd)
+
+    elif data == "usr:withdraw":
+        await query.answer()
+        bal = await run_db(get_user_balance_sync, user_id)
+        min_w = float(get_setting("min_withdraw_amount", "50"))
+
+        if bal < min_w:
+            await query.answer(f"❌ Min withdraw is {fmt_num(min_w)} ৳. Your balance: {fmt_num(bal)} ৳", show_alert=True)
+            return
+
+        methods = await run_db(get_withdraw_methods_sync)
+        if not methods:
+            await query.message.reply_text("❌ No withdraw methods are currently available. Please try again later.")
+            return
+
+        buttons = []
+        for m in methods:
+            buttons.append([create_button(m, callback_data=f"usr:w_method:{m}", style="primary")])
+
+        await query.message.reply_text("💳 **SELECT WITHDRAW METHOD:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+    elif data == "adm:w_settings":
+        await query.answer()
+        if not user_is_admin:
+            return
+        text_msg, kbd = build_withdraw_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:extra_back":
+        await query.answer()
+        if not user_is_admin:
+            return
+        text_msg, kbd = build_extra_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:panel_back":
+        await query.answer()
+        if not user_is_admin:
+            return
+        total_users = len(await run_db(get_all_users))
+        await query.message.reply_text(
+            f"**ADMIN PANEL**\n\n"
+            f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
+            f"👥 Total Registered Users: `{total_users}`",
+            reply_markup=get_admin_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    elif data == "adm:w_del_m_list":
+        await query.answer()
+        if not user_is_admin:
+            return
+        methods = await run_db(get_withdraw_methods_sync)
+        buttons = []
+        for m in methods:
+            buttons.append([create_button(f"❌ Delete {m}", callback_data=f"adm:w_del_m:{m}", style="danger")])
+        buttons.append([create_button("Back", callback_data="adm:w_settings", style="primary")])
+        await query.edit_message_text("Select payment method to remove:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm:w_del_m:"):
+        if not user_is_admin:
+            await query.answer()
+            return
+        m_name = data.split(":", 2)[2]
+        await run_db(delete_withdraw_method_sync, m_name)
+        await query.answer(f"Method {m_name} removed!", show_alert=True)
+        text_msg, kbd = build_withdraw_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:w_page:"):
+        await query.answer()
+        if not user_is_admin:
+            return
+        page = int(data.split(":", 2)[2])
+        text_msg, kbd = build_admin_withdraw_requests_view(page)
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:w_view:"):
+        await query.answer()
+        if not user_is_admin:
+            return
+        req_id = int(data.split(":", 2)[2])
+        text_msg, kbd = build_withdraw_detail_view(req_id)
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data.startswith("adm:w_app:"):
+        if not user_is_admin:
+            await query.answer()
+            return
+        req_id = int(data.split(":", 2)[2])
+        req = await run_db(get_withdraw_request_by_id_sync, req_id)
+        if req and req["status"] == "pending":
+            await run_db(update_withdraw_status_sync, req_id, "approved", "")
+            await query.answer("Withdraw Request Approved!", show_alert=True)
+
+            user_msg = (
+                "✅ <b>WITHDRAWAL APPROVED</b>\n\n"
+                f"Your withdrawal request of <b>{fmt_num(req['amount'])} ৳</b> via <b>{html.escape(req['method'])}</b> has been approved!\n"
+                f"Account / Wallet: <code>{html.escape(req['wallet_number'])}</code>"
+            )
+            try:
+                await context.bot.send_message(chat_id=req["user_id"], text=user_msg, parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Failed to send approval notification: {e}")
+
+            text_msg, kbd = build_withdraw_detail_view(req_id)
+            await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        else:
+            await query.answer("Request already processed or invalid!", show_alert=True)
 
     # Admin Control Inline Controls
     elif data == "adm:ctrl:list":
@@ -2504,6 +3140,10 @@ def main():
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
             CallbackQueryHandler(set_otpgroupid_start, pattern="^adm:set:otpgroupid$"),
+            CallbackQueryHandler(user_start_withdraw_flow, pattern="^usr:w_method:"),
+            CallbackQueryHandler(admin_add_w_method_start, pattern="^adm:w_add_m$"),
+            CallbackQueryHandler(admin_set_min_w_start, pattern="^adm:w_set_min$"),
+            CallbackQueryHandler(admin_reject_w_start, pattern="^adm:w_rej_start:"),
             MessageHandler(filters.Regex("(?i)^Connect Firebase$") & filters.User(user_id=ADMIN_ID), admin_upload_firebase_start),
             MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
         ],
@@ -2523,6 +3163,11 @@ def main():
             WAIT_OTP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_link)],
             WAIT_OTP_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_otp_group_id)],
             WAIT_BROADCAST_MSG: [MessageHandler(~filters.COMMAND & ~MENU_FILTER, receive_broadcast_msg)],
+            WAIT_WITHDRAW_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_withdraw_wallet)],
+            WAIT_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_withdraw_amount)],
+            WAIT_NEW_WITHDRAW_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_new_withdraw_method)],
+            WAIT_MIN_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_min_withdraw_amount)],
+            WAIT_REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_reject_reason)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
