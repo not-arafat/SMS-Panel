@@ -2174,10 +2174,10 @@ def get_global_settings_keyboard():
             {"text": "EDIT API", "style": "success"}
         ],
         [
-            {"text": "NUMBER QUANTITY", "style": "primary"}
+            {"text": "NUMBER QUANTITY", "style": "primary"},
+            {"text": "EXTRA", "style": "primary"}
         ],
         [
-            {"text": "EXTRA", "style": "primary"},
             {"text": "BACK", "style": "danger"}
         ]
     ]
