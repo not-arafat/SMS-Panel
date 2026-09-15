@@ -59,7 +59,7 @@ PANEL_TASKS = {}     # Dynamic background tasks for API panels
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Withdraw|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Connect Firebase|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
 
 
 # ---------------- PURE HELPERS ----------------
@@ -1839,7 +1839,7 @@ def get_admin_keyboard():
             {"text": "GLOBAL SETTINGS", "style": "primary"}
         ],
         [
-            {"text": "WITHDRAW", "style": "primary"},
+            {"text": "MANAGE PAYOUTS", "style": "primary"},
             {"text": "BACK", "style": "danger"}
         ]
     ]
@@ -1965,7 +1965,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif text_upper == "WITHDRAW" and user_is_admin:
+    elif (text_upper == "MANAGE PAYOUTS" or text_upper == "WITHDRAW") and user_is_admin:
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = build_admin_withdraw_requests_view(1)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
@@ -2036,22 +2036,46 @@ async def user_start_withdraw_flow(update: Update, context: ContextTypes.DEFAULT
     min_w = float(get_setting("min_withdraw_amount", "50"))
 
     if bal < min_w:
-        await query.message.reply_text(f"❌ Minimum withdraw amount is `{fmt_num(min_w)} ৳`.\nYour current balance is `{fmt_num(bal)} ৳`.", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ Minimum withdraw amount is `{fmt_num(min_w)} ৳`.\nYour current balance is `{fmt_num(bal)} ৳`.", parse_mode="Markdown")
         return ConversationHandler.END
 
     context.user_data['w_method'] = method
-    await query.message.reply_text(f"Please enter your **{escape_md(method)}** account number / wallet address:", parse_mode="Markdown")
+    await query.edit_message_text(f"Please enter your **{escape_md(method)}** account number / wallet address:", parse_mode="Markdown")
     return WAIT_WITHDRAW_WALLET
 
 
 async def receive_withdraw_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet_no = update.message.text.strip()
     user_id = update.effective_user.id
+    method = context.user_data.get('w_method', '')
+
+    # --- ACCOUNT NUMBER & WALLET VALIDATION ---
+    method_lower = method.lower()
+    is_valid = True
+    error_msg = ""
+
+    if any(m in method_lower for m in ['bkash', 'nagad', 'rocket', 'upay', 'cellfin']):
+        clean_num = re.sub(r'\D', '', wallet_no)
+        if len(clean_num) < 11:
+            is_valid = False
+            error_msg = "❌ Invalid Account Number! Mobile banking numbers (bKash/Nagad/Rocket) must be at least 11 digits."
+    elif any(m in method_lower for m in ['trc', 'usdt', 'crypto', 'wallet']):
+        if len(wallet_no) < 30 or not wallet_no.isalnum():
+            is_valid = False
+            error_msg = "❌ Invalid Wallet Address! Please enter a valid Crypto/TRC20 wallet address."
+    else:
+        if len(wallet_no) < 8:
+            is_valid = False
+            error_msg = "❌ Invalid Details! Account / Wallet address must be at least 8 characters long."
+
+    if not is_valid:
+        await update.message.reply_text(f"{error_msg}\n\nPlease enter a valid **{escape_md(method)}** account number / wallet address again:", parse_mode="Markdown")
+        return WAIT_WITHDRAW_WALLET
+
     context.user_data['w_wallet'] = wallet_no
 
     bal = await run_db(get_user_balance_sync, user_id)
     min_w = float(get_setting("min_withdraw_amount", "50"))
-    method = context.user_data.get('w_method', 'Payment Method')
 
     await update.message.reply_text(
         f"Selected Method: **{escape_md(method)}**\n"
@@ -2540,14 +2564,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         methods = await run_db(get_withdraw_methods_sync)
         if not methods:
-            await query.message.reply_text("❌ No withdraw methods are currently available. Please try again later.")
+            await query.edit_message_text("❌ No withdraw methods are currently available. Please try again later.")
             return
 
         buttons = []
         for m in methods:
             buttons.append([create_button(m, callback_data=f"usr:w_method:{m}", style="primary")])
 
-        await query.message.reply_text("💳 **SELECT WITHDRAW METHOD:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        await query.edit_message_text("💳 **SELECT WITHDRAW METHOD:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data == "adm:w_settings":
         await query.answer()
