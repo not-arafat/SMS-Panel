@@ -9,6 +9,7 @@ import threading
 import hashlib
 import html
 import time
+import datetime
 from functools import wraps
 
 import httpx
@@ -62,6 +63,19 @@ MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Channel|Support|Adm
 
 
 # ---------------- PURE HELPERS ----------------
+def get_bd_date_str() -> str:
+    tz_bd = datetime.timezone(datetime.timedelta(hours=6))
+    return datetime.datetime.now(tz_bd).strftime('%Y-%m-%d')
+
+
+def fmt_num(val: float) -> str:
+    if val is None:
+        return "0"
+    if val == int(val):
+        return str(int(val))
+    return f"{val:.2f}".rstrip('0').rstrip('.')
+
+
 def escape_md(text: str) -> str:
     if not text:
         return ""
@@ -145,7 +159,12 @@ def init_sqlite():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            balance REAL DEFAULT 0.0
+            balance REAL DEFAULT 0.0,
+            today_earned REAL DEFAULT 0.0,
+            total_earned REAL DEFAULT 0.0,
+            refer_earned REAL DEFAULT 0.0,
+            total_otps INTEGER DEFAULT 0,
+            last_earn_date TEXT DEFAULT ''
         )
     ''')
     cursor.execute('''
@@ -208,6 +227,31 @@ def init_sqlite():
 
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN today_earned REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN total_earned REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN refer_earned REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN total_otps INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_earn_date TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
 
@@ -537,68 +581,153 @@ async def run_db(func, *args, **kwargs):
 
 
 def save_user(user_id: int):
+    cur_date = get_bd_date_str()
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
             user_ref = db.reference(f"users/{user_id}")
             if not user_ref.get():
-                user_ref.set({"exists": True, "balance": 0.0})
+                user_ref.set({
+                    "exists": True, 
+                    "balance": 0.0,
+                    "today_earned": 0.0,
+                    "total_earned": 0.0,
+                    "refer_earned": 0.0,
+                    "total_otps": 0,
+                    "last_earn_date": cur_date
+                })
         except Exception as e:
             logging.error(f"Error saving user to Firebase: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0.0)", (user_id,))
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, ?)", (user_id, cur_date))
         conn.commit()
         conn.close()
     except Exception as e:
         logging.error(f"Error saving user to SQLite: {e}")
 
 
-def get_user_balance_sync(user_id: int) -> float:
+def get_user_profile_sync(user_id: int) -> dict:
+    current_date = get_bd_date_str()
+
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
-            bal = db.reference(f"users/{user_id}/balance").get()
-            if bal is not None:
-                return float(bal)
+            u_data = db.reference(f"users/{user_id}").get()
+            if u_data and isinstance(u_data, dict):
+                bal = float(u_data.get("balance", 0.0))
+                last_date = str(u_data.get("last_earn_date", ""))
+                today_earned = float(u_data.get("today_earned", 0.0)) if last_date == current_date else 0.0
+                total_earned = float(u_data.get("total_earned", 0.0))
+                refer_earned = float(u_data.get("refer_earned", 0.0))
+                total_otps = int(u_data.get("total_otps", 0))
+
+                if last_date != current_date:
+                    db.reference(f"users/{user_id}/today_earned").set(0.0)
+                    db.reference(f"users/{user_id}/last_earn_date").set(current_date)
+
+                return {
+                    "balance": bal,
+                    "today_earned": today_earned,
+                    "total_earned": total_earned,
+                    "refer_earned": refer_earned,
+                    "total_otps": total_otps
+                }
         except Exception as e:
-            logging.error(f"Firebase get balance error: {e}")
+            logging.error(f"Firebase profile fetch error: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
+        if row:
+            bal, today_e, total_e, refer_e, otps, last_date = row
+            bal = float(bal or 0.0)
+            today_e = float(today_e or 0.0)
+            total_e = float(total_e or 0.0)
+            refer_e = float(refer_e or 0.0)
+            otps = int(otps or 0)
+            last_date = str(last_date or "")
+
+            if last_date != current_date:
+                today_e = 0.0
+                cursor.execute("UPDATE users SET today_earned = 0.0, last_earn_date = ? WHERE user_id = ?", (current_date, user_id))
+                conn.commit()
+
+            conn.close()
+            return {
+                "balance": bal,
+                "today_earned": today_e,
+                "total_earned": total_e,
+                "refer_earned": refer_e,
+                "total_otps": otps
+            }
         conn.close()
-        if row and row[0] is not None:
-            return float(row[0])
     except Exception as e:
-        logging.error(f"SQLite get balance error: {e}")
-    return 0.0
+        logging.error(f"SQLite profile fetch error: {e}")
+
+    return {
+        "balance": 0.0,
+        "today_earned": 0.0,
+        "total_earned": 0.0,
+        "refer_earned": 0.0,
+        "total_otps": 0
+    }
 
 
-def add_user_balance_sync(user_id: int, amount: float = 1.0) -> float:
-    curr_bal = get_user_balance_sync(user_id)
-    new_bal = curr_bal + amount
+def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0) -> dict:
+    current_date = get_bd_date_str()
+    prof = get_user_profile_sync(user_id)
+
+    new_bal = prof["balance"] + amount
+    new_total_earned = prof["total_earned"] + amount
+    new_total_otps = prof["total_otps"] + 1
+    new_today_earned = prof["today_earned"] + amount
 
     if CURRENT_DB_MODE == "Firebase (Cloud)":
         try:
-            db.reference(f"users/{user_id}/balance").set(new_bal)
-            db.reference(f"users/{user_id}/exists").set(True)
+            db.reference(f"users/{user_id}").update({
+                "balance": new_bal,
+                "total_earned": new_total_earned,
+                "today_earned": new_today_earned,
+                "total_otps": new_total_otps,
+                "last_earn_date": current_date,
+                "exists": True
+            })
         except Exception as e:
-            logging.error(f"Firebase update balance error: {e}")
+            logging.error(f"Firebase update user earnings error: {e}")
 
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (user_id, new_bal))
-        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, ?)", (user_id, current_date))
+        cursor.execute("""
+            UPDATE users SET 
+                balance = ?,
+                today_earned = ?,
+                total_earned = ?,
+                total_otps = ?,
+                last_earn_date = ?
+            WHERE user_id = ?
+        """, (new_bal, new_today_earned, new_total_earned, new_total_otps, current_date, user_id))
         conn.commit()
         conn.close()
     except Exception as e:
-        logging.error(f"SQLite update balance error: {e}")
+        logging.error(f"SQLite update user earnings error: {e}")
 
-    return new_bal
+    return {
+        "balance": new_bal,
+        "today_earned": new_today_earned,
+        "total_earned": new_total_earned,
+        "refer_earned": prof["refer_earned"],
+        "total_otps": new_total_otps
+    }
+
+
+def get_user_balance_sync(user_id: int) -> float:
+    prof = get_user_profile_sync(user_id)
+    return prof["balance"]
 
 
 def get_all_users() -> list:
@@ -644,14 +773,19 @@ def sync_firebase_to_sqlite():
             cursor = conn.cursor()
             for uid, udata in fb_users.items():
                 if str(uid).isdigit():
-                    bal = 0.0
+                    bal, t_e, tot_e, ref_e, otps, l_date = 0.0, 0.0, 0.0, 0.0, 0, ""
                     if isinstance(udata, dict):
                         bal = float(udata.get("balance", 0.0))
+                        t_e = float(udata.get("today_earned", 0.0))
+                        tot_e = float(udata.get("total_earned", 0.0))
+                        ref_e = float(udata.get("refer_earned", 0.0))
+                        otps = int(udata.get("total_otps", 0))
+                        l_date = str(udata.get("last_earn_date", ""))
                     elif isinstance(udata, (int, float)):
                         bal = float(udata)
 
-                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (int(uid), bal))
-                    cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (bal, int(uid)))
+                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date) VALUES (?, ?, ?, ?, ?, ?, ?)", (int(uid), bal, t_e, tot_e, ref_e, otps, l_date))
+                    cursor.execute("UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, refer_earned = ?, total_otps = ?, last_earn_date = ? WHERE user_id = ?", (bal, t_e, tot_e, ref_e, otps, l_date, int(uid)))
             conn.commit()
             conn.close()
 
@@ -1197,10 +1331,18 @@ def migrate_sqlite_to_firebase():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT user_id, balance FROM users")
+    cursor.execute("SELECT user_id, balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date FROM users")
     users = cursor.fetchall()
     for u in users:
-        db.reference(f"users/{u[0]}").set({"exists": True, "balance": u[1] if len(u) > 1 else 0.0})
+        db.reference(f"users/{u[0]}").set({
+            "exists": True, 
+            "balance": u[1] if len(u) > 1 else 0.0,
+            "today_earned": u[2] if len(u) > 2 else 0.0,
+            "total_earned": u[3] if len(u) > 3 else 0.0,
+            "refer_earned": u[4] if len(u) > 4 else 0.0,
+            "total_otps": u[5] if len(u) > 5 else 0,
+            "last_earn_date": u[6] if len(u) > 6 else ""
+        })
 
     cursor.execute("SELECT user_id, name FROM admins")
     admins = cursor.fetchall()
@@ -1377,14 +1519,26 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         first_name = escape_md(update.effective_user.first_name or "User")
         bot_username = context.bot.username or "bot"
         refer_link = f"https://t.me/{bot_username}?start={user_id}"
-        bal = await run_db(get_user_balance_sync, user_id)
-        bal_str = f"{int(bal)}" if bal.is_integer() else f"{bal:.2f}"
+        
+        prof = await run_db(get_user_profile_sync, user_id)
+        bal_str = fmt_num(prof["balance"])
+        today_str = fmt_num(prof["today_earned"])
+        total_str = fmt_num(prof["total_earned"])
+        refer_str = fmt_num(prof["refer_earned"])
+        total_otps = prof["total_otps"]
 
         profile_text = (
-            f"👤 **USER PROFILE**\n\n"
-            f"📝 **Name:** {first_name}\n"
-            f"🆔 **ID:** `{user_id}`\n"
-            f"💰 **Balance:** `{bal_str} ৳`"
+            "👤 **USER PROFILE**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 Name: {first_name}\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"💰 Balance: {bal_str} ৳\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Today's Earn: {today_str} ৳\n"
+            f"📈 Total Earned: {total_str} ৳\n"
+            f"👥 Earned from Refer: {refer_str} ৳\n"
+            f"📨 Total OTPs: {total_otps}\n"
+            "━━━━━━━━━━━━━━━━━━━━"
         )
         kbd = InlineKeyboardMarkup([
             [create_button("Referral Link", copy_text=refer_link, style="success")]
@@ -1393,7 +1547,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "WALLET":
         bal = await run_db(get_user_balance_sync, user_id)
-        bal_str = f"{int(bal)}" if bal.is_integer() else f"{bal:.2f}"
+        bal_str = fmt_num(bal)
         wallet_text = (
             f"👛 **YOUR WALLET**\n\n"
             f"🆔 **User ID:** `{user_id}`\n"
@@ -2227,8 +2381,9 @@ async def process_otp_items(items: list, application: Application, processed_ids
                 logging.error(f"Group Forward Error: {e}")
 
         if allocated_user:
-            new_bal = await run_db(add_user_balance_sync, allocated_user, 1.0)
-            bal_str = f"{int(new_bal)}" if new_bal.is_integer() else f"{new_bal:.2f}"
+            prof = await run_db(add_user_balance_and_otp_sync, allocated_user, 1.0)
+            new_bal = prof["balance"]
+            bal_str = fmt_num(new_bal)
 
             if show_msg_enabled:
                 user_text = (
