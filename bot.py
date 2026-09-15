@@ -887,8 +887,8 @@ def check_and_process_weekly_reset_sync(bot_app=None):
                     if bot_app:
                         msg = (
                             "🎉 <b>CONGRATULATIONS! WEEKLY RANKING BONUS!</b>\n\n"
-                            f"আপনি সাপ্তাহিক র‍্যাংকিংয়ে <b>Top {rank_idx}</b> স্থান অর্জনের জন্য <b>{fmt_num(b_amt)} ৳</b> বোনাস পেয়েছেন! 🏆\n"
-                            "আপনার ওয়ালেটে বোনাস টাকা যুক্ত করা হয়েছে।"
+                            f"You earned a <b>{fmt_num(b_amt)} ৳</b> bonus for ranking <b>Top {rank_idx}</b> this week! 🏆\n"
+                            "Bonus added to your wallet."
                         )
                         try:
                             asyncio.create_task(bot_app.bot.send_message(chat_id=uid, text=msg, parse_mode="HTML"))
@@ -970,7 +970,7 @@ def get_ranking_leaderboard_sync(user_id: int, bot_app=None) -> str:
         except Exception as e:
             logging.error(f"SQLite leaderboard fetch error: {e}")
 
-    medals = ["🥇 1.", "🥈 2.", "🥉 3.", "4️⃣ 4.", "5️⃣ 5."]
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     leaderboard_text = "🏆 <b>WEEKLY TOP OTP RECEIVERS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
 
     if top_5:
@@ -1512,14 +1512,14 @@ def build_admin_services_view():
         buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
         return text, InlineKeyboardMarkup(buttons)
 
-    text = "📱 **SERVICES MANAGEMENT**\n\nBelow is the summary of your added services and available numbers:\n"
+    text = "📱 **SERVICES MANAGEMENT**\n\nSummary:\n"
     buttons = []
     for srv, cnts in summary.items():
         total_avail = sum(cnts.values())
         text += f"\n🔹 **{escape_md(srv)}** (Total Available: `{total_avail}`)"
         for cnt, count in cnts.items():
             text += f"\n   └ {escape_md(cnt)}: `{count}`"
-        buttons.append([create_button(f"⚙️ Manage {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
+        buttons.append([create_button(f"⚙️ {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
 
     buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
     return text, InlineKeyboardMarkup(buttons)
@@ -2041,7 +2041,7 @@ def get_main_keyboard(user_id: int):
             {"text": "WALLET", "style": "primary"}
         ],
         [
-            {"text": "RANKING", "style": "primary"},
+            {"text": "RANKING", "style": "danger"},
             {"text": "SUPPORT", "style": "danger"}
         ]
     ]
