@@ -242,36 +242,6 @@ def init_sqlite():
     except sqlite3.OperationalError:
         pass
 
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0.0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN today_earned REAL DEFAULT 0.0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN total_earned REAL DEFAULT 0.0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN refer_earned REAL DEFAULT 0.0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN total_otps INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN last_earn_date TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_numbers_lookup ON numbers (service, country, status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_seen_otps_ts ON seen_otps (ts)")
 
@@ -282,6 +252,8 @@ def init_sqlite():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', 'true')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_developer', 'true')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('withdraw_enabled', 'true')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_link', 'https://t.me/developer')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdraw_amount', '50')")
@@ -1387,13 +1359,17 @@ def build_edit_links_view():
     sp_val = get_setting("support", "@your_support")
     otp_link = get_setting("otp_group_link", "https://t.me/your_otp_group")
     otp_grp_id = get_setting("otp_group_id", OTP_GROUP_ID if OTP_GROUP_ID else "Not Set")
+    dev_name = get_setting("dev_username", "developer")
+    dev_link = get_setting("dev_link", "https://t.me/developer")
 
     text = (
         f"🔗 **EDIT LINKS & FORWARD SETTINGS**\n\n"
         f"📢 **Channel:** {escape_md(ch_val)}\n"
         f"🎧 **Support:** {escape_md(sp_val)}\n"
         f"🔗 **OTP Group Link:** {escape_md(otp_link)}\n"
-        f"🆔 **OTP Forward Group ID:** `{escape_md(str(otp_grp_id))}`\n\n"
+        f"🆔 **OTP Forward Group ID:** `{escape_md(str(otp_grp_id))}`\n"
+        f"👨‍💻 **Dev Name:** `{escape_md(dev_name)}`\n"
+        f"🔗 **Dev Link:** {escape_md(dev_link)}\n\n"
         f"Click below to modify settings:"
     )
     buttons = [
@@ -1404,6 +1380,10 @@ def build_edit_links_view():
         [
             create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary"),
             create_button("🆔 Edit Forward Group ID", callback_data="adm:set:otpgroupid", style="primary")
+        ],
+        [
+            create_button("👨‍💻 Edit Dev Name", callback_data="adm:set:devname", style="primary"),
+            create_button("🔗 Edit Dev Link", callback_data="adm:set:devlink", style="primary")
         ]
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -1471,18 +1451,27 @@ def build_number_quantity_view():
 def build_extra_settings_view():
     show_msg = get_setting("show_message", "true") == "true"
     show_country_count = get_setting("show_country_count", "false") == "true"
+    show_dev = get_setting("show_developer", "true") == "true"
+    withdraw_on = get_setting("withdraw_enabled", "true") == "true"
+
     msg_status = "ENABLED 🟢" if show_msg else "DISABLED 🔴"
     count_status = "ENABLED 🟢" if show_country_count else "DISABLED 🔴"
+    dev_status = "ENABLED 🟢" if show_dev else "DISABLED 🔴"
+    withdraw_status = "ENABLED 🟢" if withdraw_on else "DISABLED 🔴"
 
     text = (
         "⚙️ **EXTRA SETTINGS**\n\n"
         f"📩 **Show OTP Message:** `{msg_status}`\n"
-        f"🔢 **Show Country Number Count:** `{count_status}`\n\n"
+        f"🔢 **Show Country Number Count:** `{count_status}`\n"
+        f"👨‍💻 **Show Developer Info:** `{dev_status}`\n"
+        f"💸 **Withdraw System:** `{withdraw_status}`\n\n"
         "Use the buttons below to enable/disable each option."
     )
     buttons = [
         [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger")],
         [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger")],
+        [create_button(f"Show Developer: {dev_status}", callback_data="adm:toggle:show_dev", style="success" if show_dev else "danger")],
+        [create_button(f"Withdraw System: {withdraw_status}", callback_data="adm:toggle:withdraw", style="success" if withdraw_on else "danger")],
         [create_button("💳 Withdraw Settings", callback_data="adm:w_settings", style="primary")]
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -1768,7 +1757,7 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# States for Admin Conversations
+# States for Admin & User Conversations
 (
     ADD_SERVICE,
     ADD_COUNTRY,
@@ -1790,7 +1779,9 @@ def run_flask():
     WAIT_NEW_WITHDRAW_METHOD,
     WAIT_MIN_WITHDRAW_AMOUNT,
     WAIT_REJECT_REASON,
-) = range(20)
+    WAIT_DEV_NAME,
+    WAIT_DEV_LINK,
+) = range(22)
 
 
 # ---------------- AUTH DECORATOR ----------------
@@ -2029,6 +2020,12 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def user_start_withdraw_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    withdraw_on = get_setting("withdraw_enabled", "true") == "true"
+    if not withdraw_on:
+        await query.edit_message_text("❌ Withdraw system is currently disabled by Admin.")
+        return ConversationHandler.END
+
     method = query.data.split(":", 2)[2]
     user_id = query.from_user.id
     
@@ -2049,7 +2046,6 @@ async def receive_withdraw_wallet(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     method = context.user_data.get('w_method', '')
 
-    # --- ACCOUNT NUMBER & WALLET VALIDATION ---
     method_lower = method.lower()
     is_valid = True
     error_msg = ""
@@ -2136,7 +2132,41 @@ async def receive_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
-# ---------------- ADMIN WITHDRAW SETTINGS & REJECT CONVERSATIONS ----------------
+# ---------------- DEVELOPER INFO & ADMIN SETTINGS CONVERSATIONS ----------------
+@admin_only
+async def set_dev_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.message.reply_text("Enter the new Developer Name/Tag (e.g., John Doe):")
+    return WAIT_DEV_NAME
+
+
+async def receive_dev_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    set_setting("dev_username", new_name)
+    await update.message.reply_text(f"✅ Developer Name updated successfully!\nCurrent Name: `{escape_md(new_name)}`", parse_mode="Markdown")
+    text_msg, kbd = build_edit_links_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only
+async def set_dev_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.message.reply_text("Enter the new Developer Telegram Link/Username (e.g., https://t.me/developer or @developer):")
+    return WAIT_DEV_LINK
+
+
+async def receive_dev_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_link = update.message.text.strip()
+    set_setting("dev_link", new_link)
+    await update.message.reply_text(f"✅ Developer Link updated successfully!\nCurrent Link: {escape_md(new_link)}", parse_mode="Markdown")
+    text_msg, kbd = build_edit_links_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
 @admin_only
 async def admin_add_w_method_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2554,6 +2584,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=kbd)
 
     elif data == "usr:withdraw":
+        withdraw_on = get_setting("withdraw_enabled", "true") == "true"
+        if not withdraw_on:
+            await query.answer("❌ Withdraw feature is currently disabled by Admin.", show_alert=True)
+            return
+
         bal = await run_db(get_user_balance_sync, user_id)
         min_w = float(get_setting("min_withdraw_amount", "50"))
 
@@ -2745,6 +2780,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting("show_country_count", new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"Country number count is now {status_text}!", show_alert=True)
+        text_msg, kbd = build_extra_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:toggle:show_dev":
+        await query.answer()
+        if not user_is_admin:
+            return
+        curr_val = get_setting("show_developer", "true")
+        new_val = "false" if curr_val == "true" else "true"
+        set_setting("show_developer", new_val)
+        status_text = "enabled" if new_val == "true" else "disabled"
+        await query.answer(f"Developer Info is now {status_text}!", show_alert=True)
+        text_msg, kbd = build_extra_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:toggle:withdraw":
+        await query.answer()
+        if not user_is_admin:
+            return
+        curr_val = get_setting("withdraw_enabled", "true")
+        new_val = "false" if curr_val == "true" else "true"
+        set_setting("withdraw_enabled", new_val)
+        status_text = "enabled" if new_val == "true" else "disabled"
+        await query.answer(f"Withdraw system is now {status_text}!", show_alert=True)
         text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
@@ -2980,6 +3039,8 @@ async def process_otp_items(items: list, application: Application, processed_ids
 
     ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
     show_msg_enabled = get_setting("show_message", "true") == "true"
+    show_dev_enabled = get_setting("show_developer", "true") == "true"
+    
     dev_username = get_setting("dev_username", "developer")
     dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
     dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
@@ -3002,7 +3063,7 @@ async def process_otp_items(items: list, application: Application, processed_ids
         num = str(item.get("num", "")).strip()
         msg = item.get("message", "")
         dt = item.get("dt", "")
-        cli = item.get("cli", "")
+        cli = item.get("cli", "").strip()
 
         if not num or not msg:
             continue
@@ -3022,17 +3083,20 @@ async def process_otp_items(items: list, application: Application, processed_ids
 
         clean_num = re.sub(r'\D', '', num)
         allocated_user, service_name = await run_db(lookup_allocation_sync, num, clean_num)
-        if not service_name:
-            service_name = cli if cli else "Service"
+
+        # JSON response er cli theke service name show korbe
+        display_service = cli if cli else (service_name if service_name else "Service")
 
         otp_code = extract_otp(msg)
 
         safe_msg = html.escape(msg)
-        safe_service = html.escape(service_name)
+        safe_service = html.escape(display_service)
         safe_num = html.escape(num)
 
         masked_num = mask_number_aph(num)
         safe_masked_num = html.escape(masked_num)
+
+        dev_footer = f"\n━━━━━━━━━━━━━━━━━\n🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}" if show_dev_enabled else ""
 
         if target_otp_group:
             if show_msg_enabled:
@@ -3041,17 +3105,15 @@ async def process_otp_items(items: list, application: Application, processed_ids
                     f"📱 <b>SERVICE</b>:  {safe_service}\n"
                     f"🌐 NUM: {safe_masked_num}\n\n"
                     "🗨️ MESSAGE:\n"
-                    f"<blockquote expandable>{safe_msg}</blockquote>\n"
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
+                    f"<blockquote expandable>{safe_msg}</blockquote>"
+                    f"{dev_footer}"
                 )
             else:
                 group_text = (
                     "━━━━━━━━━━━━━━━━━\n"
                     f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                    f"🌐 NUM: {safe_masked_num}\n"
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
+                    f"🌐 NUM: {safe_masked_num}"
+                    f"{dev_footer}"
                 )
 
             group_kbd = InlineKeyboardMarkup([
@@ -3198,6 +3260,8 @@ def main():
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
             CallbackQueryHandler(set_otplink_start, pattern="^adm:set:otplink$"),
             CallbackQueryHandler(set_otpgroupid_start, pattern="^adm:set:otpgroupid$"),
+            CallbackQueryHandler(set_dev_name_start, pattern="^adm:set:devname$"),
+            CallbackQueryHandler(set_dev_link_start, pattern="^adm:set:devlink$"),
             CallbackQueryHandler(user_start_withdraw_flow, pattern="^usr:w_method:"),
             CallbackQueryHandler(admin_add_w_method_start, pattern="^adm:w_add_m$"),
             CallbackQueryHandler(admin_set_min_w_start, pattern="^adm:w_set_min$"),
@@ -3226,6 +3290,8 @@ def main():
             WAIT_NEW_WITHDRAW_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_new_withdraw_method)],
             WAIT_MIN_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_min_withdraw_amount)],
             WAIT_REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_reject_reason)],
+            WAIT_DEV_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_dev_name)],
+            WAIT_DEV_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_dev_link)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
