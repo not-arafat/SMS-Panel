@@ -4,25 +4,27 @@ import os
 import re
 import json
 import base64
-import sqlite3
-import threading
 import hashlib
 import html
 import time
 import datetime
+from collections import OrderedDict
 from functools import wraps
+from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
 from dotenv import load_dotenv
+from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions as SupabaseClientOptions
 
 try:
     import firebase_admin
-    from firebase_admin import credentials, db
+    from firebase_admin import credentials, db as firebase_db
     HAS_FIREBASE_LIB = True
 except ImportError:
     HAS_FIREBASE_LIB = False
 
-from flask import Flask
+from flask import Flask, jsonify
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
     Application,
@@ -45,14 +47,34 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OTP_GROUP_ID = os.environ.get("OTP_GROUP_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-CURRENT_DB_MODE = "SQLite (Local)"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
 
-OTP_ID_RETENTION_SECONDS = 24 * 60 * 60  # 24 hours
-CLEANUP_EVERY_N_CYCLES = 720  # ~1 hour
+FIREBASE_B64 = os.environ.get("FIREBASE_BASE64")
+FIREBASE_JSON_ENV = os.environ.get("FIREBASE_CONFIG_JSON")
+
+CURRENT_DB_MODE = "Supabase+Firebase"
+
+OTP_ID_RETENTION_SECONDS = 24 * 60 * 60
+CLEANUP_EVERY_N_CYCLES = 720
 
 DEFAULT_PAYOUT = 0.5
-BROADCAST_CONCURRENCY = 20  # workers sending in parallel
-BROADCAST_PER_MSG_DELAY = 0.05  # per-worker delay (helps avoid 429)
+BROADCAST_CONCURRENCY = 20
+BROADCAST_PER_MSG_DELAY = 0.05
+
+# Firebase backup cadence — 10 min per 500 users max (quota-safe)
+FIREBASE_BACKUP_INTERVAL = 600
+FIREBASE_BACKUP_BATCH_SIZE = 500
+# Weekly reset check every hour
+WEEKLY_RESET_CHECK_INTERVAL = 3600
+# Leaderboard in-memory TTL
+LEADERBOARD_CACHE_TTL = 60
+# Known users LRU bound
+MAX_KNOWN_USERS = 20000
+# Processed OTP IDs LRU bound (avoid RAM pressure)
+MAX_PROCESSED_IN_MEMORY = 5000
 
 # ---------------- IN-MEMORY GLOBAL CACHE ----------------
 SETTINGS_CACHE = {}
@@ -61,12 +83,39 @@ PAYOUTS_CACHE = {}    # {service_name: {country_name: payout_amount}}
 ADMINS_CACHE = set()
 PANEL_TASKS = {}
 
+
+class LRUSet:
+    """Bounded LRU set — keeps RAM bounded on Render free tier."""
+    def __init__(self, maxsize: int = 20000):
+        self.maxsize = maxsize
+        self._data: OrderedDict = OrderedDict()
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def add(self, key):
+        if key in self._data:
+            self._data.move_to_end(key)
+        else:
+            self._data[key] = True
+            if len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+    def __len__(self):
+        return len(self._data)
+
+
+KNOWN_USERS = LRUSet(maxsize=MAX_KNOWN_USERS)
+PROCESSED_OTP_IDS_CACHE: OrderedDict = OrderedDict()
+LEADERBOARD_CACHE = {"data": None, "ts": 0}
+
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
 
 
-# ---------------- PURE HELPERS ----------------
+# ---------------- PURE HELPERS (unchanged) ----------------
 def get_bd_date_str() -> str:
     tz_bd = datetime.timezone(datetime.timedelta(hours=6))
     return datetime.datetime.now(tz_bd).strftime('%Y-%m-%d')
@@ -158,182 +207,87 @@ def mask_api_key(key: str) -> str:
     return "******"
 
 
-# ---------------- DATABASE (SYNC / BLOCKING) ----------------
-def get_db_connection():
-    conn = sqlite3.connect("bot_database.db", timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+async def run_db(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def init_sqlite():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance REAL DEFAULT 0.0,
-            today_earned REAL DEFAULT 0.0,
-            total_earned REAL DEFAULT 0.0,
-            refer_earned REAL DEFAULT 0.0,
-            total_otps INTEGER DEFAULT 0,
-            weekly_otps INTEGER DEFAULT 0,
-            first_name TEXT DEFAULT '',
-            last_earn_date TEXT DEFAULT ''
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            name TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS services (
-            service_name TEXT,
-            country_name TEXT,
-            PRIMARY KEY (service_name, country_name)
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS numbers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            service TEXT,
-            country TEXT,
-            number TEXT,
-            status TEXT DEFAULT 'available',
-            user_id INTEGER DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS allocations (
-            number TEXT PRIMARY KEY,
-            user_id INTEGER,
-            service TEXT,
-            country TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS seen_otps (
-            msg_id TEXT PRIMARY KEY,
-            ts INTEGER DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS api_panels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            url TEXT,
-            token TEXT,
-            polling_interval REAL DEFAULT 5.0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS withdraw_methods (
-            name TEXT PRIMARY KEY
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS withdraw_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            method TEXT,
-            wallet_number TEXT,
-            amount REAL,
-            status TEXT DEFAULT 'pending',
-            reject_reason TEXT DEFAULT '',
-            created_at INTEGER
-        )
-    ''')
-    # NEW: per service+country payout
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS payouts (
-            service_name TEXT,
-            country_name TEXT,
-            payout REAL DEFAULT 0.5,
-            PRIMARY KEY (service_name, country_name)
-        )
-    ''')
+# ============================================================
+# SUPABASE CLIENT
+# ============================================================
+supabase: Optional[Client] = None
 
+
+def init_supabase() -> bool:
+    global supabase
     try:
-        cursor.execute("ALTER TABLE users ADD COLUMN weekly_otps INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+        options = SupabaseClientOptions(
+            auto_refresh_token=False,
+            persist_session=False,
+        )
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
+        logger.info("Supabase client initialized")
+        return True
+    except Exception as e:
+        logger.error(f"Supabase init error: {e}")
+        return False
 
+
+# ============================================================
+# FIREBASE (BACKUP ONLY)
+# ============================================================
+firebase_db_ref = None
+
+
+def init_firebase() -> bool:
+    global firebase_db_ref
+    if not HAS_FIREBASE_LIB:
+        logger.info("Firebase Admin SDK not installed — backup disabled")
+        return False
+    if firebase_admin._apps:
+        firebase_db_ref = firebase_db
+        return True
+
+    cred_dict = None
     try:
-        cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_numbers_lookup ON numbers (service, country, status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_seen_otps_ts ON seen_otps (ts)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_alloc_number ON allocations (number)")
-
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel', 'https://t.me/your_channel')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support', '@your_support')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_link', 'https://t.me/your_otp_group')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('otp_group_id', ?)", (OTP_GROUP_ID,))
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('number_quantity', '2')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_message', 'true')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_country_count', 'false')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_developer', 'true')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('withdraw_enabled', 'true')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ranking_bonus_enabled', 'true')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rank_bonus_1', '50')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rank_bonus_2', '30')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rank_bonus_3', '20')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_weekly_reset_friday', '')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_username', 'developer')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dev_link', 'https://t.me/developer')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdraw_amount', '50')")
-
-    cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES ('Bkash')")
-    cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES ('Nagad')")
-    cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES ('TRC20')")
-
-    conn.commit()
-    conn.close()
-
-init_sqlite()
+        if FIREBASE_B64:
+            cred_dict = json.loads(base64.b64decode(FIREBASE_B64).decode('utf-8'))
+        elif FIREBASE_JSON_ENV:
+            cred_dict = json.loads(FIREBASE_JSON_ENV)
+            if "private_key" in cred_dict:
+                cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+        if cred_dict:
+            cred = credentials.Certificate(cred_dict)
+            options = {}
+            if DATABASE_URL:
+                options['databaseURL'] = DATABASE_URL
+            firebase_admin.initialize_app(cred, options if options else None)
+            firebase_db_ref = firebase_db
+            logger.info("Firebase connected (backup mode)")
+            return True
+        else:
+            logger.info("No Firebase credentials — backup disabled")
+            return False
+    except Exception as e:
+        logger.error(f"Firebase Init Error: {e}")
+        return False
 
 
-# ---------------- PAYOUT DB OPERATIONS ----------------
+# ============================================================
+# PAYOUTS
+# ============================================================
 def get_payout_sync(service: str, country: str) -> float:
     if not service or not country:
         return DEFAULT_PAYOUT
-    # Cache first
     if service in PAYOUTS_CACHE and country in PAYOUTS_CACHE[service]:
         return float(PAYOUTS_CACHE[service][country])
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            val = db.reference(f"payouts/{service}/{country}").get()
-            if val is not None:
-                fval = float(val)
-                PAYOUTS_CACHE.setdefault(service, {})[country] = fval
-                return fval
-        except Exception as e:
-            logging.error(f"Firebase get payout error: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT payout FROM payouts WHERE service_name = ? AND country_name = ?", (service, country))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0] is not None:
-            fval = float(row[0])
+        res = supabase.table("payouts").select("payout").eq("service_name", service).eq("country_name", country).execute()
+        if res.data and res.data[0].get("payout") is not None:
+            fval = float(res.data[0]["payout"])
             PAYOUTS_CACHE.setdefault(service, {})[country] = fval
             return fval
     except Exception as e:
-        logging.error(f"SQLite get payout error: {e}")
-
+        logger.error(f"Supabase get payout error: {e}")
     return DEFAULT_PAYOUT
 
 
@@ -349,388 +303,188 @@ def set_payout_sync(service: str, country: str, amount: float):
 
     PAYOUTS_CACHE.setdefault(service, {})[country] = amount
 
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"payouts/{service}/{country}").set(amount)
-        except Exception as e:
-            logging.error(f"Firebase set payout error: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO payouts (service_name, country_name, payout) VALUES (?, ?, ?)",
-            (service, country, amount)
-        )
-        conn.commit()
-        conn.close()
+        supabase.table("payouts").upsert({
+            "service_name": service, "country_name": country, "payout": amount
+        }).execute()
     except Exception as e:
-        logging.error(f"SQLite set payout error: {e}")
+        logger.error(f"Supabase set payout error: {e}")
+
+    # Firebase mirror (low frequency — admin only)
+    if firebase_db_ref:
+        try:
+            firebase_db_ref.reference(f"payouts/{service}/{country}").set(amount)
+        except Exception as e:
+            logger.error(f"Firebase set payout error: {e}")
 
 
 def refresh_payouts_cache_sync():
     global PAYOUTS_CACHE
-    PAYOUTS_CACHE.clear()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_payouts = db.reference("payouts").get()
-            if fb_payouts and isinstance(fb_payouts, dict):
-                for srv, cnts in fb_payouts.items():
-                    if isinstance(cnts, dict):
-                        PAYOUTS_CACHE[srv] = {}
-                        for cnt, val in cnts.items():
-                            try:
-                                PAYOUTS_CACHE[srv][cnt] = float(val)
-                            except (TypeError, ValueError):
-                                PAYOUTS_CACHE[srv][cnt] = DEFAULT_PAYOUT
-                return
-        except Exception as e:
-            logging.error(f"Firebase payouts cache load error: {e}")
-
+    new_cache = {}
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT service_name, country_name, payout FROM payouts")
-        for srv, cnt, val in cursor.fetchall():
-            PAYOUTS_CACHE.setdefault(srv, {})[cnt] = float(val) if val is not None else DEFAULT_PAYOUT
-        conn.close()
+        res = supabase.table("payouts").select("service_name, country_name, payout").execute()
+        for r in res.data:
+            new_cache.setdefault(r["service_name"], {})[r["country_name"]] = float(r["payout"]) if r.get("payout") is not None else DEFAULT_PAYOUT
     except Exception as e:
-        logging.error(f"SQLite payouts cache load error: {e}")
+        logger.error(f"Supabase payouts cache load error: {e}")
+    PAYOUTS_CACHE = new_cache
 
 
-# ---------------- WITHDRAW DB OPERATIONS ----------------
+# ============================================================
+# WITHDRAW METHODS
+# ============================================================
 def get_withdraw_methods_sync() -> list:
-    methods = []
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_m = db.reference("withdraw_methods").get()
-            if fb_m and isinstance(fb_m, dict):
-                methods = list(fb_m.keys())
-        except Exception as e:
-            logging.error(f"Firebase get withdraw methods error: {e}")
-
-    if not methods:
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM withdraw_methods")
-            methods = [r[0] for r in cursor.fetchall()]
-            conn.close()
-        except Exception as e:
-            logging.error(f"SQLite get withdraw methods error: {e}")
-    return methods
+    try:
+        res = supabase.table("withdraw_methods").select("name").execute()
+        return [r["name"] for r in res.data]
+    except Exception as e:
+        logger.error(f"Supabase get withdraw methods error: {e}")
+        return []
 
 
 def add_withdraw_method_sync(name: str):
     name = name.strip()
     if not name:
         return
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"withdraw_methods/{name}").set(True)
-        except Exception as e:
-            logging.error(f"Firebase add withdraw method error: {e}")
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES (?)", (name,))
-        conn.commit()
-        conn.close()
+        supabase.table("withdraw_methods").upsert({"name": name}).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"withdraw_methods/{name}").set(True)
     except Exception as e:
-        logging.error(f"SQLite add withdraw method error: {e}")
+        logger.error(f"Supabase add withdraw method error: {e}")
 
 
 def delete_withdraw_method_sync(name: str):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"withdraw_methods/{name}").delete()
-        except Exception as e:
-            logging.error(f"Firebase delete withdraw method error: {e}")
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM withdraw_methods WHERE name = ?", (name,))
-        conn.commit()
-        conn.close()
+        supabase.table("withdraw_methods").delete().eq("name", name).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"withdraw_methods/{name}").delete()
     except Exception as e:
-        logging.error(f"SQLite delete withdraw method error: {e}")
+        logger.error(f"Supabase delete withdraw method error: {e}")
 
 
-def _mirror_balance_to_sqlite(user_id: int, new_bal: float):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"SQLite mirror balance error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
+# ============================================================
+# USERS
+# ============================================================
 def deduct_user_balance_sync(user_id: int, amount: float) -> bool:
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        bal_ref = db.reference(f"users/{user_id}/balance")
-        result = {"ok": False, "new_bal": None}
-
-        def txn(current):
-            cur_bal = float(current or 0.0)
-            if cur_bal < amount:
-                result["ok"] = False
-                return current
-            result["ok"] = True
-            result["new_bal"] = cur_bal - amount
-            return result["new_bal"]
-
-        try:
-            bal_ref.transaction(txn)
-        except Exception as e:
-            logging.error(f"Firebase deduct balance error: {e}")
-            return False
-
-        if result["ok"]:
-            _mirror_balance_to_sqlite(user_id, result["new_bal"])
-        return result["ok"]
-
-    conn = get_db_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        curr_bal = float(row[0]) if row and row[0] is not None else 0.0
-        if curr_bal < amount:
-            conn.rollback()
-            return False
-        new_bal = curr_bal - amount
-        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
-        conn.commit()
-        return True
+        res = supabase.rpc("deduct_user_balance", {
+            "p_user_id": user_id, "p_amount": amount,
+        }).execute()
+        return bool(res.data)
     except Exception as e:
-        conn.rollback()
-        logging.error(f"SQLite deduct balance error: {e}")
-        return False
-    finally:
-        conn.close()
+        logger.error(f"Supabase deduct balance RPC error: {e}")
+        # Fallback (non-atomic)
+        prof = get_user_profile_sync(user_id)
+        if prof["balance"] < amount:
+            return False
+        try:
+            supabase.table("users").update({
+                "balance": prof["balance"] - amount, "dirty": True,
+            }).eq("user_id", user_id).execute()
+            return True
+        except Exception:
+            return False
 
 
 def refund_user_balance_sync(user_id: int, amount: float):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        bal_ref = db.reference(f"users/{user_id}/balance")
-        result = {"new_bal": None}
-
-        def txn(current):
-            new_val = float(current or 0.0) + amount
-            result["new_bal"] = new_val
-            return new_val
-
-        try:
-            bal_ref.transaction(txn)
-        except Exception as e:
-            logging.error(f"Firebase refund balance error: {e}")
-
-        if result["new_bal"] is not None:
-            _mirror_balance_to_sqlite(user_id, result["new_bal"])
-        return
-
-    conn = get_db_connection()
+    prof = get_user_profile_sync(user_id)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        curr_bal = float(row[0]) if row and row[0] is not None else 0.0
-        new_bal = curr_bal + amount
-        cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_bal, user_id))
-        conn.commit()
+        supabase.table("users").update({
+            "balance": prof["balance"] + amount, "dirty": True,
+        }).eq("user_id", user_id).execute()
     except Exception as e:
-        conn.rollback()
-        logging.error(f"SQLite refund balance error: {e}")
-    finally:
-        conn.close()
+        logger.error(f"Supabase refund balance error: {e}")
 
 
 def create_withdraw_request_sync(user_id: int, method: str, wallet_number: str, amount: float) -> int:
     ts = int(time.time())
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO withdraw_requests (user_id, method, wallet_number, amount, status, reject_reason, created_at)
-        VALUES (?, ?, ?, ?, 'pending', '', ?)
-    """, (user_id, method, wallet_number, amount, ts))
-    req_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"withdraw_requests/{req_id}").set({
-                "id": req_id,
-                "user_id": user_id,
-                "method": method,
-                "wallet_number": wallet_number,
-                "amount": amount,
-                "status": "pending",
-                "reject_reason": "",
-                "created_at": ts
+    try:
+        res = supabase.table("withdraw_requests").insert({
+            "user_id": user_id, "method": method, "wallet_number": wallet_number,
+            "amount": amount, "status": "pending", "reject_reason": "", "created_at": ts,
+        }).execute()
+        req_id = res.data[0]["id"]
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"withdraw_requests/{req_id}").set({
+                "id": req_id, "user_id": user_id, "method": method,
+                "wallet_number": wallet_number, "amount": amount,
+                "status": "pending", "reject_reason": "", "created_at": ts,
             })
-        except Exception as e:
-            logging.error(f"Firebase create withdraw req error: {e}")
-    return req_id
+        return req_id
+    except Exception as e:
+        logger.error(f"Supabase create withdraw req error: {e}")
+        return 0
 
 
 def get_all_withdraw_requests_sync() -> list:
-    requests = []
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_reqs = db.reference("withdraw_requests").get()
-            if fb_reqs and isinstance(fb_reqs, dict):
-                for rid, rdata in fb_reqs.items():
-                    if isinstance(rdata, dict):
-                        requests.append({
-                            "id": int(rdata.get("id", rid)),
-                            "user_id": int(rdata.get("user_id", 0)),
-                            "method": str(rdata.get("method", "")),
-                            "wallet_number": str(rdata.get("wallet_number", "")),
-                            "amount": float(rdata.get("amount", 0.0)),
-                            "status": str(rdata.get("status", "pending")),
-                            "reject_reason": str(rdata.get("reject_reason", "")),
-                            "created_at": int(rdata.get("created_at", 0))
-                        })
-        except Exception as e:
-            logging.error(f"Firebase fetch withdraw reqs error: {e}")
-
-    if not requests:
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, user_id, method, wallet_number, amount, status, reject_reason, created_at FROM withdraw_requests ORDER BY id ASC")
-            for r in cursor.fetchall():
-                requests.append({
-                    "id": r[0], "user_id": r[1], "method": r[2], "wallet_number": r[3],
-                    "amount": r[4], "status": r[5], "reject_reason": r[6], "created_at": r[7]
-                })
-            conn.close()
-        except Exception as e:
-            logging.error(f"SQLite fetch withdraw reqs error: {e}")
-    else:
-        requests.sort(key=lambda x: x["id"])
-    return requests
+    try:
+        res = supabase.table("withdraw_requests").select(
+            "id, user_id, method, wallet_number, amount, status, reject_reason, created_at"
+        ).order("id", desc=False).execute()
+        return [{
+            "id": r["id"], "user_id": r["user_id"], "method": r["method"],
+            "wallet_number": r["wallet_number"], "amount": r["amount"],
+            "status": r["status"], "reject_reason": r.get("reject_reason", ""),
+            "created_at": r.get("created_at", 0),
+        } for r in res.data]
+    except Exception as e:
+        logger.error(f"Supabase fetch withdraw reqs error: {e}")
+        return []
 
 
 def get_withdraw_request_by_id_sync(req_id: int):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            rdata = db.reference(f"withdraw_requests/{req_id}").get()
-            if isinstance(rdata, dict):
-                return {
-                    "id": int(rdata.get("id", req_id)),
-                    "user_id": int(rdata.get("user_id", 0)),
-                    "method": str(rdata.get("method", "")),
-                    "wallet_number": str(rdata.get("wallet_number", "")),
-                    "amount": float(rdata.get("amount", 0.0)),
-                    "status": str(rdata.get("status", "pending")),
-                    "reject_reason": str(rdata.get("reject_reason", "")),
-                    "created_at": int(rdata.get("created_at", 0))
-                }
-        except Exception as e:
-            logging.error(f"Firebase fetch single withdraw req error: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, user_id, method, wallet_number, amount, status, reject_reason, created_at FROM withdraw_requests WHERE id = ?", (req_id,))
-        r = cursor.fetchone()
-        conn.close()
-        if r:
+        res = supabase.table("withdraw_requests").select("*").eq("id", req_id).execute()
+        if res.data:
+            r = res.data[0]
             return {
-                "id": r[0], "user_id": r[1], "method": r[2], "wallet_number": r[3],
-                "amount": r[4], "status": r[5], "reject_reason": r[6], "created_at": r[7]
+                "id": r["id"], "user_id": r["user_id"], "method": r["method"],
+                "wallet_number": r["wallet_number"], "amount": r["amount"],
+                "status": r["status"], "reject_reason": r.get("reject_reason", ""),
+                "created_at": r.get("created_at", 0),
             }
     except Exception as e:
-        logging.error(f"SQLite fetch single withdraw req error: {e}")
+        logger.error(f"Supabase fetch single withdraw req error: {e}")
     return None
 
 
 def atomic_transition_withdraw_status_sync(req_id: int, from_status: str, to_status: str, reject_reason: str = "") -> bool:
-    """Atomically transitions a withdraw request from `from_status` → `to_status`.
-    Returns True only if THIS call performed the transition (i.e. no one else already did).
-    Prevents duplicate approve/reject notifications when admin double-taps."""
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        ref = db.reference(f"withdraw_requests/{req_id}")
-        result = {"ok": False}
-
-        def txn(current):
-            if not isinstance(current, dict):
-                return current
-            if current.get("status") != from_status:
-                return current  # no-op, someone else already handled it
-            result["ok"] = True
-            new_val = dict(current)
-            new_val["status"] = to_status
-            new_val["reject_reason"] = reject_reason
-            return new_val
-
-        try:
-            ref.transaction(txn)
-        except Exception as e:
-            logging.error(f"Firebase atomic withdraw transition error: {e}")
-            return False
-
-        if result["ok"]:
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE withdraw_requests SET status = ?, reject_reason = ? WHERE id = ? AND status = ?",
-                    (to_status, reject_reason, req_id, from_status)
-                )
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                logging.error(f"SQLite mirror withdraw transition error: {e}")
-        return result["ok"]
-
-    conn = get_db_connection()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE withdraw_requests SET status = ?, reject_reason = ? WHERE id = ? AND status = ?",
-            (to_status, reject_reason, req_id, from_status)
-        )
-        changed = cur.rowcount
-        conn.commit()
-        return changed == 1
+        res = supabase.rpc("transition_withdraw", {
+            "p_req_id": req_id, "p_from_status": from_status,
+            "p_to_status": to_status, "p_reject_reason": reject_reason,
+        }).execute()
+        ok = bool(res.data)
+        if ok and firebase_db_ref:
+            try:
+                firebase_db_ref.reference(f"withdraw_requests/{req_id}").update({
+                    "status": to_status, "reject_reason": reject_reason,
+                })
+            except Exception:
+                pass
+        return ok
     except Exception as e:
-        logging.error(f"SQLite atomic withdraw transition error: {e}")
+        logger.error(f"Supabase atomic withdraw transition error: {e}")
         return False
-    finally:
-        conn.close()
 
 
 def update_withdraw_status_sync(req_id: int, status: str, reject_reason: str = ""):
-    """Non-atomic setter — kept for backwards compatibility / migrations."""
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"withdraw_requests/{req_id}").update({
-                "status": status, "reject_reason": reject_reason
-            })
-        except Exception as e:
-            logging.error(f"Firebase update withdraw status error: {e}")
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE withdraw_requests SET status = ?, reject_reason = ? WHERE id = ?", (status, reject_reason, req_id))
-        conn.commit()
-        conn.close()
+        supabase.table("withdraw_requests").update({
+            "status": status, "reject_reason": reject_reason,
+        }).eq("id", req_id).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"withdraw_requests/{req_id}").update({
+                "status": status, "reject_reason": reject_reason,
+            })
     except Exception as e:
-        logging.error(f"SQLite update withdraw status error: {e}")
+        logger.error(f"Supabase update withdraw status error: {e}")
 
 
-# ---------------- ADMIN MANAGEMENT DB OPERATIONS ----------------
+# ============================================================
+# ADMINS
+# ============================================================
 def is_admin_sync(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
@@ -741,55 +495,28 @@ def get_all_admins_sync() -> list:
     admins = {}
     if ADMIN_ID:
         admins[ADMIN_ID] = {"user_id": ADMIN_ID, "name": "Main Owner", "is_owner": True}
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_admins = db.reference("admins").get()
-            if fb_admins and isinstance(fb_admins, dict):
-                for uid, adata in fb_admins.items():
-                    if str(uid).isdigit():
-                        uid_int = int(uid)
-                        name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
-                        if uid_int == ADMIN_ID:
-                            admins[uid_int]["name"] = f"{name} (Owner)"
-                        else:
-                            admins[uid_int] = {"user_id": uid_int, "name": name, "is_owner": False}
-        except Exception as e:
-            logging.error(f"Firebase get admins error: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name FROM admins")
-        for r in cursor.fetchall():
-            uid_int = int(r[0])
-            name = str(r[1])
+        res = supabase.table("admins").select("user_id, name").execute()
+        for r in res.data:
+            uid_int = int(r["user_id"])
+            name = str(r["name"])
             if uid_int == ADMIN_ID:
                 admins[uid_int]["name"] = f"{name} (Owner)"
             else:
                 admins[uid_int] = {"user_id": uid_int, "name": name, "is_owner": False}
-        conn.close()
     except Exception as e:
-        logging.error(f"SQLite get admins error: {e}")
-
+        logger.error(f"Supabase get admins error: {e}")
     return list(admins.values())
 
 
 def add_admin_sync(user_id: int, name: str):
     ADMINS_CACHE.add(user_id)
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"admins/{user_id}").set({"name": name})
-        except Exception as e:
-            logging.error(f"Firebase add admin error: {e}")
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (user_id, name))
-        conn.commit()
-        conn.close()
+        supabase.table("admins").upsert({"user_id": user_id, "name": name}).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"admins/{user_id}").set({"name": name})
     except Exception as e:
-        logging.error(f"SQLite add admin error: {e}")
+        logger.error(f"Supabase add admin error: {e}")
 
 
 def delete_admin_sync(user_id: int) -> bool:
@@ -797,202 +524,73 @@ def delete_admin_sync(user_id: int) -> bool:
         return False
     if user_id in ADMINS_CACHE:
         ADMINS_CACHE.remove(user_id)
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"admins/{user_id}").delete()
-        except Exception as e:
-            logging.error(f"Firebase delete admin error: {e}")
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-        conn.commit()
-        conn.close()
+        supabase.table("admins").delete().eq("user_id", user_id).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"admins/{user_id}").delete()
+        return True
     except Exception as e:
-        logging.error(f"SQLite delete admin error: {e}")
-    return True
+        logger.error(f"Supabase delete admin error: {e}")
+        return False
 
 
-# ---------------- API PANELS DB OPERATIONS ----------------
+# ============================================================
+# API PANELS
+# ============================================================
 def get_all_api_panels_sync() -> list:
-    panels = []
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_panels = db.reference("api_panels").get()
-            if fb_panels and isinstance(fb_panels, dict):
-                for pid, pdata in fb_panels.items():
-                    if isinstance(pdata, dict):
-                        panels.append({
-                            "id": str(pdata.get("id", pid)),
-                            "name": str(pdata.get("name", "")),
-                            "url": str(pdata.get("url", "")),
-                            "token": str(pdata.get("token", "")),
-                            "polling_interval": float(pdata.get("polling_interval", 5.0))
-                        })
-                return panels
-        except Exception as e:
-            logging.error(f"Firebase get API panels error: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
-        for r in cursor.fetchall():
-            panels.append({
-                "id": str(r[0]), "name": str(r[1]), "url": str(r[2]),
-                "token": str(r[3]), "polling_interval": float(r[4]) if r[4] else 5.0
-            })
-        conn.close()
+        res = supabase.table("api_panels").select("id, name, url, token, polling_interval").execute()
+        return [{
+            "id": str(r["id"]), "name": str(r["name"]), "url": str(r["url"]),
+            "token": str(r["token"]), "polling_interval": float(r["polling_interval"]) if r.get("polling_interval") else 5.0,
+        } for r in res.data]
     except Exception as e:
-        logging.error(f"SQLite get API panels error: {e}")
-    return panels
+        logger.error(f"Supabase get API panels error: {e}")
+        return []
 
 
 def get_api_panel_sync(panel_id: str):
-    panels = get_all_api_panels_sync()
-    for p in panels:
-        if str(p["id"]) == str(panel_id):
-            return p
+    try:
+        res = supabase.table("api_panels").select("id, name, url, token, polling_interval").eq("id", int(panel_id)).execute()
+        if res.data:
+            r = res.data[0]
+            return {
+                "id": str(r["id"]), "name": str(r["name"]), "url": str(r["url"]),
+                "token": str(r["token"]), "polling_interval": float(r["polling_interval"]) if r.get("polling_interval") else 5.0,
+            }
+    except Exception as e:
+        logger.error(f"Supabase get single panel error: {e}")
     return None
 
 
 def save_api_panel_sync(name: str, url: str, token: str, polling_interval: float = 5.0) -> str:
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO api_panels (name, url, token, polling_interval) VALUES (?, ?, ?, ?)",
-        (name, url, token, polling_interval)
-    )
-    pid = str(cursor.lastrowid)
-    conn.commit()
-    conn.close()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"api_panels/{pid}").set({
-                "id": pid, "name": name, "url": url, "token": token,
-                "polling_interval": polling_interval
+    try:
+        res = supabase.table("api_panels").insert({
+            "name": name, "url": url, "token": token, "polling_interval": polling_interval,
+        }).execute()
+        pid = str(res.data[0]["id"])
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"api_panels/{pid}").set({
+                "id": pid, "name": name, "url": url, "token": token, "polling_interval": polling_interval,
             })
-        except Exception as e:
-            logging.error(f"Firebase save API panel error: {e}")
-    return pid
+        return pid
+    except Exception as e:
+        logger.error(f"Supabase save API panel error: {e}")
+        return ""
 
 
 def delete_api_panel_sync(panel_id: str):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"api_panels/{panel_id}").delete()
-        except Exception as e:
-            logging.error(f"Firebase delete API panel error: {e}")
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM api_panels WHERE id = ?", (panel_id,))
-        conn.commit()
-        conn.close()
+        supabase.table("api_panels").delete().eq("id", int(panel_id)).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"api_panels/{panel_id}").delete()
     except Exception as e:
-        logging.error(f"SQLite delete API panel error: {e}")
+        logger.error(f"Supabase delete API panel error: {e}")
 
 
-# ---------------- CACHE MANAGEMENT ----------------
-def refresh_all_caches_sync():
-    global SETTINGS_CACHE, SERVICES_CACHE, ADMINS_CACHE
-    SETTINGS_CACHE.clear()
-    SERVICES_CACHE.clear()
-    ADMINS_CACHE.clear()
-
-    if ADMIN_ID:
-        ADMINS_CACHE.add(ADMIN_ID)
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT key, value FROM settings")
-        for k, v in cursor.fetchall():
-            SETTINGS_CACHE[str(k)] = str(v)
-
-        cursor.execute("SELECT user_id FROM admins")
-        for r in cursor.fetchall():
-            ADMINS_CACHE.add(int(r[0]))
-        conn.close()
-    except Exception as e:
-        logging.error(f"Error loading settings/admins into cache: {e}")
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_settings = db.reference("settings").get()
-            if fb_settings and isinstance(fb_settings, dict):
-                for k, v in fb_settings.items():
-                    if v is not None:
-                        SETTINGS_CACHE[str(k)] = str(v)
-
-            fb_admins = db.reference("admins").get()
-            if fb_admins and isinstance(fb_admins, dict):
-                for uid in fb_admins.keys():
-                    if str(uid).isdigit():
-                        ADMINS_CACHE.add(int(uid))
-        except Exception as e:
-            logging.error(f"Error merging Firebase settings/admins to cache: {e}")
-
-    refresh_services_cache_sync()
-    refresh_payouts_cache_sync()
-
-
-def refresh_services_cache_sync():
-    global SERVICES_CACHE
-    SERVICES_CACHE.clear()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            srv_ref = db.reference("services").get()
-            globally_allocated = set()
-            try:
-                alloc_data = db.reference("allocations").get() or {}
-                if isinstance(alloc_data, dict):
-                    globally_allocated = {str(k) for k in alloc_data.keys()}
-            except Exception as e:
-                logging.error(f"Error loading global allocation locks for cache: {e}")
-
-            if srv_ref and isinstance(srv_ref, dict):
-                for srv in srv_ref.keys():
-                    SERVICES_CACHE[srv] = {}
-                    cnt_ref = db.reference(f"services/{srv}").get()
-                    if cnt_ref and isinstance(cnt_ref, dict):
-                        for cnt in cnt_ref.keys():
-                            num_ref = db.reference(f"numbers/{srv}/{cnt}").get()
-                            avail_count = 0
-                            if num_ref and isinstance(num_ref, dict):
-                                for n_key, n_val in num_ref.items():
-                                    if not isinstance(n_val, dict):
-                                        continue
-                                    num_val = str(n_val.get("number", n_key))
-                                    if n_val.get("status") == "available" and num_val not in globally_allocated:
-                                        avail_count += 1
-                            SERVICES_CACHE[srv][cnt] = avail_count
-            return
-        except Exception as e:
-            logging.error(f"Error populating services cache from Firebase: {e}")
-
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT service_name, country_name FROM services")
-        pairs = cursor.fetchall()
-        for srv, cnt in pairs:
-            if srv not in SERVICES_CACHE:
-                SERVICES_CACHE[srv] = {}
-            cursor.execute("""
-                SELECT COUNT(*) FROM numbers n
-                WHERE n.service = ? AND n.country = ? AND n.status = 'available'
-                  AND NOT EXISTS (SELECT 1 FROM allocations a WHERE a.number = n.number)
-            """, (srv, cnt))
-            cnt_val = cursor.fetchone()[0]
-            SERVICES_CACHE[srv][cnt] = cnt_val
-        conn.close()
-    except Exception as e:
-        logging.error(f"Error populating services cache from SQLite: {e}")
-
-
+# ============================================================
+# SETTINGS
+# ============================================================
 def get_setting(key: str, default_val: str = "") -> str:
     if key in SETTINGS_CACHE:
         return SETTINGS_CACHE[key]
@@ -1002,107 +600,144 @@ def get_setting(key: str, default_val: str = "") -> str:
 def set_setting(key: str, value: str):
     str_val = str(value)
     SETTINGS_CACHE[key] = str_val
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"settings/{key}").set(str_val)
-        except Exception as e:
-            logging.error(f"Error writing setting to Firebase: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str_val))
-        conn.commit()
-        conn.close()
+        supabase.table("settings").upsert({"key": key, "value": str_val}).execute()
+        if firebase_db_ref:
+            firebase_db_ref.reference(f"settings/{key}").set(str_val)
     except Exception as e:
-        logging.error(f"Error writing setting to SQLite: {e}")
+        logger.error(f"Supabase set setting error: {e}")
 
 
-async def run_db(func, *args, **kwargs):
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-
+# ============================================================
+# USERS
+# ============================================================
 def save_user(user_id: int, first_name: str = ""):
+    """Hot path — only writes on first sighting (tracked in LRU)."""
+    if user_id in KNOWN_USERS:
+        return
     cur_date = get_bd_date_str()
     first_name = first_name.strip() if first_name else ""
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            user_ref = db.reference(f"users/{user_id}")
-            u_data = user_ref.get()
-            if not u_data:
-                user_ref.set({
-                    "exists": True, "balance": 0.0, "today_earned": 0.0,
-                    "total_earned": 0.0, "refer_earned": 0.0, "total_otps": 0,
-                    "weekly_otps": 0, "first_name": first_name, "last_earn_date": cur_date
-                })
-            elif first_name:
-                db.reference(f"users/{user_id}/first_name").set(first_name)
-        except Exception as e:
-            logging.error(f"Error saving user to Firebase: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, ?, ?)", (user_id, first_name, cur_date))
-        if first_name:
-            cursor.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (first_name, user_id))
-        conn.commit()
-        conn.close()
+        existing = supabase.table("users").select("user_id").eq("user_id", user_id).limit(1).execute()
+        if not existing.data:
+            supabase.table("users").insert({
+                "user_id": user_id, "balance": 0.0, "today_earned": 0.0,
+                "total_earned": 0.0, "refer_earned": 0.0, "total_otps": 0,
+                "weekly_otps": 0, "first_name": first_name,
+                "last_earn_date": cur_date, "dirty": True,
+            }).execute()
+        KNOWN_USERS.add(user_id)
     except Exception as e:
-        logging.error(f"Error saving user to SQLite: {e}")
+        logger.error(f"Supabase save user error: {e}")
 
 
-# ---------------- WEEKLY RESET (now returns notifications) ----------------
+def get_user_profile_sync(user_id: int) -> dict:
+    current_date = get_bd_date_str()
+    try:
+        res = supabase.table("users").select(
+            "balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date"
+        ).eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            u = res.data[0]
+            bal = float(u.get("balance") or 0.0)
+            today_e = float(u.get("today_earned") or 0.0)
+            total_e = float(u.get("total_earned") or 0.0)
+            refer_e = float(u.get("refer_earned") or 0.0)
+            otps = int(u.get("total_otps") or 0)
+            last_date = str(u.get("last_earn_date") or "")
+            if last_date != current_date:
+                today_e = 0.0
+                try:
+                    supabase.table("users").update({
+                        "today_earned": 0.0, "last_earn_date": current_date,
+                    }).eq("user_id", user_id).execute()
+                except Exception:
+                    pass
+            return {
+                "balance": bal, "today_earned": today_e, "total_earned": total_e,
+                "refer_earned": refer_e, "total_otps": otps,
+            }
+    except Exception as e:
+        logger.error(f"Supabase profile fetch error: {e}")
+    return {"balance": 0.0, "today_earned": 0.0, "total_earned": 0.0, "refer_earned": 0.0, "total_otps": 0}
+
+
+def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0, count: int = 1) -> dict:
+    """Atomic via Supabase RPC. Batch-friendly (count>1 for grouped OTPs)."""
+    current_date = get_bd_date_str()
+    try:
+        res = supabase.rpc("add_otp_earnings", {
+            "p_user_id": user_id,
+            "p_amount": amount,
+            "p_count": count,
+            "p_date": current_date,
+        }).execute()
+        if res.data:
+            row = res.data[0] if isinstance(res.data, list) else res.data
+            return {
+                "balance": float(row.get("new_balance", 0.0)),
+                "total_otps": int(row.get("new_total_otps", 0)),
+            }
+    except Exception as e:
+        logger.error(f"Supabase add_otp_earnings RPC error: {e}")
+
+    # Fallback (non-atomic)
+    prof = get_user_profile_sync(user_id)
+    new_bal = prof["balance"] + amount
+    try:
+        supabase.table("users").update({
+            "balance": new_bal,
+            "total_earned": prof["total_earned"] + amount,
+            "today_earned": prof["today_earned"] + amount,
+            "total_otps": prof["total_otps"] + count,
+            "last_earn_date": current_date,
+            "dirty": True,
+        }).eq("user_id", user_id).execute()
+    except Exception as e:
+        logger.error(f"Supabase fallback earnings error: {e}")
+    return {"balance": new_bal, "total_otps": prof["total_otps"] + count}
+
+
+def get_user_balance_sync(user_id: int) -> float:
+    return get_user_profile_sync(user_id)["balance"]
+
+
+def get_all_users() -> list:
+    users = []
+    try:
+        res = supabase.table("users").select("user_id").execute()
+        users = [int(r["user_id"]) for r in res.data]
+    except Exception as e:
+        logger.error(f"Error fetching users from Supabase: {e}")
+    return list(set(users))
+
+
+# ============================================================
+# WEEKLY RESET & LEADERBOARD
+# ============================================================
 def check_and_process_weekly_reset_sync() -> list:
-    """If the Friday-based reset is due, performs it and returns a list of
-    notification dicts [{uid, amount, rank}, ...] for the async caller to send.
-    Previously this used asyncio.create_task() from inside a worker thread —
-    which raised RuntimeError (no running event loop) and silently dropped all
-    rank-bonus notifications. Now we return data instead."""
+    """Cheap early-return; all reads from Supabase."""
     current_friday = get_current_friday_str()
     last_reset = get_setting("last_weekly_reset_friday", "")
-
     if not last_reset:
         set_setting("last_weekly_reset_friday", current_friday)
         return []
-
     if last_reset == current_friday:
         return []
 
     is_bonus_enabled = get_setting("ranking_bonus_enabled", "true") == "true"
     top_users = []
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_users = db.reference("users").get() or {}
-            u_list = []
-            if isinstance(fb_users, dict):
-                for uid, udata in fb_users.items():
-                    if isinstance(udata, dict) and str(uid).isdigit():
-                        w_otps = int(udata.get("weekly_otps", 0))
-                        t_otps = int(udata.get("total_otps", 0))
-                        if w_otps > 0:
-                            u_list.append((int(uid), w_otps, t_otps))
-            u_list.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            top_users = u_list[:3]
-        except Exception as e:
-            logging.error(f"Firebase fetch top ranking error: {e}")
-    else:
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, weekly_otps, total_otps FROM users WHERE weekly_otps > 0 ORDER BY weekly_otps DESC, total_otps DESC LIMIT 3")
-            top_users = cursor.fetchall()
-            conn.close()
-        except Exception as e:
-            logging.error(f"SQLite fetch top ranking error: {e}")
+    try:
+        res = supabase.table("users").select("user_id, weekly_otps, total_otps").gt("weekly_otps", 0).order(
+            "weekly_otps", desc=True).order("total_otps", desc=True).limit(3).execute()
+        top_users = res.data
+    except Exception as e:
+        logger.error(f"Supabase fetch top ranking error: {e}")
 
     notifications = []
     if is_bonus_enabled and top_users:
-        for rank_idx, u_info in enumerate(top_users, start=1):
-            uid = u_info[0]
+        for rank_idx, u in enumerate(top_users, start=1):
+            uid = u["user_id"]
             b_str = get_setting(f"rank_bonus_{rank_idx}", "0")
             try:
                 b_amt = float(b_str)
@@ -1112,371 +747,362 @@ def check_and_process_weekly_reset_sync() -> list:
                 refund_user_balance_sync(uid, b_amt)
                 notifications.append({"uid": uid, "amount": b_amt, "rank": rank_idx})
 
-    # Reset weekly counters
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_users = db.reference("users").get() or {}
-            if isinstance(fb_users, dict):
-                for uid in fb_users.keys():
-                    if str(uid).isdigit():
-                        db.reference(f"users/{uid}/weekly_otps").set(0)
-        except Exception as e:
-            logging.error(f"Firebase reset weekly otps error: {e}")
-
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET weekly_otps = 0")
-        conn.commit()
-        conn.close()
+        supabase.table("users").update({"weekly_otps": 0, "dirty": True}).gt("weekly_otps", 0).execute()
     except Exception as e:
-        logging.error(f"SQLite reset weekly otps error: {e}")
+        logger.error(f"Supabase reset weekly otps error: {e}")
 
     set_setting("last_weekly_reset_friday", current_friday)
     return notifications
 
 
 def get_ranking_leaderboard_sync(user_id: int) -> str:
-    """Leaderboard read-only. Weekly reset is handled by the poller manager
-    every ~5s (which can properly send notifications)."""
-    top_5 = []
-    user_rank = "N/A"
-    user_weekly_otps = 0
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            fb_users = db.reference("users").get() or {}
-            all_list = []
-            if isinstance(fb_users, dict):
-                for uid, udata in fb_users.items():
-                    if isinstance(udata, dict) and str(uid).isdigit():
-                        uid_int = int(uid)
-                        w_otps = int(udata.get("weekly_otps", 0))
-                        t_otps = int(udata.get("total_otps", 0))
-                        fname = str(udata.get("first_name", f"User {uid_int}")) or f"User {uid_int}"
-                        if uid_int == user_id:
-                            user_weekly_otps = w_otps
-                        if w_otps > 0:
-                            all_list.append((uid_int, fname, w_otps, t_otps))
-
-            all_list.sort(key=lambda x: (x[2], x[3]), reverse=True)
-            top_5 = all_list[:5]
-            for idx, item in enumerate(all_list, start=1):
-                if item[0] == user_id:
-                    user_rank = f"#{idx}"
-                    break
-        except Exception as e:
-            logging.error(f"Firebase leaderboard fetch error: {e}")
+    now = time.time()
+    top_5 = None
+    if LEADERBOARD_CACHE["data"] is not None and now - LEADERBOARD_CACHE["ts"] < LEADERBOARD_CACHE_TTL:
+        top_5 = LEADERBOARD_CACHE["data"]
     else:
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, first_name, weekly_otps, total_otps FROM users WHERE weekly_otps > 0 ORDER BY weekly_otps DESC, total_otps DESC LIMIT 5")
-            top_5 = cursor.fetchall()
-
-            cursor.execute("SELECT weekly_otps FROM users WHERE user_id = ?", (user_id,))
-            u_row = cursor.fetchone()
-            if u_row:
-                user_weekly_otps = u_row[0] or 0
-
-            if user_weekly_otps > 0:
-                cursor.execute("SELECT COUNT(*) FROM users WHERE weekly_otps > ? OR (weekly_otps = ? AND total_otps > (SELECT total_otps FROM users WHERE user_id = ?))",
-                               (user_weekly_otps, user_weekly_otps, user_id))
-                higher_cnt = cursor.fetchone()[0]
-                user_rank = f"#{higher_cnt + 1}"
-            conn.close()
+            res = supabase.table("users").select("user_id, first_name, weekly_otps, total_otps").gt("weekly_otps", 0).order(
+                "weekly_otps", desc=True).order("total_otps", desc=True).limit(5).execute()
+            top_5 = res.data
+            LEADERBOARD_CACHE["data"] = top_5
+            LEADERBOARD_CACHE["ts"] = now
         except Exception as e:
-            logging.error(f"SQLite leaderboard fetch error: {e}")
+            logger.error(f"Supabase leaderboard fetch error: {e}")
+            top_5 = []
+
+    user_rank = "N/A"
+    user_weekly_otps = 0
+    try:
+        res = supabase.table("users").select("weekly_otps").eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            user_weekly_otps = int(res.data[0].get("weekly_otps") or 0)
+        if user_weekly_otps > 0:
+            hr = supabase.table("users").select("user_id", count="exact").gt("weekly_otps", user_weekly_otps).execute()
+            higher_cnt = hr.count if hr.count else 0
+            user_rank = f"#{higher_cnt + 1}"
+    except Exception as e:
+        logger.error(f"Supabase user rank error: {e}")
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    leaderboard_text = "🏆 <b>WEEKLY TOP OTP RECEIVERS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-
+    text = "🏆 <b>WEEKLY TOP OTP RECEIVERS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
     if top_5:
-        for idx, row in enumerate(top_5):
-            uid = row[0]
-            fname = row[1] if row[1] else f"User {uid}"
-            w_otps = row[2]
+        for idx, u in enumerate(top_5):
+            uid = u["user_id"]
+            fname = u.get("first_name") or f"User {uid}"
+            w_otps = u.get("weekly_otps", 0)
             medal = medals[idx] if idx < len(medals) else f"{idx+1}."
             safe_fname = html.escape(fname)
             user_link = f'<a href="tg://user?id={uid}">{safe_fname}</a>'
-            leaderboard_text += f"{medal} {user_link} — <b>{w_otps}</b> OTPs\n"
+            text += f"{medal} {user_link} — <b>{w_otps}</b> OTPs\n"
     else:
-        leaderboard_text += "<i>No OTP receivers this week yet. Be the first!</i>\n"
+        text += "<i>No OTP receivers this week yet. Be the first!</i>\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"👤 <b>Your Rank:</b> {user_rank} ({user_weekly_otps} OTPs)"
+    return text
 
-    leaderboard_text += "━━━━━━━━━━━━━━━━━━━━\n"
-    leaderboard_text += f"👤 <b>Your Rank:</b> {user_rank} ({user_weekly_otps} OTPs)"
-    return leaderboard_text
 
-
-def get_user_profile_sync(user_id: int) -> dict:
-    current_date = get_bd_date_str()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            u_data = db.reference(f"users/{user_id}").get()
-            if u_data and isinstance(u_data, dict):
-                bal = float(u_data.get("balance", 0.0))
-                last_date = str(u_data.get("last_earn_date", ""))
-                today_earned = float(u_data.get("today_earned", 0.0)) if last_date == current_date else 0.0
-                total_earned = float(u_data.get("total_earned", 0.0))
-                refer_earned = float(u_data.get("refer_earned", 0.0))
-                total_otps = int(u_data.get("total_otps", 0))
-
-                if last_date != current_date:
-                    db.reference(f"users/{user_id}/today_earned").set(0.0)
-                    db.reference(f"users/{user_id}/last_earn_date").set(current_date)
-
-                return {
-                    "balance": bal, "today_earned": today_earned,
-                    "total_earned": total_earned, "refer_earned": refer_earned,
-                    "total_otps": total_otps
-                }
-        except Exception as e:
-            logging.error(f"Firebase profile fetch error: {e}")
-
+# ============================================================
+# FIREBASE BACKUP WORKER
+# ============================================================
+def push_dirty_to_firebase_sync() -> int:
+    """Push only dirty user rows using Firebase multi-path update (1 write per batch)."""
+    if not firebase_db_ref:
+        return 0
+    total_pushed = 0
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance, today_earned, total_earned, refer_earned, total_otps, last_earn_date FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if row:
-            bal, today_e, total_e, refer_e, otps, last_date = row
-            bal = float(bal or 0.0)
-            today_e = float(today_e or 0.0)
-            total_e = float(total_e or 0.0)
-            refer_e = float(refer_e or 0.0)
-            otps = int(otps or 0)
-            last_date = str(last_date or "")
-
-            if last_date != current_date:
-                today_e = 0.0
-                cursor.execute("UPDATE users SET today_earned = 0.0, last_earn_date = ? WHERE user_id = ?", (current_date, user_id))
-                conn.commit()
-            conn.close()
-            return {
-                "balance": bal, "today_earned": today_e, "total_earned": total_e,
-                "refer_earned": refer_e, "total_otps": otps
-            }
-        conn.close()
+        while True:
+            res = supabase.table("users").select(
+                "user_id, balance, today_earned, total_earned, total_otps, weekly_otps, last_earn_date, first_name"
+            ).eq("dirty", True).limit(FIREBASE_BACKUP_BATCH_SIZE).execute()
+            rows = res.data
+            if not rows:
+                break
+            updates = {}
+            user_ids = []
+            for u in rows:
+                uid = u["user_id"]
+                updates[f"users/{uid}/balance"] = float(u.get("balance") or 0.0)
+                updates[f"users/{uid}/today_earned"] = float(u.get("today_earned") or 0.0)
+                updates[f"users/{uid}/total_earned"] = float(u.get("total_earned") or 0.0)
+                updates[f"users/{uid}/total_otps"] = int(u.get("total_otps") or 0)
+                updates[f"users/{uid}/weekly_otps"] = int(u.get("weekly_otps") or 0)
+                updates[f"users/{uid}/last_earn_date"] = str(u.get("last_earn_date") or "")
+                updates[f"users/{uid}/exists"] = True
+                fn = u.get("first_name") or ""
+                if fn:
+                    updates[f"users/{uid}/first_name"] = fn
+                user_ids.append(uid)
+            if updates:
+                firebase_db_ref.reference("/").update(updates)
+                try:
+                    supabase.table("users").update({"dirty": False}).in_("user_id", user_ids).execute()
+                except Exception as e:
+                    logger.error(f"clear dirty error: {e}")
+                total_pushed += len(user_ids)
+            if len(rows) < FIREBASE_BACKUP_BATCH_SIZE:
+                break
+        if total_pushed:
+            logger.info(f"Firebase backup: pushed {total_pushed} dirty users")
     except Exception as e:
-        logging.error(f"SQLite profile fetch error: {e}")
+        logger.error(f"push_dirty_to_firebase_sync error: {e}")
+    return total_pushed
 
-    return {"balance": 0.0, "today_earned": 0.0, "total_earned": 0.0, "refer_earned": 0.0, "total_otps": 0}
 
-
-def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0) -> dict:
-    current_date = get_bd_date_str()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        user_ref = db.reference(f"users/{user_id}")
-        result = {"data": None}
-
-        def txn(current):
-            data = dict(current) if isinstance(current, dict) else {}
-            bal = float(data.get("balance", 0.0))
-            total_earned = float(data.get("total_earned", 0.0))
-            total_otps = int(data.get("total_otps", 0))
-            weekly_otps = int(data.get("weekly_otps", 0))
-            last_date = str(data.get("last_earn_date", ""))
-            today_earned = float(data.get("today_earned", 0.0)) if last_date == current_date else 0.0
-
-            data["balance"] = bal + amount
-            data["total_earned"] = total_earned + amount
-            data["today_earned"] = today_earned + amount
-            data["total_otps"] = total_otps + 1
-            data["weekly_otps"] = weekly_otps + 1
-            data["last_earn_date"] = current_date
-            data["exists"] = True
-            data.setdefault("refer_earned", 0.0)
-            data.setdefault("first_name", "")
-            result["data"] = data
-            return data
-
-        try:
-            user_ref.transaction(txn)
-        except Exception as e:
-            logging.error(f"Firebase update user earnings error: {e}")
-
-        data = result["data"]
-        if data:
-            conn = None
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, ?)", (user_id, current_date))
-                cursor.execute("""
-                    UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, total_otps = ?, weekly_otps = ?, last_earn_date = ?
-                    WHERE user_id = ?
-                """, (data["balance"], data["today_earned"], data["total_earned"], data["total_otps"], data["weekly_otps"], current_date, user_id))
-                conn.commit()
-            except Exception as e:
-                logging.error(f"SQLite mirror update user earnings error: {e}")
-            finally:
-                if conn:
-                    conn.close()
-            return {
-                "balance": data["balance"], "today_earned": data["today_earned"],
-                "total_earned": data["total_earned"],
-                "refer_earned": float(data.get("refer_earned", 0.0)),
-                "total_otps": data["total_otps"]
-            }
-        return get_user_profile_sync(user_id)
-
-    conn = get_db_connection()
+async def firebase_backup_worker():
+    await asyncio.sleep(30)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date) VALUES (?, 0.0, 0.0, 0.0, 0.0, 0, 0, '', ?)",
-            (user_id, current_date)
-        )
-        cursor.execute("SELECT balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, last_earn_date FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        bal, today_e, total_e, refer_e, otps, w_otps, last_date = row
-        bal = float(bal or 0.0)
-        today_e = float(today_e or 0.0) if str(last_date or "") == current_date else 0.0
-        total_e = float(total_e or 0.0)
-        refer_e = float(refer_e or 0.0)
-        otps = int(otps or 0)
-        w_otps = int(w_otps or 0)
-
-        new_bal = bal + amount
-        new_today = today_e + amount
-        new_total = total_e + amount
-        new_otps = otps + 1
-        new_weekly = w_otps + 1
-
-        cursor.execute("""
-            UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, total_otps = ?, weekly_otps = ?, last_earn_date = ?
-            WHERE user_id = ?
-        """, (new_bal, new_today, new_total, new_otps, new_weekly, current_date, user_id))
-        conn.commit()
-
-        return {
-            "balance": new_bal, "today_earned": new_today, "total_earned": new_total,
-            "refer_earned": refer_e, "total_otps": new_otps
-        }
+        await asyncio.to_thread(push_dirty_to_firebase_sync)
     except Exception as e:
-        conn.rollback()
-        logging.error(f"SQLite update user earnings error: {e}")
-        return get_user_profile_sync(user_id)
-    finally:
-        conn.close()
+        logger.error(f"Initial Firebase backup error: {e}")
 
-
-def get_user_balance_sync(user_id: int) -> float:
-    prof = get_user_profile_sync(user_id)
-    return prof["balance"]
-
-
-def get_all_users() -> list:
-    users = []
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
+    while True:
+        await asyncio.sleep(FIREBASE_BACKUP_INTERVAL)
         try:
-            fb_users = db.reference("users").get()
-            if fb_users and isinstance(fb_users, dict):
-                users = [int(uid) for uid in fb_users.keys() if str(uid).isdigit()]
+            await asyncio.to_thread(push_dirty_to_firebase_sync)
         except Exception as e:
-            logging.error(f"Error fetching users from Firebase: {e}")
-
-    if not users:
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM users")
-            users = [row[0] for row in cursor.fetchall()]
-            conn.close()
-        except Exception as e:
-            logging.error(f"Error fetching users from SQLite: {e}")
-    return list(set(users))
+            logger.error(f"Firebase backup worker error: {e}")
 
 
-def sync_firebase_to_sqlite():
-    if not HAS_FIREBASE_LIB or not firebase_admin._apps:
+# ============================================================
+# RESTORE FROM FIREBASE (only if Supabase is empty)
+# ============================================================
+def restore_from_firebase_to_supabase():
+    if not firebase_db_ref:
         return
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        res = supabase.table("users").select("user_id", count="exact").limit(1).execute()
+        if res.count and res.count > 0:
+            logger.info("Supabase has data — skipping Firebase restore")
+            return
+        logger.info("Supabase empty — restoring from Firebase...")
 
-        fb_settings = db.reference("settings").get()
-        if fb_settings and isinstance(fb_settings, dict):
-            for k, v in fb_settings.items():
-                if v is not None:
-                    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (str(k), str(v)))
-
-        fb_users = db.reference("users").get()
+        # Users
+        fb_users = firebase_db_ref.reference("users").get()
         if fb_users and isinstance(fb_users, dict):
-            for uid, udata in fb_users.items():
-                if str(uid).isdigit():
-                    bal, t_e, tot_e, ref_e, otps, w_otps, fname, l_date = 0.0, 0.0, 0.0, 0.0, 0, 0, "", ""
-                    if isinstance(udata, dict):
-                        bal = float(udata.get("balance", 0.0))
-                        t_e = float(udata.get("today_earned", 0.0))
-                        tot_e = float(udata.get("total_earned", 0.0))
-                        ref_e = float(udata.get("refer_earned", 0.0))
-                        otps = int(udata.get("total_otps", 0))
-                        w_otps = int(udata.get("weekly_otps", 0))
-                        fname = str(udata.get("first_name", ""))
-                        l_date = str(udata.get("last_earn_date", ""))
-                    elif isinstance(udata, (int, float)):
-                        bal = float(udata)
+            batch = []
+            for uid, u in fb_users.items():
+                if not str(uid).isdigit():
+                    continue
+                batch.append({
+                    "user_id": int(uid),
+                    "balance": float(u.get("balance") or 0.0),
+                    "today_earned": float(u.get("today_earned") or 0.0),
+                    "total_earned": float(u.get("total_earned") or 0.0),
+                    "refer_earned": float(u.get("refer_earned") or 0.0),
+                    "total_otps": int(u.get("total_otps") or 0),
+                    "weekly_otps": int(u.get("weekly_otps") or 0),
+                    "first_name": str(u.get("first_name") or ""),
+                    "last_earn_date": str(u.get("last_earn_date") or ""),
+                    "dirty": False,
+                })
+            for i in range(0, len(batch), 500):
+                try:
+                    supabase.table("users").upsert(batch[i:i+500]).execute()
+                except Exception as e:
+                    logger.error(f"restore users error: {e}")
 
-                    cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (int(uid), bal, t_e, tot_e, ref_e, otps, w_otps, fname, l_date))
-                    cursor.execute("UPDATE users SET balance = ?, today_earned = ?, total_earned = ?, refer_earned = ?, total_otps = ?, weekly_otps = ?, first_name = ?, last_earn_date = ? WHERE user_id = ?", (bal, t_e, tot_e, ref_e, otps, w_otps, fname, l_date, int(uid)))
+        # Settings
+        fb_settings = firebase_db_ref.reference("settings").get()
+        if fb_settings and isinstance(fb_settings, dict):
+            rows = [{"key": str(k), "value": str(v)} for k, v in fb_settings.items() if v is not None]
+            if rows:
+                try:
+                    supabase.table("settings").upsert(rows).execute()
+                except Exception as e:
+                    logger.error(f"restore settings error: {e}")
 
-        fb_admins = db.reference("admins").get()
-        if fb_admins and isinstance(fb_admins, dict):
-            for uid, adata in fb_admins.items():
-                if str(uid).isdigit():
-                    name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
-                    cursor.execute("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (int(uid), str(name)))
-
-        fb_panels = db.reference("api_panels").get()
-        if fb_panels and isinstance(fb_panels, dict):
-            for pid, pdata in fb_panels.items():
-                if isinstance(pdata, dict):
-                    p_id = str(pdata.get("id", pid))
-                    name = str(pdata.get("name", ""))
-                    url = str(pdata.get("url", ""))
-                    token = str(pdata.get("token", ""))
-                    pinterval = float(pdata.get("polling_interval", 5.0))
-                    cursor.execute("INSERT OR REPLACE INTO api_panels (id, name, url, token, polling_interval) VALUES (?, ?, ?, ?, ?)", (p_id, name, url, token, pinterval))
-
-        fb_methods = db.reference("withdraw_methods").get()
-        if fb_methods and isinstance(fb_methods, dict):
-            for m_name in fb_methods.keys():
-                cursor.execute("INSERT OR IGNORE INTO withdraw_methods (name) VALUES (?)", (str(m_name),))
-
-        fb_wreqs = db.reference("withdraw_requests").get()
-        if fb_wreqs and isinstance(fb_wreqs, dict):
-            for rid, rdata in fb_wreqs.items():
-                if isinstance(rdata, dict):
-                    r_id = int(rdata.get("id", rid))
-                    u_id = int(rdata.get("user_id", 0))
-                    meth = str(rdata.get("method", ""))
-                    wnum = str(rdata.get("wallet_number", ""))
-                    amt = float(rdata.get("amount", 0.0))
-                    st = str(rdata.get("status", "pending"))
-                    rr = str(rdata.get("reject_reason", ""))
-                    ca = int(rdata.get("created_at", 0))
-                    cursor.execute("INSERT OR REPLACE INTO withdraw_requests (id, user_id, method, wallet_number, amount, status, reject_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (r_id, u_id, meth, wnum, amt, st, rr, ca))
-
-        fb_payouts = db.reference("payouts").get()
+        # Payouts
+        fb_payouts = firebase_db_ref.reference("payouts").get()
         if fb_payouts and isinstance(fb_payouts, dict):
+            rows = []
             for srv, cnts in fb_payouts.items():
                 if isinstance(cnts, dict):
                     for cnt, val in cnts.items():
-                        try:
-                            fval = float(val)
-                        except (TypeError, ValueError):
-                            fval = DEFAULT_PAYOUT
-                        cursor.execute("INSERT OR REPLACE INTO payouts (service_name, country_name, payout) VALUES (?, ?, ?)", (str(srv), str(cnt), fval))
+                        rows.append({"service_name": srv, "country_name": cnt, "payout": float(val)})
+            if rows:
+                try:
+                    supabase.table("payouts").upsert(rows).execute()
+                except Exception as e:
+                    logger.error(f"restore payouts error: {e}")
 
-        conn.commit()
-        conn.close()
-        refresh_all_caches_sync()
+        # Admins
+        fb_admins = firebase_db_ref.reference("admins").get()
+        if fb_admins and isinstance(fb_admins, dict):
+            rows = []
+            for uid, adata in fb_admins.items():
+                if str(uid).isdigit():
+                    name = adata.get("name", "Admin") if isinstance(adata, dict) else "Admin"
+                    rows.append({"user_id": int(uid), "name": str(name)})
+            if rows:
+                try:
+                    supabase.table("admins").upsert(rows).execute()
+                except Exception as e:
+                    logger.error(f"restore admins error: {e}")
+
+        # API panels
+        fb_panels = firebase_db_ref.reference("api_panels").get()
+        if fb_panels and isinstance(fb_panels, dict):
+            for pid, pdata in fb_panels.items():
+                if isinstance(pdata, dict):
+                    try:
+                        supabase.table("api_panels").upsert({
+                            "id": int(pdata.get("id", pid)),
+                            "name": str(pdata.get("name", "")),
+                            "url": str(pdata.get("url", "")),
+                            "token": str(pdata.get("token", "")),
+                            "polling_interval": float(pdata.get("polling_interval", 5.0)),
+                        }).execute()
+                    except Exception:
+                        pass
+
+        # Withdraw methods
+        fb_methods = firebase_db_ref.reference("withdraw_methods").get()
+        if fb_methods and isinstance(fb_methods, dict):
+            rows = [{"name": str(m)} for m in fb_methods.keys()]
+            if rows:
+                try:
+                    supabase.table("withdraw_methods").upsert(rows).execute()
+                except Exception:
+                    pass
+
+        # Withdraw requests
+        fb_wreqs = firebase_db_ref.reference("withdraw_requests").get()
+        if fb_wreqs and isinstance(fb_wreqs, dict):
+            for rid, rdata in fb_wreqs.items():
+                if isinstance(rdata, dict):
+                    try:
+                        supabase.table("withdraw_requests").upsert({
+                            "id": int(rdata.get("id", rid)),
+                            "user_id": int(rdata.get("user_id", 0)),
+                            "method": str(rdata.get("method", "")),
+                            "wallet_number": str(rdata.get("wallet_number", "")),
+                            "amount": float(rdata.get("amount", 0.0)),
+                            "status": str(rdata.get("status", "pending")),
+                            "reject_reason": str(rdata.get("reject_reason", "")),
+                            "created_at": int(rdata.get("created_at", 0)),
+                        }).execute()
+                    except Exception:
+                        pass
+
+        # Services + numbers
+        fb_services = firebase_db_ref.reference("services").get()
+        if fb_services and isinstance(fb_services, dict):
+            for srv, cnts in fb_services.items():
+                if isinstance(cnts, dict):
+                    for cnt in cnts.keys():
+                        try:
+                            supabase.table("services").upsert({
+                                "service_name": srv, "country_name": cnt,
+                            }).execute()
+                        except Exception:
+                            pass
+                        nums = firebase_db_ref.reference(f"numbers/{srv}/{cnt}").get()
+                        if nums and isinstance(nums, dict):
+                            batch = []
+                            for nk, nv in nums.items():
+                                if isinstance(nv, dict):
+                                    batch.append({
+                                        "service": srv, "country": cnt,
+                                        "number": str(nv.get("number", nk)),
+                                        "status": str(nv.get("status", "available")),
+                                        "user_id": int(nv.get("user_id", 0) or 0),
+                                    })
+                            for i in range(0, len(batch), 500):
+                                try:
+                                    supabase.table("numbers").upsert(batch[i:i+500]).execute()
+                                except Exception:
+                                    pass
+
+        # Allocations (critical — prevents re-allocate on restart)
+        fb_alloc = firebase_db_ref.reference("allocations").get()
+        if fb_alloc and isinstance(fb_alloc, dict):
+            batch = []
+            for num, adata in fb_alloc.items():
+                if isinstance(adata, dict):
+                    batch.append({
+                        "number": num,
+                        "user_id": int(adata.get("user_id", 0) or 0),
+                        "service": str(adata.get("service", "")),
+                        "country": str(adata.get("country", "")),
+                    })
+            for i in range(0, len(batch), 500):
+                try:
+                    supabase.table("allocations").upsert(batch[i:i+500]).execute()
+                except Exception:
+                    pass
+
+        logger.info("Firebase → Supabase restore complete")
     except Exception as e:
-        logging.error(f"Error syncing Firebase data to SQLite: {e}")
+        logger.error(f"Restore from Firebase error: {e}")
+
+
+# ============================================================
+# CACHE MANAGEMENT
+# ============================================================
+def load_known_users():
+    """Load a bounded subset of user IDs into LRU (RAM-safe)."""
+    try:
+        res = supabase.table("users").select("user_id").limit(MAX_KNOWN_USERS).execute()
+        for r in res.data:
+            KNOWN_USERS.add(int(r["user_id"]))
+        logger.info(f"Loaded {len(KNOWN_USERS)} known users")
+    except Exception as e:
+        logger.error(f"load_known_users error: {e}")
+
+
+def refresh_all_caches_sync():
+    global SETTINGS_CACHE, ADMINS_CACHE
+    SETTINGS_CACHE.clear()
+    ADMINS_CACHE.clear()
+
+    if ADMIN_ID:
+        ADMINS_CACHE.add(ADMIN_ID)
+
+    try:
+        res = supabase.table("settings").select("key, value").execute()
+        for r in res.data:
+            SETTINGS_CACHE[str(r["key"])] = str(r["value"])
+    except Exception as e:
+        logger.error(f"Error loading settings: {e}")
+
+    try:
+        res = supabase.table("admins").select("user_id").execute()
+        for r in res.data:
+            ADMINS_CACHE.add(int(r["user_id"]))
+    except Exception as e:
+        logger.error(f"Error loading admins: {e}")
+
+    refresh_services_cache_sync()
+    refresh_payouts_cache_sync()
+
+
+def refresh_services_cache_sync():
+    """Rebuild SERVICES_CACHE from Supabase. Called at startup + admin ops only, NOT in hot path."""
+    global SERVICES_CACHE
+    new_cache = {}
+    try:
+        res = supabase.table("services").select("service_name, country_name").execute()
+        for r in res.data:
+            new_cache.setdefault(r["service_name"], {})[r["country_name"]] = 0
+        # Global allocations — one read
+        allocated = set()
+        try:
+            ar = supabase.table("allocations").select("number").execute()
+            allocated = {a["number"] for a in ar.data}
+        except Exception as e:
+            logger.error(f"allocations read error: {e}")
+        for srv, cnts in new_cache.items():
+            for cnt in list(cnts.keys()):
+                try:
+                    nr = supabase.table("numbers").select("number").eq("service", srv).eq("country", cnt).eq("status", "available").execute()
+                    new_cache[srv][cnt] = sum(1 for n in nr.data if n["number"] not in allocated)
+                except Exception as e:
+                    logger.error(f"count error for {srv}/{cnt}: {e}")
+    except Exception as e:
+        logger.error(f"Error populating services cache: {e}")
+    SERVICES_CACHE = new_cache
 
 
 def get_admin_services_summary():
@@ -1484,41 +1110,37 @@ def get_admin_services_summary():
 
 
 def delete_service_db(service: str):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
+    try:
+        supabase.table("services").delete().eq("service_name", service).execute()
+        supabase.table("numbers").delete().eq("service", service).execute()
+        supabase.table("payouts").delete().eq("service_name", service).execute()
+    except Exception as e:
+        logger.error(f"Supabase delete service error: {e}")
+    if firebase_db_ref:
         try:
-            db.reference(f"services/{service}").delete()
-            db.reference(f"numbers/{service}").delete()
-            db.reference(f"payouts/{service}").delete()
+            firebase_db_ref.reference(f"services/{service}").delete()
+            firebase_db_ref.reference(f"numbers/{service}").delete()
+            firebase_db_ref.reference(f"payouts/{service}").delete()
         except Exception as e:
-            logging.error(f"Error deleting service from Firebase: {e}")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM services WHERE service_name = ?", (service,))
-    cursor.execute("DELETE FROM numbers WHERE service = ?", (service,))
-    cursor.execute("DELETE FROM payouts WHERE service_name = ?", (service,))
-    conn.commit()
-    conn.close()
+            logger.error(f"Firebase delete service error: {e}")
     refresh_services_cache_sync()
     refresh_payouts_cache_sync()
 
 
 def delete_country_db(service: str, country: str):
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
+    try:
+        supabase.table("services").delete().eq("service_name", service).eq("country_name", country).execute()
+        supabase.table("numbers").delete().eq("service", service).eq("country", country).execute()
+        supabase.table("payouts").delete().eq("service_name", service).eq("country_name", country).execute()
+    except Exception as e:
+        logger.error(f"Supabase delete country error: {e}")
+    if firebase_db_ref:
         try:
-            db.reference(f"services/{service}/{country}").delete()
-            db.reference(f"numbers/{service}/{country}").delete()
-            db.reference(f"payouts/{service}/{country}").delete()
+            firebase_db_ref.reference(f"services/{service}/{country}").delete()
+            firebase_db_ref.reference(f"numbers/{service}/{country}").delete()
+            firebase_db_ref.reference(f"payouts/{service}/{country}").delete()
         except Exception as e:
-            logging.error(f"Error deleting country from Firebase: {e}")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM services WHERE service_name = ? AND country_name = ?", (service, country))
-    cursor.execute("DELETE FROM numbers WHERE service = ? AND country = ?", (service, country))
-    cursor.execute("DELETE FROM payouts WHERE service_name = ? AND country_name = ?", (service, country))
-    conn.commit()
-    conn.close()
+            logger.error(f"Firebase delete country error: {e}")
     refresh_services_cache_sync()
     refresh_payouts_cache_sync()
 
@@ -1541,214 +1163,173 @@ def save_numbers_sync(service: str, country: str, numbers: list, payout: float =
     if not cleaned_numbers:
         return 0
 
-    globally_used = set()
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
+    inserted = 0
+    try:
+        supabase.table("services").upsert({
+            "service_name": service, "country_name": country,
+        }).execute()
+
+        # Existing allocations
+        globally_used = set()
         try:
-            used = db.reference("allocations").get() or {}
-            if isinstance(used, dict):
-                globally_used.update(str(k) for k in used.keys())
+            ar = supabase.table("allocations").select("number").execute()
+            globally_used = {str(r["number"]) for r in ar.data}
         except Exception as e:
-            logging.error(f"Error reading Firebase allocations before upload: {e}")
+            logger.error(f"allocs read error: {e}")
 
-        ref = db.reference(f"numbers/{service}/{country}")
-        existing = ref.get() or {}
-        batch = {}
-        for num in cleaned_numbers:
-            if num in globally_used:
-                continue
-            if isinstance(existing, dict) and num in existing:
-                continue
-            batch[num] = {"number": num, "status": "available", "user_id": 0}
+        # Existing numbers for this service+country
+        existing = set()
+        try:
+            nr = supabase.table("numbers").select("number").eq("service", service).eq("country", country).execute()
+            existing = {str(r["number"]) for r in nr.data}
+        except Exception as e:
+            logger.error(f"existing numbers read error: {e}")
 
-        if batch:
-            ref.update(batch)
-        db.reference(f"services/{service}/{country}").set(True)
-        inserted = len(batch)
-    else:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO services (service_name, country_name) VALUES (?, ?)", (service, country))
+        to_insert = [n for n in cleaned_numbers if n not in globally_used and n not in existing]
 
-        cursor.execute("SELECT number FROM allocations")
-        globally_used = {str(row[0]) for row in cursor.fetchall()}
+        for i in range(0, len(to_insert), 500):
+            chunk = to_insert[i:i+500]
+            try:
+                supabase.table("numbers").insert([
+                    {"service": service, "country": country, "number": n,
+                     "status": "available", "user_id": 0}
+                    for n in chunk
+                ]).execute()
+                inserted += len(chunk)
+            except Exception as e:
+                logger.error(f"batch numbers insert error: {e}")
+    except Exception as e:
+        logger.error(f"save_numbers error: {e}")
 
-        inserted = 0
-        for num in cleaned_numbers:
-            if num in globally_used:
-                continue
-            cursor.execute(
-                "SELECT id, status FROM numbers WHERE service = ? AND country = ? AND number = ? LIMIT 1",
-                (service, country, num)
-            )
-            row = cursor.fetchone()
-            if row:
-                continue
-            cursor.execute(
-                "INSERT INTO numbers (service, country, number, status, user_id) VALUES (?, ?, ?, 'available', 0)",
-                (service, country, num)
-            )
-            inserted += 1
-
-        conn.commit()
-        conn.close()
-
-    # Save payout if provided
+    # Save payout
     if payout is not None:
         set_payout_sync(service, country, payout)
+
+    # Firebase mirror (low frequency — admin action only)
+    if firebase_db_ref and inserted > 0:
+        try:
+            updates = {}
+            for n in to_insert[:2000]:
+                updates[f"numbers/{service}/{country}/{n}"] = {"number": n, "status": "available", "user_id": 0}
+            if updates:
+                firebase_db_ref.reference("/").update(updates)
+            firebase_db_ref.reference(f"services/{service}/{country}").set(True)
+        except Exception as e:
+            logger.error(f"Firebase mirror numbers error: {e}")
 
     refresh_services_cache_sync()
     return inserted
 
 
 def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: int, exclude: list = None) -> list:
-    exclude = {str(x) for x in (exclude or [])}
+    """Atomic via Supabase RPC — no full cache refresh in hot path."""
+    exclude_list = [str(x) for x in (exclude or [])]
     target_qty = max(1, int(target_qty))
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        ref = db.reference(f"numbers/{service}/{country}")
-        current_data = ref.get() or {}
-        if not isinstance(current_data, dict):
-            return []
-
-        candidates = []
-        for key, val in current_data.items():
-            if not isinstance(val, dict):
-                continue
-            num = str(val.get("number", key)).strip()
-            if not num or num in exclude or val.get("status") != "available":
-                continue
-            candidates.append(num)
-            if len(candidates) >= target_qty * 3:
-                break
-
-        if len(candidates) < target_qty:
-            return []
-
-        assigned = []
-        for num in candidates:
-            if len(assigned) >= target_qty:
-                break
-            lock_ref = db.reference(f"allocations/{num}")
-            result_holder = {"won": False}
-
-            def lock_txn(current):
-                if current is not None:
-                    return current
-                result_holder["won"] = True
-                return {"user_id": user_id, "service": service, "country": country, "allocated_at": int(time.time())}
-
-            try:
-                lock_ref.transaction(lock_txn)
-            except Exception as e:
-                logging.error(f"Firebase global allocation lock failed for {num}: {e}")
-                continue
-
-            if not result_holder["won"]:
-                try:
-                    existing_lock = lock_ref.get()
-                    if isinstance(existing_lock, dict):
-                        db.reference(f"numbers/{service}/{country}/{num}").update({
-                            "status": "allocated",
-                            "user_id": int(existing_lock.get("user_id", 0) or 0)
-                        })
-                except Exception as e:
-                    logging.error(f"Firebase duplicate-allocation cleanup failed for {num}: {e}")
-                continue
-
-            try:
-                db.reference(f"numbers/{service}/{country}/{num}").update({
-                    "status": "allocated",
-                    "user_id": user_id,
-                    "allocated_at": int(time.time())
-                })
-                assigned.append(num)
-            except Exception as e:
-                logging.error(f"Firebase number status update failed for {num}: {e}")
-                try:
-                    lock_ref.delete()
-                except Exception:
-                    pass
-
-        refresh_services_cache_sync()
-        return assigned
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
     assigned = []
-    try:
-        conn.execute("BEGIN IMMEDIATE")
 
-        if exclude:
-            placeholders = ','.join(['?'] * len(exclude))
-            sql = f"""
-                SELECT id, number FROM numbers
-                WHERE service = ? AND country = ? AND status = 'available'
-                  AND number NOT IN ({placeholders})
-                  AND number NOT IN (SELECT number FROM allocations)
-                ORDER BY id ASC LIMIT ?
-            """
-            params = [service, country] + list(exclude) + [target_qty]
-        else:
-            sql = """
-                SELECT id, number FROM numbers
-                WHERE service = ? AND country = ? AND status = 'available'
-                  AND number NOT IN (SELECT number FROM allocations)
-                ORDER BY id ASC LIMIT ?
-            """
-            params = [service, country, target_qty]
+    for _ in range(target_qty):
+        try:
+            res = supabase.rpc("allocate_number", {
+                "p_service": service, "p_country": country,
+                "p_user_id": user_id, "p_exclude": exclude_list + assigned,
+            }).execute()
+            num = res.data
+            if isinstance(num, list):
+                num = num[0] if num else None
+            if not num:
+                break
+            assigned.append(str(num))
+        except Exception as e:
+            logger.error(f"allocate RPC error: {e}")
+            break
 
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        if len(rows) < target_qty:
-            conn.rollback()
-            return []
+    # In-place cache decrement (cheap)
+    if service in SERVICES_CACHE and country in SERVICES_CACHE[service]:
+        SERVICES_CACHE[service][country] = max(0, SERVICES_CACHE[service][country] - len(assigned))
 
-        for num_id, num in rows:
-            num_str = str(num)
-            assigned.append(num_str)
-            cursor.execute(
-                "UPDATE numbers SET status = 'allocated', user_id = ? WHERE id = ? AND status = 'available'",
-                (user_id, num_id)
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError(f"Number {num_str} could not be locked")
-            cursor.execute(
-                "INSERT OR IGNORE INTO allocations (number, user_id, service, country) VALUES (?, ?, ?, ?)",
-                (num_str, user_id, service, country)
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError(f"Number {num_str} was already allocated")
+    # Firebase mirror — batched, one write per allocation cycle
+    if firebase_db_ref and assigned:
+        try:
+            updates = {}
+            for n in assigned:
+                updates[f"allocations/{n}"] = {
+                    "user_id": user_id, "service": service, "country": country,
+                    "allocated_at": int(time.time()),
+                }
+                updates[f"numbers/{service}/{country}/{n}/status"] = "allocated"
+                updates[f"numbers/{service}/{country}/{n}/user_id"] = user_id
+            firebase_db_ref.reference("/").update(updates)
+        except Exception as e:
+            logger.error(f"Firebase mirror alloc error: {e}")
 
-        conn.commit()
-        refresh_services_cache_sync()
-        return assigned
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"SQLite allocation failed: {e}")
-        return []
-    finally:
-        conn.close()
+    return assigned
 
 
 def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        alloc_ref = db.reference("allocations").get()
-        result = []
-        if alloc_ref and isinstance(alloc_ref, dict):
-            for num_k, num_v in alloc_ref.items():
-                if isinstance(num_v, dict) and num_v.get("user_id") == user_id and num_v.get("service") == service and num_v.get("country") == country:
-                    result.append(str(num_k))
-        return result
+    try:
+        res = supabase.table("allocations").select("number").eq("user_id", user_id).eq("service", service).eq("country", country).execute()
+        return [str(r["number"]) for r in res.data]
+    except Exception as e:
+        logger.error(f"Supabase get user allocations error: {e}")
+        return []
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT number FROM allocations WHERE user_id = ? AND service = ? AND country = ?", (user_id, service, country))
-    result = [str(r[0]) for r in cursor.fetchall()]
-    conn.close()
+
+def lookup_allocation_sync(num: str, clean_num: str):
+    try:
+        res = supabase.table("allocations").select("user_id, service, country").or_(
+            f"number.eq.{num},number.eq.{clean_num}"
+        ).limit(1).execute()
+        if res.data:
+            r = res.data[0]
+            return r["user_id"], r["service"], r["country"]
+    except Exception as e:
+        logger.error(f"Supabase lookup allocation error: {e}")
+    return None, None, None
+
+
+# ============================================================
+# SEEN OTPs (persistent via Supabase → no duplicate payouts on restart)
+# ============================================================
+def load_seen_otp_ids_sync() -> dict:
+    """Load only IDs from last 24h to bound memory."""
+    cutoff = int(time.time()) - OTP_ID_RETENTION_SECONDS
+    result = {}
+    try:
+        res = supabase.table("seen_otps").select("msg_id").gte("ts", cutoff).execute()
+        result = {r["msg_id"]: True for r in res.data}
+    except Exception as e:
+        logger.error(f"Supabase load seen otps error: {e}")
     return result
 
 
-# ---------------- VIEW BUILDERS ----------------
+def mark_otp_seen_sync(msg_id: str):
+    try:
+        supabase.table("seen_otps").upsert({"msg_id": msg_id, "ts": int(time.time())}).execute()
+    except Exception as e:
+        logger.error(f"Supabase mark otp seen error: {e}")
+
+
+def mark_otp_seen_batch_sync(msg_ids: list):
+    if not msg_ids:
+        return
+    ts = int(time.time())
+    try:
+        supabase.table("seen_otps").upsert([{"msg_id": m, "ts": ts} for m in msg_ids]).execute()
+    except Exception as e:
+        logger.error(f"Supabase batch mark otp seen error: {e}")
+
+
+def cleanup_old_otp_ids_sync():
+    cutoff = int(time.time()) - OTP_ID_RETENTION_SECONDS
+    try:
+        supabase.table("seen_otps").delete().lt("ts", cutoff).execute()
+    except Exception as e:
+        logger.error(f"Supabase cleanup seen otps error: {e}")
+
+
+# ============================================================
+# VIEW BUILDERS — UNCHANGED (data via Supabase)
+# ============================================================
 def build_admin_control_view():
     admins = get_all_admins_sync()
     text = "🛠 **ADMIN CONTROL MANAGEMENT**\n\nList of System Admins:\n"
@@ -2095,158 +1676,37 @@ def get_services_keyboard():
     return InlineKeyboardMarkup(buttons), "📍 Please select a service:"
 
 
-# ---------------- FIREBASE CONNECTION MANAGEMENT ----------------
-def init_firebase_system(run_migration=True):
-    global CURRENT_DB_MODE
-    if not HAS_FIREBASE_LIB:
-        CURRENT_DB_MODE = "SQLite (Local)"
-        refresh_all_caches_sync()
-        return False
-
-    if firebase_admin._apps:
-        CURRENT_DB_MODE = "Firebase (Cloud)"
-        sync_firebase_to_sqlite()
-        if run_migration:
-            migrate_sqlite_to_firebase()
-        return True
-
-    cred_dict = None
-    firebase_b64 = os.environ.get("FIREBASE_BASE64")
-    firebase_json_env = os.environ.get("FIREBASE_CONFIG_JSON")
-
-    try:
-        if firebase_b64:
-            decoded_json = base64.b64decode(firebase_b64).decode('utf-8')
-            cred_dict = json.loads(decoded_json)
-        elif firebase_json_env:
-            cred_dict = json.loads(firebase_json_env)
-            if "private_key" in cred_dict:
-                cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-
-        if cred_dict:
-            cred = credentials.Certificate(cred_dict)
-            options = {}
-            if DATABASE_URL:
-                options['databaseURL'] = DATABASE_URL
-            firebase_admin.initialize_app(cred, options if options else None)
-            CURRENT_DB_MODE = "Firebase (Cloud)"
-
-            sync_firebase_to_sqlite()
-            if run_migration:
-                migrate_sqlite_to_firebase()
-            logging.info("Firebase connected successfully from environment variables!")
-            return True
-        else:
-            logging.info("No FIREBASE_BASE64 / FIREBASE_CONFIG_JSON set — running in SQLite (Local) mode.")
-    except Exception as e:
-        logging.error(f"Firebase Init Error: {e}")
-
-    CURRENT_DB_MODE = "SQLite (Local)"
-    refresh_all_caches_sync()
-    return False
+# ============================================================
+# FLASK HEALTH (UptimeRobot endpoint)
+# ============================================================
+flask_app = Flask(__name__)
 
 
-def migrate_sqlite_to_firebase():
-    """One-time migration of local SQLite cache to Firebase.
-    NOTE: On first successful boot, Firebase is the source of truth. On subsequent
-    boots we do NOT overwrite Firebase users/payouts from SQLite (avoids data loss)."""
-    if not firebase_admin._apps:
-        return
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    # Users: only seed Firebase if not present (never overwrite existing cloud values)
-    cursor.execute("SELECT user_id, balance, today_earned, total_earned, refer_earned, total_otps, weekly_otps, first_name, last_earn_date FROM users")
-    users = cursor.fetchall()
-    for u in users:
-        try:
-            existing = db.reference(f"users/{u[0]}").get()
-        except Exception:
-            existing = None
-        if not existing:
-            db.reference(f"users/{u[0]}").set({
-                "exists": True,
-                "balance": u[1] if len(u) > 1 else 0.0,
-                "today_earned": u[2] if len(u) > 2 else 0.0,
-                "total_earned": u[3] if len(u) > 3 else 0.0,
-                "refer_earned": u[4] if len(u) > 4 else 0.0,
-                "total_otps": u[5] if len(u) > 5 else 0,
-                "weekly_otps": u[6] if len(u) > 6 else 0,
-                "first_name": u[7] if len(u) > 7 else "",
-                "last_earn_date": u[8] if len(u) > 8 else ""
-            })
-
-    # Admins (idempotent)
-    cursor.execute("SELECT user_id, name FROM admins")
-    for a in cursor.fetchall():
-        db.reference(f"admins/{a[0]}").set({"name": a[1]})
-
-    # Payouts (seed only if missing)
-    cursor.execute("SELECT service_name, country_name, payout FROM payouts")
-    for row in cursor.fetchall():
-        srv, cnt, amt = row
-        try:
-            existing = db.reference(f"payouts/{srv}/{cnt}").get()
-        except Exception:
-            existing = None
-        if existing is None:
-            db.reference(f"payouts/{srv}/{cnt}").set(float(amt))
-
-    # Settings (only write missing keys — never overwrite Firebase-side edits)
-    existing_fb_settings = db.reference("settings").get() or {}
-    cursor.execute("SELECT key, value FROM settings")
-    for k, v in cursor.fetchall():
-        if k not in existing_fb_settings or not existing_fb_settings[k]:
-            db.reference(f"settings/{k}").set(v)
-        else:
-            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, existing_fb_settings[k]))
-
-    # API panels (upsert)
-    cursor.execute("SELECT id, name, url, token, polling_interval FROM api_panels")
-    for pid, name, url, token, pinterval in cursor.fetchall():
-        db.reference(f"api_panels/{pid}").set({
-            "id": str(pid), "name": name, "url": url, "token": token, "polling_interval": pinterval
-        })
-
-    # Withdraw methods (upsert)
-    cursor.execute("SELECT name FROM withdraw_methods")
-    for m in cursor.fetchall():
-        db.reference(f"withdraw_methods/{m[0]}").set(True)
-
-    # Withdraw requests — seed only missing
-    cursor.execute("SELECT id, user_id, method, wallet_number, amount, status, reject_reason, created_at FROM withdraw_requests")
-    for r in cursor.fetchall():
-        try:
-            existing = db.reference(f"withdraw_requests/{r[0]}").get()
-        except Exception:
-            existing = None
-        if not existing:
-            db.reference(f"withdraw_requests/{r[0]}").set({
-                "id": r[0], "user_id": r[1], "method": r[2], "wallet_number": r[3],
-                "amount": r[4], "status": r[5], "reject_reason": r[6], "created_at": r[7]
-            })
-
-    conn.commit()
-    conn.close()
-    refresh_all_caches_sync()
-
-
-init_firebase_system(run_migration=True)
-
-app = Flask(__name__)
-
-@app.route('/')
+@flask_app.route('/')
 def home():
-    return f"Bot running! Current DB Mode: {CURRENT_DB_MODE}"
+    return f"Bot running! DB Mode: {CURRENT_DB_MODE}"
+
+
+@flask_app.route('/health')
+def health():
+    return jsonify({
+        "status": "ok",
+        "db_mode": CURRENT_DB_MODE,
+        "known_users": len(KNOWN_USERS),
+        "services": len(SERVICES_CACHE),
+        "panels": len(PANEL_TASKS),
+        "firebase": "connected" if firebase_db_ref else "disabled",
+    })
 
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, threaded=True)
 
 
-# States
+# ============================================================
+# STATES
+# ============================================================
 (
     ADD_SERVICE,
     ADD_COUNTRY,
@@ -2323,7 +1783,9 @@ def get_global_settings_keyboard():
     return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
 
 
-# ---------------- BOT HANDLERS ----------------
+# ============================================================
+# BOT HANDLERS (all existing logic, data via Supabase)
+# ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name or ""
@@ -2654,7 +2116,7 @@ async def receive_payout_amount(update: Update, context: ContextTypes.DEFAULT_TY
         return ADD_NUMBERS
 
 
-# ---------------- RANKING BONUS CONVERSATION HANDLERS ----------------
+# ---------------- RANKING BONUS ----------------
 @admin_only
 async def set_rank1_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2718,7 +2180,7 @@ async def receive_rank3_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# ---------------- DEV / ADMIN SETTINGS CONVERSATIONS ----------------
+# ---------------- DEV / ADMIN SETTINGS ----------------
 @admin_only
 async def set_dev_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2808,7 +2270,6 @@ async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TY
     if req_id:
         req = await run_db(get_withdraw_request_by_id_sync, req_id)
         if req and req["status"] == "pending":
-            # Atomic: take ownership first, THEN refund (avoids double refund)
             ok = await run_db(atomic_transition_withdraw_status_sync, req_id, "pending", "rejected", reason_text)
             if ok:
                 await run_db(refund_user_balance_sync, req["user_id"], req["amount"])
@@ -2835,7 +2296,7 @@ async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-# ---------------- ADMIN SETUP CONVERSATIONS ----------------
+# ---------------- ADMIN SETUP ----------------
 @admin_only
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2866,7 +2327,6 @@ async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['country_name'] = country
     service = context.user_data.get('service_name', '')
 
-    # Show existing payout as hint if it exists
     existing_payout = get_payout_sync(service, country) if service else DEFAULT_PAYOUT
     hint = ""
     if service and country in PAYOUTS_CACHE.get(service, {}):
@@ -2911,7 +2371,6 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------------- ADD ADMIN CONVERSATION ----------------
 @admin_only
 async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3008,7 +2467,7 @@ async def receive_panel_interval(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
-# ---------------- EDIT LINKS CONVERSATIONS ----------------
+# ---------------- EDIT LINKS ----------------
 @admin_only
 async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3086,7 +2545,7 @@ async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-# ---------------- BROADCAST (concurrent, non-blocking) ----------------
+# ---------------- BROADCAST ----------------
 @admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_users = await run_db(get_all_users)
@@ -3134,7 +2593,6 @@ async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TY
                 logging.error(f"Broadcast failed for {target_id}: {e}")
                 async with counter_lock:
                     failed_count += 1
-            # Small per-worker throttle to avoid hitting Telegram rate limits
             await asyncio.sleep(BROADCAST_PER_MSG_DELAY)
 
     tasks = [asyncio.create_task(send_one(uid)) for uid in all_users]
@@ -3168,7 +2626,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------------- INLINE CALLBACK HANDLER ----------------
+# ---------------- CALLBACK HANDLER ----------------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -3301,7 +2759,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Request already processed or invalid!", show_alert=True)
             return
 
-        # Atomic transition — prevents double-approve notifications
         ok = await run_db(atomic_transition_withdraw_status_sync, req_id, "pending", "approved", "")
         if not ok:
             await query.answer("Request already processed!", show_alert=True)
@@ -3322,7 +2779,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_msg, kbd = build_withdraw_detail_view(req_id)
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
-    # Admin Control
     elif data == "adm:ctrl:list":
         if not user_is_admin:
             await query.answer()
@@ -3455,7 +2911,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer()
 
-    # Payout management
     elif data.startswith("adm:pay:mng:"):
         if not user_is_admin:
             await query.answer()
@@ -3465,7 +2920,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kbd = build_payout_manage_view(service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
-    # API Panel
     elif data == "adm:api:list":
         if not user_is_admin:
             await query.answer()
@@ -3508,7 +2962,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kbd = build_api_panels_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
-    # User: service / country selection
     elif data.startswith("srv_"):
         await query.answer()
         service = data.split("_", 1)[1]
@@ -3579,95 +3032,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Sorry, not enough ({target_qty}) new numbers available to change!", show_alert=True)
 
 
-# ---------------- OTP POLLING & MULTI-API MANAGER ----------------
-def load_seen_otp_ids_sync() -> dict:
-    result = {}
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT msg_id FROM seen_otps")
-        result = {row[0]: True for row in cursor.fetchall()}
-    except Exception as e:
-        logging.error(f"SQLite load seen otps error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            seen_ref = db.reference("seen_otp_ids").get()
-            if seen_ref and isinstance(seen_ref, dict):
-                result.update({k: True for k in seen_ref.keys()})
-        except Exception as e:
-            logging.error(f"Firebase load seen otps error: {e}")
-    return result
-
-
-def mark_otp_seen_sync(msg_id: str):
-    ts = int(time.time())
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO seen_otps (msg_id, ts) VALUES (?, ?)", (msg_id, ts))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"SQLite mark otp seen error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            db.reference(f"seen_otp_ids/{msg_id}").set(ts)
-        except Exception as e:
-            logging.error(f"Firebase mark otp seen error: {e}")
-
-
-def cleanup_old_otp_ids_sync():
-    cutoff = int(time.time()) - OTP_ID_RETENTION_SECONDS
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM seen_otps WHERE ts > 0 AND ts < ?", (cutoff,))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"SQLite cleanup seen otps error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        try:
-            seen_ref = db.reference("seen_otp_ids").get()
-            if seen_ref and isinstance(seen_ref, dict):
-                for msg_id, ts in seen_ref.items():
-                    if isinstance(ts, (int, float)) and ts < cutoff:
-                        db.reference(f"seen_otp_ids/{msg_id}").delete()
-        except Exception as e:
-            logging.error(f"Firebase cleanup seen otps error: {e}")
-
-
-def lookup_allocation_sync(num: str, clean_num: str):
-    """Returns (user_id, service, country) — country is NEW."""
-    if CURRENT_DB_MODE == "Firebase (Cloud)":
-        alloc_ref = db.reference(f"allocations/{num}").get() or db.reference(f"allocations/{clean_num}").get()
-        if alloc_ref and isinstance(alloc_ref, dict):
-            return alloc_ref.get("user_id"), alloc_ref.get("service"), alloc_ref.get("country")
-        return None, None, None
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, service, country FROM allocations WHERE number = ? OR number = ?", (num, clean_num))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return row[0], row[1], row[2]
-    return None, None, None
+# ============================================================
+# OTP POLLING & PROCESSING
+# ============================================================
+def _remember_processed(msg_id: str):
+    PROCESSED_OTP_IDS_CACHE[msg_id] = True
+    if len(PROCESSED_OTP_IDS_CACHE) > MAX_PROCESSED_IN_MEMORY:
+        for _ in range(MAX_PROCESSED_IN_MEMORY // 2):
+            PROCESSED_OTP_IDS_CACHE.popitem(last=False)
 
 
 async def process_otp_items(items: list, application: Application, processed_ids: dict):
+    """Batched: 1 Supabase write for seen_otps, 1 read for allocations, per-user single update."""
     bot_info = await application.bot.get_me()
     bot_username = bot_info.username or ""
     bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
@@ -3682,94 +3058,121 @@ async def process_otp_items(items: list, application: Application, processed_ids
 
     target_otp_group = get_setting("otp_group_id", OTP_GROUP_ID)
 
+    # ---- Step 1: filter new valid items ----
+    valid = []
+    new_ids = []
     for item in items:
         if not isinstance(item, dict):
             continue
-
-        payout_raw = item.get("payout", "0")
         try:
-            payout_val = float(payout_raw)
+            if float(item.get("payout", "0")) <= 0:
+                continue
         except (ValueError, TypeError):
-            payout_val = 0.0
-
-        if payout_val <= 0.0:
             continue
 
         num = str(item.get("num", "")).strip()
         msg = item.get("message", "")
         dt = item.get("dt", "")
-        cli = item.get("cli", "").strip()
-
         if not num or not msg:
             continue
 
-        unique_str = f"{num}_{dt}_{msg}"
-        msg_id = hashlib.md5(unique_str.encode()).hexdigest()
-
-        if msg_id in processed_ids:
+        mid = hashlib.md5(f"{num}_{dt}_{msg}".encode()).hexdigest()
+        if mid in processed_ids:
             continue
+        processed_ids[mid] = True
+        _remember_processed(mid)
+        new_ids.append(mid)
+        valid.append(item)
 
-        processed_ids[msg_id] = True
-        if len(processed_ids) > 2000:
-            for old_id in list(processed_ids.keys())[:1000]:
-                del processed_ids[old_id]
+    if not valid:
+        return
 
-        await run_db(mark_otp_seen_sync, msg_id)
+    # ---- Step 2: batch insert seen IDs (1 Supabase write) ----
+    await run_db(mark_otp_seen_batch_sync, new_ids)
 
-        clean_num = re.sub(r'\D', '', num)
-        allocated_user, service_name, country_name = await run_db(lookup_allocation_sync, num, clean_num)
+    # ---- Step 3: batch lookup allocations ----
+    numbers = [str(it.get("num", "")).strip() for it in valid]
+    clean_numbers = [re.sub(r'\D', '', n) for n in numbers]
+    alloc_map = {}
+    try:
+        combined = list(set(numbers + clean_numbers))
+        # Supabase .in_() with large list — chunk if > 200
+        for i in range(0, len(combined), 200):
+            chunk = combined[i:i+200]
+            res = supabase.table("allocations").select("number, user_id, service, country").in_("number", chunk).execute()
+            for r in res.data:
+                alloc_map[r["number"]] = r
+    except Exception as e:
+        logger.error(f"batch alloc lookup error: {e}")
 
-        display_service = cli if cli else (service_name if service_name else "Service")
+    # ---- Step 4: group per user ----
+    per_user = {}  # uid -> {"amount": float, "count": int, "items": [(item, alloc), ...], "service": str}
+    for it in valid:
+        num = str(it.get("num", "")).strip()
+        clean = re.sub(r'\D', '', num)
+        alloc = alloc_map.get(num) or alloc_map.get(clean)
+        if not alloc:
+            continue
+        u = alloc["user_id"]
+        payout = await run_db(get_payout_supabase_wrapper, alloc["service"], alloc["country"])
+        if u not in per_user:
+            per_user[u] = {"amount": 0.0, "count": 0, "items": [], "service": alloc["service"]}
+        per_user[u]["amount"] += payout
+        per_user[u]["count"] += 1
+        per_user[u]["items"].append((it, alloc))
 
-        otp_code = extract_otp(msg)
-        safe_msg = html.escape(msg)
-        safe_service = html.escape(display_service)
-        safe_num = html.escape(num)
-        masked_num = mask_number_aph(num)
-        safe_masked_num = html.escape(masked_num)
+    # ---- Step 5: per-user single balance update + send messages ----
+    for u, data in per_user.items():
+        prof = await run_db(add_user_balance_and_otp_sync, u, data["amount"], data["count"])
+        bal_str = fmt_num(prof["balance"])
 
-        dev_footer = f"\n━━━━━━━━━━━━━━━━━\n🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}" if show_dev_enabled else ""
+        for item, alloc in data["items"]:
+            num = str(item.get("num", "")).strip()
+            msg = item.get("message", "")
+            cli = (item.get("cli") or "").strip()
+            display_service = cli if cli else (alloc.get("service") or "Service")
 
-        if target_otp_group:
-            if show_msg_enabled:
-                group_text = (
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                    f"🌐 NUM: {safe_masked_num}\n\n"
-                    "🗨️ MESSAGE:\n"
-                    f"<blockquote expandable>{safe_msg}</blockquote>"
-                    f"{dev_footer}"
-                )
-            else:
-                group_text = (
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"📱 <b>SERVICE</b>:  {safe_service}\n"
-                    f"🌐 NUM: {safe_masked_num}"
-                    f"{dev_footer}"
-                )
-            group_kbd = InlineKeyboardMarkup([
-                [create_button("Channel", url=ch_link, style="primary"),
-                 create_button("Get Number", url=bot_link, style="primary")],
-                [create_button(f"{otp_code}", copy_text=otp_code, style="success")]
-            ])
-            try:
-                await application.bot.send_message(
-                    chat_id=target_otp_group, text=group_text, reply_markup=group_kbd,
-                    parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
-                )
-            except Exception as e:
-                logging.error(f"Group Forward Error: {e}")
+            otp_code = extract_otp(msg)
+            safe_msg = html.escape(msg)
+            safe_service = html.escape(display_service)
+            safe_num = html.escape(num)
+            masked_num = mask_number_aph(num)
+            safe_masked_num = html.escape(masked_num)
 
-        if allocated_user:
-            # NEW: per-service+country payout
-            otp_payout = DEFAULT_PAYOUT
-            if service_name and country_name:
-                otp_payout = await run_db(get_payout_sync, service_name, country_name)
+            dev_footer = f"\n━━━━━━━━━━━━━━━━━\n🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}" if show_dev_enabled else ""
 
-            prof = await run_db(add_user_balance_and_otp_sync, allocated_user, otp_payout)
-            new_bal = prof["balance"]
-            bal_str = fmt_num(new_bal)
-            payout_str = fmt_num(otp_payout)
+            if target_otp_group:
+                if show_msg_enabled:
+                    group_text = (
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📱 <b>SERVICE</b>:  {safe_service}\n"
+                        f"🌐 NUM: {safe_masked_num}\n\n"
+                        "🗨️ MESSAGE:\n"
+                        f"<blockquote expandable>{safe_msg}</blockquote>"
+                        f"{dev_footer}"
+                    )
+                else:
+                    group_text = (
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📱 <b>SERVICE</b>:  {safe_service}\n"
+                        f"🌐 NUM: {safe_masked_num}"
+                        f"{dev_footer}"
+                    )
+                group_kbd = InlineKeyboardMarkup([
+                    [create_button("Channel", url=ch_link, style="primary"),
+                     create_button("Get Number", url=bot_link, style="primary")],
+                    [create_button(f"{otp_code}", copy_text=otp_code, style="success")]
+                ])
+                try:
+                    await application.bot.send_message(
+                        chat_id=target_otp_group, text=group_text, reply_markup=group_kbd,
+                        parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
+                    )
+                except Exception as e:
+                    logging.error(f"Group Forward Error: {e}")
+
+            payout_per_otp = data["amount"] / max(1, data["count"])
+            payout_str = fmt_num(payout_per_otp)
 
             if show_msg_enabled:
                 user_text = (
@@ -3795,15 +3198,20 @@ async def process_otp_items(items: list, application: Application, processed_ids
             user_kbd = InlineKeyboardMarkup([[create_button(f"{otp_code}", copy_text=otp_code, style="success")]])
             try:
                 await application.bot.send_message(
-                    chat_id=allocated_user, text=user_text,
-                    reply_markup=user_kbd, parse_mode="HTML"
+                    chat_id=u, text=user_text, reply_markup=user_kbd, parse_mode="HTML"
                 )
             except Exception as e:
                 logging.error(f"User Forward Error: {e}")
 
 
+def get_payout_supabase_wrapper(service: str, country: str) -> float:
+    """Thin wrapper so we can call via run_db."""
+    return get_payout_sync(service, country)
+
+
 async def poll_single_panel(panel_id: str, application: Application, processed_ids: dict):
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=5)) as client:
+        error_streak = 0
         while True:
             panel = await run_db(get_api_panel_sync, panel_id)
             if not panel:
@@ -3829,15 +3237,26 @@ async def poll_single_panel(panel_id: str, application: Application, processed_i
                         items = res_data.get("data", [])
                         if isinstance(items, list) and items:
                             await process_otp_items(items, application, processed_ids)
+                    error_streak = 0
+                else:
+                    error_streak += 1
             except Exception as e:
+                error_streak += 1
                 logging.error(f"Polling Exception for Panel {panel_id}: {e}")
 
-            await asyncio.sleep(interval)
+            # Exponential backoff on repeated errors (RAM/CPU protection)
+            sleep_t = interval * min(8, 2 ** min(error_streak, 3)) if error_streak else interval
+            await asyncio.sleep(sleep_t)
 
 
 async def otp_poller_manager(application: Application):
     processed_ids = await run_db(load_seen_otp_ids_sync)
+    # Seed in-memory LRU
+    for mid in list(processed_ids.keys())[:MAX_PROCESSED_IN_MEMORY]:
+        _remember_processed(mid)
+
     cycle_count = 0
+    last_reset_check = 0.0
 
     while True:
         try:
@@ -3861,18 +3280,21 @@ async def otp_poller_manager(application: Application):
             if cycle_count % 120 == 0:
                 await run_db(cleanup_old_otp_ids_sync)
 
-            # Weekly reset + notifications (sent from async context — FIXED)
-            notifications = await run_db(check_and_process_weekly_reset_sync)
-            for n in notifications:
-                try:
-                    msg = (
-                        "🎉 <b>CONGRATULATIONS! WEEKLY RANKING BONUS!</b>\n\n"
-                        f"You earned a <b>{fmt_num(n['amount'])} ৳</b> bonus for ranking <b>Top {n['rank']}</b> this week! 🏆\n"
-                        "Bonus added to your wallet."
-                    )
-                    await application.bot.send_message(chat_id=n["uid"], text=msg, parse_mode="HTML")
-                except Exception as e:
-                    logging.error(f"Failed sending rank bonus notification to {n['uid']}: {e}")
+            # Weekly reset — checked hourly (was every 5s: quota-killer)
+            now = time.time()
+            if now - last_reset_check >= WEEKLY_RESET_CHECK_INTERVAL:
+                last_reset_check = now
+                notifications = await run_db(check_and_process_weekly_reset_sync)
+                for n in notifications:
+                    try:
+                        msg = (
+                            "🎉 <b>CONGRATULATIONS! WEEKLY RANKING BONUS!</b>\n\n"
+                            f"You earned a <b>{fmt_num(n['amount'])} ৳</b> bonus for ranking <b>Top {n['rank']}</b> this week! 🏆\n"
+                            "Bonus added to your wallet."
+                        )
+                        await application.bot.send_message(chat_id=n["uid"], text=msg, parse_mode="HTML")
+                    except Exception as e:
+                        logging.error(f"Failed sending rank bonus notification to {n['uid']}: {e}")
 
         except Exception as e:
             logging.error(f"OTP Poller Manager Error: {e}")
@@ -3880,12 +3302,34 @@ async def otp_poller_manager(application: Application):
         await asyncio.sleep(5)
 
 
-# ---------------- MAIN FUNCTION ----------------
+# ============================================================
+# MAIN FUNCTION
+# ============================================================
 def main():
-    threading.Thread(target=run_flask, daemon=True).start()
+    # 1) Init Supabase (primary)
+    if not init_supabase():
+        logger.error("Failed to initialize Supabase. Exiting.")
+        return
 
-    # FIX: concurrent_updates(True) — prevents broadcast / long tasks from
-    # blocking other users' button presses and commands.
+    # 2) Init Firebase (backup, optional)
+    init_firebase()
+
+    # 3) Load caches from Supabase
+    refresh_all_caches_sync()
+
+    # 4) Restore from Firebase only if Supabase is empty
+    if not SETTINGS_CACHE:
+        restore_from_firebase_to_supabase()
+        refresh_all_caches_sync()
+
+    # 5) Load known users into bounded LRU
+    load_known_users()
+
+    # 6) Start Flask (UptimeRobot endpoint)
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info(f"Flask started on port {os.environ.get('PORT', 8080)}")
+
+    # 7) Build Telegram application
     application = (
         Application.builder()
         .token(TOKEN)
@@ -3956,8 +3400,18 @@ def main():
 
     async def post_init(app: Application):
         asyncio.create_task(otp_poller_manager(app))
+        asyncio.create_task(firebase_backup_worker())
+        logger.info("Bot started: Supabase primary + Firebase backup")
+
+    async def post_shutdown(app: Application):
+        try:
+            await asyncio.to_thread(push_dirty_to_firebase_sync)
+            logger.info("Final Firebase backup flush complete")
+        except Exception as e:
+            logger.error(f"Shutdown backup error: {e}")
 
     application.post_init = post_init
+    application.post_shutdown = post_shutdown
     application.run_polling()
 
 
