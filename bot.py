@@ -58,7 +58,8 @@ FIREBASE_JSON_ENV = os.environ.get("FIREBASE_CONFIG_JSON")
 
 CURRENT_DB_MODE = "Supabase+Firebase"
 
-OTP_ID_RETENTION_SECONDS = 24 * 60 * 60
+# 6 hours retention (was 24h — cuts seen_otps DB size ~75%)
+OTP_ID_RETENTION_SECONDS = 6 * 60 * 60
 CLEANUP_EVERY_N_CYCLES = 720
 
 DEFAULT_PAYOUT = 0.5
@@ -76,6 +77,12 @@ LEADERBOARD_CACHE_TTL = 60
 MAX_KNOWN_USERS = 20000
 # Processed OTP IDs LRU bound (avoid RAM pressure)
 MAX_PROCESSED_IN_MEMORY = 5000
+
+# Supabase pagination page size (PostgREST hard cap = 1000)
+SUPABASE_PAGE_SIZE = 1000
+
+# Batch RPC availability flag (auto-disabled on first failure)
+_BATCH_RPC_AVAILABLE = True
 
 # ---------------- IN-MEMORY GLOBAL CACHE ----------------
 SETTINGS_CACHE = {}
@@ -116,7 +123,7 @@ logger = logging.getLogger(__name__)
 MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|Withdraw|Back)$")
 
 
-# ---------------- PURE HELPERS (unchanged) ----------------
+# ---------------- PURE HELPERS ----------------
 def get_bd_date_str() -> str:
     tz_bd = datetime.timezone(datetime.timedelta(hours=6))
     return datetime.datetime.now(tz_bd).strftime('%Y-%m-%d')
@@ -210,6 +217,66 @@ def mask_api_key(key: str) -> str:
 
 async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+# ============================================================
+# PAGED SUPABASE FETCH — bypasses PostgREST 1000-row default limit
+# ============================================================
+def fetch_all_rows(table: str, columns: str,
+                   filters: dict = None,
+                   order_col: str = None, order_desc: bool = False,
+                   in_filter: tuple = None,
+                   chunk_size: int = SUPABASE_PAGE_SIZE) -> list:
+    """
+    Fetch every row from Supabase by paginating past the default 1000 limit.
+
+    - filters: {"service": "X", "status": "available"}  (equality only)
+    - in_filter: ("number", [list])  → chunked .in_()
+    - order_col: column to order by (recommended for consistent pagination)
+    """
+    all_rows = []
+    try:
+        # Chunked .in_() path
+        if in_filter:
+            col, values = in_filter
+            for i in range(0, len(values), chunk_size):
+                chunk = values[i:i + chunk_size]
+                offset = 0
+                while True:
+                    q = supabase.table(table).select(columns).in_(col, chunk)
+                    if filters:
+                        for k, v in filters.items():
+                            q = q.eq(k, v)
+                    if order_col:
+                        q = q.order(order_col, desc=order_desc)
+                    r = q.range(offset, offset + chunk_size - 1).execute()
+                    if not r.data:
+                        break
+                    all_rows.extend(r.data)
+                    if len(r.data) < chunk_size:
+                        break
+                    offset += chunk_size
+            return all_rows
+
+        # Normal paginated path
+        offset = 0
+        while True:
+            q = supabase.table(table).select(columns)
+            if filters:
+                for k, v in filters.items():
+                    q = q.eq(k, v)
+            if order_col:
+                q = q.order(order_col, desc=order_desc)
+            r = q.range(offset, offset + chunk_size - 1).execute()
+            if not r.data:
+                break
+            all_rows.extend(r.data)
+            if len(r.data) < chunk_size:
+                break
+            offset += chunk_size
+    except Exception as e:
+        logger.error(f"fetch_all_rows({table}) error: {e}")
+    return all_rows
 
 
 # ============================================================
@@ -311,7 +378,6 @@ def set_payout_sync(service: str, country: str, amount: float):
     except Exception as e:
         logger.error(f"Supabase set payout error: {e}")
 
-    # Firebase mirror (low frequency — admin only)
     if firebase_db_ref:
         try:
             firebase_db_ref.reference(f"payouts/{service}/{country}").set(amount)
@@ -323,9 +389,11 @@ def refresh_payouts_cache_sync():
     global PAYOUTS_CACHE
     new_cache = {}
     try:
-        res = supabase.table("payouts").select("service_name, country_name, payout").execute()
-        for r in res.data:
-            new_cache.setdefault(r["service_name"], {})[r["country_name"]] = float(r["payout"]) if r.get("payout") is not None else DEFAULT_PAYOUT
+        rows = fetch_all_rows("payouts", "service_name, country_name, payout")
+        for r in rows:
+            new_cache.setdefault(r["service_name"], {})[r["country_name"]] = (
+                float(r["payout"]) if r.get("payout") is not None else DEFAULT_PAYOUT
+            )
     except Exception as e:
         logger.error(f"Supabase payouts cache load error: {e}")
     PAYOUTS_CACHE = new_cache
@@ -336,8 +404,8 @@ def refresh_payouts_cache_sync():
 # ============================================================
 def get_withdraw_methods_sync() -> list:
     try:
-        res = supabase.table("withdraw_methods").select("name").execute()
-        return [r["name"] for r in res.data]
+        rows = fetch_all_rows("withdraw_methods", "name")
+        return [r["name"] for r in rows]
     except Exception as e:
         logger.error(f"Supabase get withdraw methods error: {e}")
         return []
@@ -375,7 +443,6 @@ def deduct_user_balance_sync(user_id: int, amount: float) -> bool:
         return bool(res.data)
     except Exception as e:
         logger.error(f"Supabase deduct balance RPC error: {e}")
-        # Fallback (non-atomic)
         prof = get_user_profile_sync(user_id)
         if prof["balance"] < amount:
             return False
@@ -420,15 +487,17 @@ def create_withdraw_request_sync(user_id: int, method: str, wallet_number: str, 
 
 def get_all_withdraw_requests_sync() -> list:
     try:
-        res = supabase.table("withdraw_requests").select(
-            "id, user_id, method, wallet_number, amount, status, reject_reason, created_at"
-        ).order("id", desc=False).execute()
+        rows = fetch_all_rows(
+            "withdraw_requests",
+            "id, user_id, method, wallet_number, amount, status, reject_reason, created_at",
+            order_col="id", order_desc=False,
+        )
         return [{
             "id": r["id"], "user_id": r["user_id"], "method": r["method"],
             "wallet_number": r["wallet_number"], "amount": r["amount"],
             "status": r["status"], "reject_reason": r.get("reject_reason", ""),
             "created_at": r.get("created_at", 0),
-        } for r in res.data]
+        } for r in rows]
     except Exception as e:
         logger.error(f"Supabase fetch withdraw reqs error: {e}")
         return []
@@ -497,8 +566,8 @@ def get_all_admins_sync() -> list:
     if ADMIN_ID:
         admins[ADMIN_ID] = {"user_id": ADMIN_ID, "name": "Main Owner", "is_owner": True}
     try:
-        res = supabase.table("admins").select("user_id, name").execute()
-        for r in res.data:
+        rows = fetch_all_rows("admins", "user_id, name")
+        for r in rows:
             uid_int = int(r["user_id"])
             name = str(r["name"])
             if uid_int == ADMIN_ID:
@@ -540,11 +609,12 @@ def delete_admin_sync(user_id: int) -> bool:
 # ============================================================
 def get_all_api_panels_sync() -> list:
     try:
-        res = supabase.table("api_panels").select("id, name, url, token, polling_interval").execute()
+        rows = fetch_all_rows("api_panels", "id, name, url, token, polling_interval")
         return [{
             "id": str(r["id"]), "name": str(r["name"]), "url": str(r["url"]),
-            "token": str(r["token"]), "polling_interval": float(r["polling_interval"]) if r.get("polling_interval") else 5.0,
-        } for r in res.data]
+            "token": str(r["token"]),
+            "polling_interval": float(r["polling_interval"]) if r.get("polling_interval") else 5.0,
+        } for r in rows]
     except Exception as e:
         logger.error(f"Supabase get API panels error: {e}")
         return []
@@ -557,7 +627,8 @@ def get_api_panel_sync(panel_id: str):
             r = res.data[0]
             return {
                 "id": str(r["id"]), "name": str(r["name"]), "url": str(r["url"]),
-                "token": str(r["token"]), "polling_interval": float(r["polling_interval"]) if r.get("polling_interval") else 5.0,
+                "token": str(r["token"]),
+                "polling_interval": float(r["polling_interval"]) if r.get("polling_interval") else 5.0,
             }
     except Exception as e:
         logger.error(f"Supabase get single panel error: {e}")
@@ -664,7 +735,7 @@ def get_user_profile_sync(user_id: int) -> dict:
 
 
 def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0, count: int = 1) -> dict:
-    """Atomic via Supabase RPC. Batch-friendly (count>1 for grouped OTPs)."""
+    """Per-user RPC — kept as fallback for batch RPC."""
     current_date = get_bd_date_str()
     try:
         res = supabase.rpc("add_otp_earnings", {
@@ -699,6 +770,63 @@ def add_user_balance_and_otp_sync(user_id: int, amount: float = 1.0, count: int 
     return {"balance": new_bal, "total_otps": prof["total_otps"] + count}
 
 
+def add_otp_earnings_batch_sync(updates: list) -> dict:
+    """
+    Batch-update multiple users' earnings in ONE Supabase RPC call.
+
+    updates = [{"user_id": int, "amount": float, "count": int}, ...]
+    Returns = {user_id: {"balance": float, "total_otps": int}}
+
+    Requires SQL function 'add_otp_earnings_batch' (see migration).
+    Auto-falls back to per-user RPC if the function is missing.
+    """
+    global _BATCH_RPC_AVAILABLE
+    if not updates:
+        return {}
+
+    current_date = get_bd_date_str()
+
+    # ---- Fast path: single batch RPC ----
+    if _BATCH_RPC_AVAILABLE:
+        try:
+            res = supabase.rpc("add_otp_earnings_batch", {
+                "p_updates": updates,
+                "p_date": current_date,
+            }).execute()
+            if res.data:
+                result = {}
+                for row in res.data:
+                    result[int(row["out_user_id"])] = {
+                        "balance": float(row.get("out_balance", 0.0)),
+                        "total_otps": int(row.get("out_total_otps", 0)),
+                    }
+                return result
+        except Exception as e:
+            err_str = str(e)
+            if ("does not exist" in err_str
+                    or "PGRST202" in err_str
+                    or "Could not find" in err_str
+                    or "not find the function" in err_str):
+                _BATCH_RPC_AVAILABLE = False
+                logger.warning(
+                    "add_otp_earnings_batch RPC not found — falling back to per-user RPC. "
+                    "Run the SQL migration to enable batch mode."
+                )
+            else:
+                logger.error(f"Batch earnings RPC error: {e}")
+
+    # ---- Fallback: per-user RPC ----
+    result = {}
+    for u in updates:
+        try:
+            r = add_user_balance_and_otp_sync(u["user_id"], u["amount"], u["count"])
+        except Exception as e:
+            logger.error(f"Fallback per-user earnings error for {u.get('user_id')}: {e}")
+            r = {"balance": 0.0, "total_otps": 0}
+        result[u["user_id"]] = r
+    return result
+
+
 def get_user_balance_sync(user_id: int) -> float:
     return get_user_profile_sync(user_id)["balance"]
 
@@ -706,8 +834,8 @@ def get_user_balance_sync(user_id: int) -> float:
 def get_all_users() -> list:
     users = []
     try:
-        res = supabase.table("users").select("user_id").execute()
-        users = [int(r["user_id"]) for r in res.data]
+        rows = fetch_all_rows("users", "user_id")
+        users = [int(r["user_id"]) for r in rows]
     except Exception as e:
         logger.error(f"Error fetching users from Supabase: {e}")
     return list(set(users))
@@ -1016,7 +1144,7 @@ def restore_from_firebase_to_supabase():
                                 except Exception:
                                     pass
 
-        # Allocations (critical — prevents re-allocate on restart)
+        # Allocations
         fb_alloc = firebase_db_ref.reference("allocations").get()
         if fb_alloc and isinstance(fb_alloc, dict):
             batch = []
@@ -1062,15 +1190,15 @@ def refresh_all_caches_sync():
         ADMINS_CACHE.add(ADMIN_ID)
 
     try:
-        res = supabase.table("settings").select("key, value").execute()
-        for r in res.data:
+        rows = fetch_all_rows("settings", "key, value")
+        for r in rows:
             SETTINGS_CACHE[str(r["key"])] = str(r["value"])
     except Exception as e:
         logger.error(f"Error loading settings: {e}")
 
     try:
-        res = supabase.table("admins").select("user_id").execute()
-        for r in res.data:
+        rows = fetch_all_rows("admins", "user_id")
+        for r in rows:
             ADMINS_CACHE.add(int(r["user_id"]))
     except Exception as e:
         logger.error(f"Error loading admins: {e}")
@@ -1080,25 +1208,37 @@ def refresh_all_caches_sync():
 
 
 def refresh_services_cache_sync():
-    """Rebuild SERVICES_CACHE from Supabase. Called at startup + admin ops only, NOT in hot path."""
+    """
+    Rebuild SERVICES_CACHE from Supabase with proper pagination.
+    Called at startup + admin ops only, NOT in hot path.
+    """
     global SERVICES_CACHE
     new_cache = {}
     try:
-        res = supabase.table("services").select("service_name, country_name").execute()
-        for r in res.data:
+        # 1) All service/country pairs — PAGED
+        srv_rows = fetch_all_rows("services", "service_name, country_name")
+        for r in srv_rows:
             new_cache.setdefault(r["service_name"], {})[r["country_name"]] = 0
-        # Global allocations — one read
+
+        # 2) All allocated numbers — PAGED (was capped at 1000)
         allocated = set()
         try:
-            ar = supabase.table("allocations").select("number").execute()
-            allocated = {a["number"] for a in ar.data}
+            alloc_rows = fetch_all_rows("allocations", "number")
+            allocated = {str(a["number"]) for a in alloc_rows}
         except Exception as e:
             logger.error(f"allocations read error: {e}")
+
+        # 3) Count available per service/country — PAGED
         for srv, cnts in new_cache.items():
             for cnt in list(cnts.keys()):
                 try:
-                    nr = supabase.table("numbers").select("number").eq("service", srv).eq("country", cnt).eq("status", "available").execute()
-                    new_cache[srv][cnt] = sum(1 for n in nr.data if n["number"] not in allocated)
+                    num_rows = fetch_all_rows(
+                        "numbers", "number",
+                        filters={"service": srv, "country": cnt, "status": "available"},
+                    )
+                    new_cache[srv][cnt] = sum(
+                        1 for n in num_rows if str(n["number"]) not in allocated
+                    )
                 except Exception as e:
                     logger.error(f"count error for {srv}/{cnt}: {e}")
     except Exception as e:
@@ -1165,31 +1305,35 @@ def save_numbers_sync(service: str, country: str, numbers: list, payout: float =
         return 0
 
     inserted = 0
+    to_insert = []
     try:
         supabase.table("services").upsert({
             "service_name": service, "country_name": country,
         }).execute()
 
-        # Existing allocations
+        # Existing allocations — PAGED
         globally_used = set()
         try:
-            ar = supabase.table("allocations").select("number").execute()
-            globally_used = {str(r["number"]) for r in ar.data}
+            alloc_rows = fetch_all_rows("allocations", "number")
+            globally_used = {str(r["number"]) for r in alloc_rows}
         except Exception as e:
             logger.error(f"allocs read error: {e}")
 
-        # Existing numbers for this service+country
+        # Existing numbers for this service+country — PAGED
         existing = set()
         try:
-            nr = supabase.table("numbers").select("number").eq("service", service).eq("country", country).execute()
-            existing = {str(r["number"]) for r in nr.data}
+            num_rows = fetch_all_rows(
+                "numbers", "number",
+                filters={"service": service, "country": country},
+            )
+            existing = {str(r["number"]) for r in num_rows}
         except Exception as e:
             logger.error(f"existing numbers read error: {e}")
 
         to_insert = [n for n in cleaned_numbers if n not in globally_used and n not in existing]
 
         for i in range(0, len(to_insert), 500):
-            chunk = to_insert[i:i+500]
+            chunk = to_insert[i:i + 500]
             try:
                 supabase.table("numbers").insert([
                     {"service": service, "country": country, "number": n,
@@ -1202,16 +1346,16 @@ def save_numbers_sync(service: str, country: str, numbers: list, payout: float =
     except Exception as e:
         logger.error(f"save_numbers error: {e}")
 
-    # Save payout
     if payout is not None:
         set_payout_sync(service, country, payout)
 
-    # Firebase mirror (low frequency — admin action only)
     if firebase_db_ref and inserted > 0:
         try:
             updates = {}
             for n in to_insert[:2000]:
-                updates[f"numbers/{service}/{country}/{n}"] = {"number": n, "status": "available", "user_id": 0}
+                updates[f"numbers/{service}/{country}/{n}"] = {
+                    "number": n, "status": "available", "user_id": 0
+                }
             if updates:
                 firebase_db_ref.reference("/").update(updates)
             firebase_db_ref.reference(f"services/{service}/{country}").set(True)
@@ -1244,11 +1388,11 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
             logger.error(f"allocate RPC error: {e}")
             break
 
-    # In-place cache decrement (cheap)
+    # In-place cache decrement
     if service in SERVICES_CACHE and country in SERVICES_CACHE[service]:
         SERVICES_CACHE[service][country] = max(0, SERVICES_CACHE[service][country] - len(assigned))
 
-    # Firebase mirror — batched, one write per allocation cycle
+    # Firebase mirror
     if firebase_db_ref and assigned:
         try:
             updates = {}
@@ -1268,8 +1412,11 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
 
 def get_user_allocations_sync(user_id: int, service: str, country: str) -> list:
     try:
-        res = supabase.table("allocations").select("number").eq("user_id", user_id).eq("service", service).eq("country", country).execute()
-        return [str(r["number"]) for r in res.data]
+        rows = fetch_all_rows(
+            "allocations", "number",
+            filters={"user_id": user_id, "service": service, "country": country},
+        )
+        return [str(r["number"]) for r in rows]
     except Exception as e:
         logger.error(f"Supabase get user allocations error: {e}")
         return []
@@ -1292,12 +1439,24 @@ def lookup_allocation_sync(num: str, clean_num: str):
 # SEEN OTPs (persistent via Supabase → no duplicate payouts on restart)
 # ============================================================
 def load_seen_otp_ids_sync() -> dict:
-    """Load only IDs from last 24h to bound memory."""
+    """Load only IDs from last 6h (retention) with pagination."""
     cutoff = int(time.time()) - OTP_ID_RETENTION_SECONDS
     result = {}
     try:
-        res = supabase.table("seen_otps").select("msg_id").gte("ts", cutoff).execute()
-        result = {r["msg_id"]: True for r in res.data}
+        offset = 0
+        while True:
+            r = (supabase.table("seen_otps")
+                 .select("msg_id")
+                 .gte("ts", cutoff)
+                 .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+                 .execute())
+            if not r.data:
+                break
+            for row in r.data:
+                result[row["msg_id"]] = True
+            if len(r.data) < SUPABASE_PAGE_SIZE:
+                break
+            offset += SUPABASE_PAGE_SIZE
     except Exception as e:
         logger.error(f"Supabase load seen otps error: {e}")
     return result
@@ -1329,7 +1488,7 @@ def cleanup_old_otp_ids_sync():
 
 
 # ============================================================
-# VIEW BUILDERS — UNCHANGED (data via Supabase)
+# VIEW BUILDERS
 # ============================================================
 def build_admin_control_view():
     admins = get_all_admins_sync()
@@ -1678,7 +1837,7 @@ def get_services_keyboard():
 
 
 # ============================================================
-# FLASK HEALTH (UptimeRobot endpoint)
+# FLASK HEALTH
 # ============================================================
 flask_app = Flask(__name__)
 
@@ -1695,8 +1854,11 @@ def health():
         "db_mode": CURRENT_DB_MODE,
         "known_users": len(KNOWN_USERS),
         "services": len(SERVICES_CACHE),
+        "service_counts": SERVICES_CACHE,
         "panels": len(PANEL_TASKS),
+        "batch_rpc": "enabled" if _BATCH_RPC_AVAILABLE else "fallback",
         "firebase": "connected" if firebase_db_ref else "disabled",
+        "otp_retention_hours": OTP_ID_RETENTION_SECONDS // 3600,
     })
 
 
@@ -1785,7 +1947,7 @@ def get_global_settings_keyboard():
 
 
 # ============================================================
-# BOT HANDLERS (all existing logic, data via Supabase)
+# BOT HANDLERS
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -3044,7 +3206,7 @@ def _remember_processed(msg_id: str):
 
 
 async def process_otp_items(items: list, application: Application, processed_ids: dict):
-    """Batched: 1 Supabase write for seen_otps, 1 read for allocations, per-user single update."""
+    """Batched: 1 write for seen_otps, 1 read for allocations, 1 RPC for all earnings."""
     bot_info = await application.bot.get_me()
     bot_username = bot_info.username or ""
     bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
@@ -3088,7 +3250,7 @@ async def process_otp_items(items: list, application: Application, processed_ids
     if not valid:
         return
 
-    # ---- Step 2: batch insert seen IDs (1 Supabase write) ----
+    # ---- Step 2: batch insert seen IDs ----
     await run_db(mark_otp_seen_batch_sync, new_ids)
 
     # ---- Step 3: batch lookup allocations ----
@@ -3097,7 +3259,6 @@ async def process_otp_items(items: list, application: Application, processed_ids
     alloc_map = {}
     try:
         combined = list(set(numbers + clean_numbers))
-        # Supabase .in_() with large list — chunk if > 200
         for i in range(0, len(combined), 200):
             chunk = combined[i:i+200]
             res = supabase.table("allocations").select("number, user_id, service, country").in_("number", chunk).execute()
@@ -3107,7 +3268,7 @@ async def process_otp_items(items: list, application: Application, processed_ids
         logger.error(f"batch alloc lookup error: {e}")
 
     # ---- Step 4: group per user ----
-    per_user = {}  # uid -> {"amount": float, "count": int, "items": [(item, alloc), ...], "service": str}
+    per_user = {}
     for it in valid:
         num = str(it.get("num", "")).strip()
         clean = re.sub(r'\D', '', num)
@@ -3122,9 +3283,18 @@ async def process_otp_items(items: list, application: Application, processed_ids
         per_user[u]["count"] += 1
         per_user[u]["items"].append((it, alloc))
 
-    # ---- Step 5: per-user single balance update + send messages ----
+    # ---- Step 5: BATCH balance update (single RPC) + send messages ----
+    if per_user:
+        batch_updates = [
+            {"user_id": u, "amount": d["amount"], "count": d["count"]}
+            for u, d in per_user.items()
+        ]
+        profiles = await run_db(add_otp_earnings_batch_sync, batch_updates)
+    else:
+        profiles = {}
+
     for u, data in per_user.items():
-        prof = await run_db(add_user_balance_and_otp_sync, u, data["amount"], data["count"])
+        prof = profiles.get(u) or {"balance": 0.0, "total_otps": 0}
         bal_str = fmt_num(prof["balance"])
 
         for item, alloc in data["items"]:
@@ -3245,14 +3415,12 @@ async def poll_single_panel(panel_id: str, application: Application, processed_i
                 error_streak += 1
                 logging.error(f"Polling Exception for Panel {panel_id}: {e}")
 
-            # Exponential backoff on repeated errors (RAM/CPU protection)
             sleep_t = interval * min(8, 2 ** min(error_streak, 3)) if error_streak else interval
             await asyncio.sleep(sleep_t)
 
 
 async def otp_poller_manager(application: Application):
     processed_ids = await run_db(load_seen_otp_ids_sync)
-    # Seed in-memory LRU
     for mid in list(processed_ids.keys())[:MAX_PROCESSED_IN_MEMORY]:
         _remember_processed(mid)
 
@@ -3281,7 +3449,6 @@ async def otp_poller_manager(application: Application):
             if cycle_count % 120 == 0:
                 await run_db(cleanup_old_otp_ids_sync)
 
-            # Weekly reset — checked hourly (was every 5s: quota-killer)
             now = time.time()
             if now - last_reset_check >= WEEKLY_RESET_CHECK_INTERVAL:
                 last_reset_check = now
@@ -3307,30 +3474,22 @@ async def otp_poller_manager(application: Application):
 # MAIN FUNCTION
 # ============================================================
 def main():
-    # 1) Init Supabase (primary)
     if not init_supabase():
         logger.error("Failed to initialize Supabase. Exiting.")
         return
 
-    # 2) Init Firebase (backup, optional)
     init_firebase()
-
-    # 3) Load caches from Supabase
     refresh_all_caches_sync()
 
-    # 4) Restore from Firebase only if Supabase is empty
     if not SETTINGS_CACHE:
         restore_from_firebase_to_supabase()
         refresh_all_caches_sync()
 
-    # 5) Load known users into bounded LRU
     load_known_users()
 
-    # 6) Start Flask (UptimeRobot endpoint)
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"Flask started on port {os.environ.get('PORT', 8080)}")
 
-    # 7) Build Telegram application
     application = (
         Application.builder()
         .token(TOKEN)
